@@ -1,6 +1,6 @@
 # PyDIC — Python Digital Image Correlation
 
-PyDIC is a 2D Digital Image Correlation tool written in Python. We built it as part of our work at IIT Kanpur to replicate the algorithmic core of Ncorr (Blaber, Adair & Antoniou, 2015) in a freely available, fully automated package — and to add one capability Ncorr doesn't have: direct full-field strain rate computation.
+PyDIC is a 2D Digital Image Correlation tool written in Python. We built it as part of our work at IIT Kanpur to replicate the algorithmic core of Ncorr (Blaber, Adair & Antoniou, 2015) in a freely available, fully automated package and to add one capability Ncorr doesn't have: direct full-field strain rate computation.
 
 The algorithms follow the Ncorr paper closely enough that we validated PyDIC against Ncorr on a real CFRP tensile dataset and got R² = 0.991 on vertical displacement across ten loading frames, with Bland–Altman agreement within ±1.34 px. The strain rates are a new addition and are described at the bottom of this file.
 
@@ -11,14 +11,14 @@ The algorithms follow the Ncorr paper closely enough that we validated PyDIC aga
 - Tracks speckle patterns between a reference image and one or more deformed images
 - Outputs full-field displacement (u, v) and Green–Lagrangian strain (Exx, Exy, Eyy) maps
 - Computes strain rates dExx/dt, dExy/dt, dEyy/dt directly from the image sequence
-- Runs the whole pipeline through a five-step GUI — no scripting needed
+- Runs the whole pipeline through a five-step GUI no scripting needed
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/pydic.git
+git clone https://github.com/anandroid29/pydic.git
 cd pydic
 python -m venv venv
 source venv/bin/activate        # on Windows: venv\Scripts\activate.bat
@@ -49,7 +49,7 @@ The GUI walks you through five steps in order.
 | Convergence tolerance ‖Δp‖ | Exit criterion for IC-GN | 1×10⁻⁶ |
 | ZNSSD cutoff C_LS | Maximum acceptable correlation cost | 2.0 |
 
-There is a trade-off between spatial resolution and noise that is worth being aware of: a larger subset radius smooths out noise but blurs sharp gradients. A larger strain window has the same effect on the strain fields. We used r = 21 px and r_E = 15 px for the CFRP validation — reasonable starting points for most quasi-static tests.
+There is a trade-off between spatial resolution and noise that is worth being aware of: a larger subset radius smooths out noise but blurs sharp gradients. A larger strain window has the same effect on the strain fields. We used r = 21 px and r_E = 15 px for the CFRP validation, reasonable starting points for most quasi-static tests.
 
 **Step 4 — Run.** Click "Run Analysis". A progress bar shows completion per image. You can cancel at any time without losing work already done on earlier frames.
 
@@ -69,7 +69,7 @@ Before anything else, the grayscale values of both the reference and deformed im
 g(x̃, ỹ) = [1  Δx  Δx²  Δx³  Δx⁴  Δx⁵] · [QK] · C[xf-2:xf+3, yf-2:yf+3] · [QK]ᵀ · [1  Δy  ...]ᵀ
 ```
 
-where [QK] is the 6×6 quintic kernel matrix, C is the B-spline coefficient array, xf = floor(x̃), and Δx = x̃ − xf. The spatial gradients ∂g/∂x and ∂g/∂y needed for the Hessian are computed analytically from the same coefficient array — not by finite-differencing the raw pixel values, which would introduce a systematic bias.
+where [QK] is the 6×6 quintic kernel matrix, C is the B-spline coefficient array, xf = floor(x̃), and Δx = x̃ − xf. The spatial gradients ∂g/∂x and ∂g/∂y needed for the Hessian are computed analytically from the same coefficient array and not by finite-differencing the raw pixel values, which would introduce a systematic bias.
 
 ### Initial guess via NCC
 
@@ -101,7 +101,7 @@ The IC-GN method solves for a small incremental warp Δ**p** that minimises C_LS
 5. Apply the compositional warp update: **M**(**p**) ← **M**(**p**) ∘ **M**(Δ**p**)⁻¹
 6. Exit when ‖Δ**p**‖ < 10⁻⁶
 
-The compositional update in step 5 is what makes IC-GN different from a standard Gauss-Newton solver — it applies the correction in the reference frame, keeping the Hessian valid across iterations. This is the same update Ncorr uses.
+The compositional update in step 5 is what makes IC-GN different from a standard Gauss-Newton solver. It applies the correction in the reference frame, keeping the Hessian valid across iterations. This is the same update Ncorr uses.
 
 ### Reliability-Guided DIC (RG-DIC)
 
@@ -137,7 +137,7 @@ E_yy = ∂v/∂y + ½[(∂u/∂y)² + (∂v/∂y)²]
 E_xy = ½[∂u/∂y + ∂v/∂x + (∂u/∂x)(∂u/∂y) + (∂v/∂x)(∂v/∂y)]
 ```
 
-These are the full Green–Lagrangian (finite-strain) expressions, not the linearised engineering strains — important if your specimen undergoes large deformations.
+These are the full Green–Lagrangian (finite-strain) expressions, not the linearised engineering strains, important if your specimen undergoes large deformations.
 
 ### Strain rates
 
