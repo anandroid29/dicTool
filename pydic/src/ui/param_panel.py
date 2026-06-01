@@ -20,8 +20,7 @@ from PyQt6.QtWidgets import (
     QToolButton,
 )
 
-from .image_canvas import ROITool
-
+from .image_canvas import ROITool, make_polygon_tool_icon, TOOL_TOOLTIPS
 
 # ---------------------------------------------------------------------------
 # Step indicator widget
@@ -240,21 +239,25 @@ class ParamPanel(QWidget):
         self._tool_group.setExclusive(True)
 
         tools = [
-            ("⬠ Polygon",   ROITool.POLYGON),
-            ("▭ Rectangle", ROITool.RECTANGLE),
-            ("○ Circle",    ROITool.CIRCLE),
-            ("✕ Erase",     ROITool.ERASE),
+            ("Polygon", ROITool.POLYGON),
+            ("Rectangle", ROITool.RECTANGLE),
+            ("Circle", ROITool.CIRCLE),
+            ("Erase", ROITool.ERASE),
         ]
+
         for label, tool in tools:
             btn = QToolButton()
-            btn.setText(label)
-            btn.setCheckable(True)
-            btn.setFixedHeight(28)
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            btn.clicked.connect(lambda checked, t=tool: self._select_tool(t))
-            self._tool_group.addButton(btn)
-            tool_row.addWidget(btn)
-        lay.addLayout(tool_row)
+
+            # Apply your new custom icon for Polygon, fallback to text/emoji for others
+            if tool == ROITool.POLYGON:
+                btn.setIcon(make_polygon_tool_icon(size=24))
+                btn.setText("")
+            else:
+                btn.setText(label)
+
+            # Pull the tooltip from your canvas dictionary
+            btn.setToolTip(TOOL_TOOLTIPS.get(tool, label))
+            lay.addLayout(tool_row)
 
         btn_row = QHBoxLayout()
         btn_clear = QPushButton("Clear ROI")

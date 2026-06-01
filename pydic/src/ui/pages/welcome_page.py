@@ -219,28 +219,47 @@ class WelcomePage(QWidget):
     def _load_images(self) -> None:
         analysis = self._wizard.analysis
 
-        # Reference
-        ref, _ = QFileDialog.getOpenFileName(
-            self, "Select Reference Image", "",
-            "Images (*.png *.tif *.tiff *.jpg *.jpeg *.bmp);;All Files (*)"
-        )
-        if not ref:
+        # 1. Ask for a folder
+        folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+        if not folder:
             return
-        analysis.set_reference(ref)
 
-        # Deformed
-        defs, _ = QFileDialog.getOpenFileNames(
-            self, "Select Deformed Images", os.path.dirname(ref),
-            "Images (*.png *.tif *.tiff *.jpg *.jpeg *.bmp);;All Files (*)"
-        )
-        if not defs:
+        # 2. Gather and sort image files
+        valid_exts = {".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"}
+        img_files = []
+        for f in os.listdir(folder):
+            if os.path.splitext(f)[1].lower() in valid_exts:
+                img_files.append(os.path.join(folder, f))
+
+        img_files.sort()  # Lexicographical sort
+
+        if len(img_files) < 2:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Not Enough Images", "The folder must contain at least 2 images.")
             return
+
+        # 3. Assign reference and deformed
+        ref = img_files[0]
+        defs = img_files[1:]
+
+        analysis.set_reference(ref)
         analysis.clear_deformed()
-        for p in sorted(defs):
+        for p in defs:
             analysis.add_deformed(p)
 
-        self._update_status(ref, defs, analysis.fps)
+        # 4. Look for invisible metadata file to restore FPS
+        import json
+        meta_path = os.path.join(folder, "dic_metadata.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                    if "fps" in meta:
+                        analysis.fps = float(meta["fps"])
+            except Exception:
+                pass
 
+        self._update_status(ref, defs, analysis.fps)
     def _update_status(self, ref: str, defs: list, fps: float) -> None:
         self._status_ref.setText(
             f"✓  Reference: {os.path.basename(ref)}"

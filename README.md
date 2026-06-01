@@ -19,10 +19,10 @@ The algorithms follow the Ncorr paper closely enough that we validated PyDIC aga
 
 ```bash
 git clone https://github.com/anandroid29/pydic.git
-cd pydic
 python -m venv venv
 source venv/bin/activate        # on Windows: venv\Scripts\activate.bat
 pip install -r requirements.txt
+cd pydic
 python main.py
 ```
 
