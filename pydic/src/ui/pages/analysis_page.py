@@ -220,7 +220,6 @@ class AnalysisPage(QWidget):
             h, w = rgb.shape[:2]
             import numpy as np
 
-            # NEW: Bind array to instance to prevent garbage-collection segfault
             self._current_thumb_array = np.ascontiguousarray(rgb)
             qimg = QImage(self._current_thumb_array.data, w, h, w * 3, QImage.Format.Format_RGB888)
 

@@ -158,7 +158,7 @@ class DICAnalysis:
         if not self._cancel[0] and self.results:
             if progress_cb:
                 progress_cb(0.97, "Computing strain rates…")
-            self._compute_strain_rates()
+            # self._compute_strain_rates()
 
         if progress_cb:
             progress_cb(1.0, "Complete.")

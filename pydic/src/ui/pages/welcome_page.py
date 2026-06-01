@@ -10,18 +10,21 @@ from PyQt6.QtGui import QFont, QPixmap, QImage
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QFrame, QSizePolicy,
+    QGroupBox, QSpinBox, QRadioButton
 )
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
-
+from src.ui.components import FooterButton
 
 # color shortcuts
+_C_SURFACE = "#0e1c2e"
 _C_CARD    = "#132035"
 _C_BORDER  = "#1e3a5a"
 _C_ACCENT  = "#3b82f6"
 _C_TEXT    = "#e2e8f0"
 _C_TEXT2   = "#94a3b8"
+_C_TEXT3   = "#475569"
 _C_SUCCESS = "#10b981"
 
 
@@ -99,7 +102,7 @@ class WelcomePage(QWidget):
         hero = QWidget()
         hero.setStyleSheet(f"background:#0e1c2e;")
         hero_lay = QVBoxLayout(hero)
-        hero_lay.setContentsMargins(60, 60, 60, 50)
+        hero_lay.setContentsMargins(60, 40, 60, 30) # Reduced margins
         hero_lay.setSpacing(6)
 
         logo = QLabel("PyDIC")
@@ -122,8 +125,8 @@ class WelcomePage(QWidget):
         # ── Body ──────────────────────────────────────────────────────
         body = QWidget()
         body_lay = QVBoxLayout(body)
-        body_lay.setContentsMargins(60, 48, 60, 48)
-        body_lay.setSpacing(32)
+        body_lay.setContentsMargins(60, 30, 60, 30) # Reduced margins
+        body_lay.setSpacing(24)                     # Reduced spacing
 
         step_lbl = QLabel("Step 1  —  Import your footage")
         step_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:13px; font-weight:600;")
@@ -151,8 +154,74 @@ class WelcomePage(QWidget):
         cards_row.addStretch()
         body_lay.addLayout(cards_row)
 
+        # ── Frame Sampling Settings ───────────────────────────────────
+        self.frame_options_grp = QGroupBox("FRAME SAMPLING SETTINGS")
+        # Hard minimum height guarantees it never squishes
+        self.frame_options_grp.setMinimumHeight(140)
+        self.frame_options_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.frame_options_grp.setStyleSheet(f"""
+            QGroupBox {{ border: 1px solid {_C_BORDER}; border-radius: 8px; padding-top: 18px; font-weight: bold; color: {_C_TEXT3}; font-size: 11px; }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {_C_TEXT2}; }}
+            QRadioButton {{ color: {_C_TEXT2}; font-size: 11px; }}
+            QRadioButton::indicator {{ width: 12px; height: 12px; border-radius: 6px; border: 1px solid {_C_BORDER}; background: {_C_SURFACE}; }}
+            QRadioButton::indicator:checked {{ background: {_C_ACCENT}; border: 1px solid {_C_ACCENT}; }}
+        """)
+
+        opts_layout = QVBoxLayout(self.frame_options_grp)
+        opts_layout.setContentsMargins(20, 16, 20, 16)
+        opts_layout.setSpacing(12)
+
+        # Step Spinbox
+        step_lay = QHBoxLayout()
+        step_lay.addWidget(QLabel("Load every:"))
+        self.step_spin = QSpinBox()
+        self.step_spin.setRange(1, 1000)
+        self.step_spin.setValue(1)
+        self.step_spin.setStyleSheet(f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px;")
+        step_lay.addWidget(self.step_spin)
+
+        lbl1 = QLabel("frame(s)")
+        lbl1.setStyleSheet(f"color:{_C_TEXT2};")
+        step_lay.addWidget(lbl1)
+        step_lay.addStretch()
+        opts_layout.addLayout(step_lay)
+
+        # Divider
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"background:{_C_BORDER}; max-height:1px;")
+        opts_layout.addWidget(div)
+
+        # Max Frames Radio Buttons
+        self.radio_all_frames = QRadioButton("Load all available deformed frames")
+        self.radio_all_frames.setChecked(True)
+        opts_layout.addWidget(self.radio_all_frames)
+
+        limit_lay = QHBoxLayout()
+        self.radio_limit_frames = QRadioButton("Limit maximum deformed frames to:")
+        limit_lay.addWidget(self.radio_limit_frames)
+
+        self.max_frames_spin = QSpinBox()
+        self.max_frames_spin.setRange(1, 999999)
+        self.max_frames_spin.setValue(30)
+        self.max_frames_spin.setEnabled(False)
+        self.max_frames_spin.setStyleSheet(f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px;")
+
+        # Tie spinbox enabled state to radio button
+        self.radio_limit_frames.toggled.connect(self.max_frames_spin.setEnabled)
+
+        limit_lay.addWidget(self.max_frames_spin)
+        limit_lay.addStretch()
+        opts_layout.addLayout(limit_lay)
+
+        body_lay.addWidget(self.frame_options_grp)
+        # ──────────────────────────────────────────────────────────────
+
         # Status area
         self._status_box = QFrame()
+        # Hard minimum height guarantees it never squishes
+        self._status_box.setMinimumHeight(80)
+        self._status_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._status_box.setStyleSheet(
             f"background:{_C_CARD}; border:1px solid {_C_BORDER}; border-radius:10px;"
         )
@@ -185,7 +254,7 @@ class WelcomePage(QWidget):
         footer_lay.setContentsMargins(60, 14, 60, 14)
         footer_lay.addStretch()
 
-        self._next_btn = QPushButton("Define ROI  →")
+        self._next_btn = FooterButton("Define ROI  →")
         self._next_btn.setProperty("class", "accent")
         self._next_btn.setFixedHeight(38)
         self._next_btn.setMinimumWidth(160)
@@ -207,8 +276,20 @@ class WelcomePage(QWidget):
         ref_path = paths[ref_idx]
         def_paths = [p for i, p in enumerate(paths) if i != ref_idx]
 
+        # Apply Slicing Logic
+        step = self.step_spin.value()
+        def_paths = def_paths[::step]
+
+        if self.radio_limit_frames.isChecked():
+            max_f = self.max_frames_spin.value()
+            def_paths = def_paths[:max_f]
+
         analysis = self._wizard.analysis
-        analysis.fps = dlg._fps if hasattr(dlg, '_fps') else 1.0
+
+        # Calculate effective FPS (scales time correctly for strain rates)
+        original_fps = dlg._fps if hasattr(dlg, '_fps') else 1.0
+        analysis.fps = original_fps / step
+
         analysis.set_reference(ref_path)
         analysis.clear_deformed()
         for p in def_paths:
@@ -238,16 +319,24 @@ class WelcomePage(QWidget):
             QMessageBox.warning(self, "Not Enough Images", "The folder must contain at least 2 images.")
             return
 
-        # 3. Assign reference and deformed
+        # 3. Apply Slicing Logic
+        step = self.step_spin.value()
         ref = img_files[0]
         defs = img_files[1:]
 
-        analysis.set_reference(ref)
-        analysis.clear_deformed()
-        for p in defs:
-            analysis.add_deformed(p)
+        defs = defs[::step]
 
-        # 4. Look for invisible metadata file to restore FPS
+        if self.radio_limit_frames.isChecked():
+            max_f = self.max_frames_spin.value()
+            defs = defs[:max_f]
+
+        if len(defs) == 0:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Empty Selection", "Your sampling settings filtered out all deformed frames.")
+            return
+
+        # 4. Look for invisible metadata file to calculate original FPS
+        original_fps = 1.0
         import json
         meta_path = os.path.join(folder, "dic_metadata.json")
         if os.path.exists(meta_path):
@@ -255,14 +344,24 @@ class WelcomePage(QWidget):
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
                     if "fps" in meta:
-                        analysis.fps = float(meta["fps"])
+                        original_fps = float(meta["fps"])
             except Exception:
                 pass
 
+        # Update effective FPS
+        analysis.fps = original_fps / step
+
+        # 5. Assign reference and deformed
+        analysis.set_reference(ref)
+        analysis.clear_deformed()
+        for p in defs:
+            analysis.add_deformed(p)
+
         self._update_status(ref, defs, analysis.fps)
+
     def _update_status(self, ref: str, defs: list, fps: float) -> None:
         self._status_ref.setText(
-            f"✓  Reference: {os.path.basename(ref)}"
+            f"Reference: {os.path.basename(ref)}"
         )
         self._status_ref.setStyleSheet(f"color:{_C_SUCCESS}; font-size:12px; border:none;")
         self._status_def.setText(
@@ -270,7 +369,7 @@ class WelcomePage(QWidget):
         )
         self._status_def.setStyleSheet(f"color:{_C_SUCCESS}; font-size:12px; border:none;")
         if fps > 1.0:
-            self._status_fps.setText(f"   Video: {fps:.2f} fps  ·  "
+            self._status_fps.setText(f"   Effective sample rate: {fps:.2f} fps  ·  "
                                      f"Δt = {1000/fps:.1f} ms per frame")
         else:
             self._status_fps.setText("   No fps metadata — strain rate will use Δt = 1 s")

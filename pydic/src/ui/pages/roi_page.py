@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QFrame, QToolButton, QButtonGroup,
     QSizePolicy, QFileDialog, QMessageBox,
 )
+from src.ui.components import FooterButton
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
@@ -183,7 +184,7 @@ class ROIPage(QWidget):
 
         foot_lay.addSpacing(24)
 
-        self._next_btn = QPushButton("Parameters  →")
+        self._next_btn = FooterButton("Parameters  →")
         self._next_btn.setProperty("class", "accent")
         self._next_btn.setFixedHeight(36)
         self._next_btn.setMinimumWidth(150)

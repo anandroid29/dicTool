@@ -11,6 +11,8 @@ from PyQt6.QtWidgets import (
     QFrame, QGridLayout, QSizePolicy,
 )
 
+from src.ui.components import FooterButton
+
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 
@@ -205,7 +207,7 @@ class ParamsPage(QWidget):
         foot_lay.setContentsMargins(20, 0, 20, 0)
         foot_lay.addStretch()
 
-        self._run_btn = QPushButton("▶  Run Analysis")
+        self._run_btn = FooterButton("▶  Run Analysis")
         self._run_btn.setProperty("class", "run")
         self._run_btn.setFixedHeight(38)
         self._run_btn.setMinimumWidth(160)
