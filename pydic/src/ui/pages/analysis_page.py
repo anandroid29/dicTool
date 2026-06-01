@@ -61,13 +61,14 @@ class AnalysisPage(QWidget):
 
     def __init__(self, wizard: "Wizard") -> None:
         super().__init__()
-        self._wizard  = wizard
+        self._wizard = wizard
         self._worker: Optional[_Worker] = None
         self._thread: Optional[QThread] = None
         self._t_start = 0.0
-        self._timer   = QTimer(self)
+        self._timer = QTimer(self)
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._tick_elapsed)
+        self._last_thumb_idx = -1  # NEW: Track frame to stop I/O spam
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -188,14 +189,16 @@ class AnalysisPage(QWidget):
         self._pbar.setValue(int(frac * 1000))
         self._status_lbl.setText(msg)
 
-        # Parse frame number from message like "[3/8]"
         import re
         m = re.search(r"\[(\d+)/(\d+)\]", msg)
         if m:
             cur_f, tot_f = int(m.group(1)), int(m.group(2))
             self._frames_lbl.findChild(QLabel, "value").setText(f"{cur_f} / {tot_f}")
-            # Show deformed frame thumbnail
-            self._show_frame_thumbnail(cur_f - 1)
+
+            # NEW: Only execute disk I/O if the frame actually changed
+            if self._last_thumb_idx != cur_f:
+                self._show_frame_thumbnail(cur_f - 1)
+                self._last_thumb_idx = cur_f
 
     def _show_frame_thumbnail(self, idx: int) -> None:
         paths = self._wizard.analysis.def_paths
@@ -216,8 +219,11 @@ class AnalysisPage(QWidget):
             rgb = cv2.cvtColor(img_small, cv2.COLOR_GRAY2RGB)
             h, w = rgb.shape[:2]
             import numpy as np
-            c = np.ascontiguousarray(rgb)
-            qimg = QImage(c.data, w, h, w * 3, QImage.Format.Format_RGB888)
+
+            # NEW: Bind array to instance to prevent garbage-collection segfault
+            self._current_thumb_array = np.ascontiguousarray(rgb)
+            qimg = QImage(self._current_thumb_array.data, w, h, w * 3, QImage.Format.Format_RGB888)
+
             self._preview_lbl.setPixmap(QPixmap.fromImage(qimg))
             self._frame_lbl.setText(f"Frame {idx + 1}: {paths[idx].split('/')[-1]}")
         except Exception:

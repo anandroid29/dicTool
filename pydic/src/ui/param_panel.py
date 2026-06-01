@@ -156,7 +156,7 @@ class ParamPanel(QWidget):
         self._status_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
         self._status_lbl.setWordWrap(True)
         root.addWidget(self._status_lbl)
-
+        self._load_settings()
     # ------------------------------------------------------------------
     # Section builders
     # ------------------------------------------------------------------
@@ -279,16 +279,18 @@ class ParamPanel(QWidget):
         lay = QVBoxLayout(grp)
         lay.setSpacing(4)
 
+        p = self._analysis.params
+
         params_def = [
-            ("Subset radius",  "px",  "subset_radius",  int,   5,  200,  20,
+            ("Subset radius", "px", "subset_radius", int, 5, 200, p.subset_radius,
              "Radius of the circular correlation window"),
-            ("Subset spacing", "px",  "subset_spacing", int,   1,   50,   5,
+            ("Subset spacing", "px", "subset_spacing", int, 1, 50, p.subset_spacing,
              "Centre-to-centre grid step between subsets"),
-            ("Strain window",  "px",  "strain_window",  int,   2,   80,  10,
+            ("Strain window", "px", "strain_window", int, 2, 80, p.strain_window,
              "Half-width of the least-squares strain fitting window"),
-            ("Max iterations", "",    "max_iter",       int,   5,  500,  50,
+            ("Max iterations", "", "max_iter", int, 5, 500, p.max_iter,
              "Maximum IC-GN iterations per subset"),
-            ("Search radius",  "px",  "search_radius",  int,   5,  200,  30,
+            ("Search radius", "px", "search_radius", int, 5, 200, p.search_radius,
              "NCC search half-extent (seed point only)"),
         ]
 
@@ -323,7 +325,7 @@ class ParamPanel(QWidget):
         row.addWidget(lbl)
         self._tol_box = QDoubleSpinBox()
         self._tol_box.setRange(1e-8, 1e-1)
-        self._tol_box.setValue(1e-4)
+        self._tol_box.setValue(p.conv_tol)
         self._tol_box.setDecimals(8)
         self._tol_box.valueChanged.connect(lambda v: self._sync_param("conv_tol", v))
         row.addWidget(self._tol_box)
@@ -337,11 +339,19 @@ class ParamPanel(QWidget):
         row2.addWidget(lbl2)
         self._corr_box = QDoubleSpinBox()
         self._corr_box.setRange(0.01, 2.0)
-        self._corr_box.setValue(0.8)
+        self._corr_box.setValue(p.corr_cutoff)
         self._corr_box.setDecimals(3)
         self._corr_box.valueChanged.connect(lambda v: self._sync_param("corr_cutoff", v))
         row2.addWidget(self._corr_box)
         lay.addLayout(row2)
+
+        reset_btn = QPushButton("Reset to Ncorr Defaults")
+        reset_btn.setStyleSheet(
+            "background: #21262d; color: #c9d1d9; border: 1px solid #30363d; "
+            "padding: 5px; border-radius: 4px; margin-top: 5px;"
+        )
+        reset_btn.clicked.connect(self._reset_defaults)
+        lay.addWidget(reset_btn)
 
         self._content_layout.addWidget(grp)
 
@@ -507,3 +517,30 @@ class ParamPanel(QWidget):
     def update_progress(self, frac: float, msg: str) -> None:
         self._progress.setValue(int(frac * 1000))
         self._status_lbl.setText(msg)
+
+    def _sync_param(self, attr: str, val) -> None:
+        setattr(self._analysis.params, attr, val)
+        self._analysis.save_settings()
+
+    def _reset_defaults(self) -> None:
+        """Reset underlying parameters to Ncorr defaults, save, and update UI."""
+        from src.core.rg_dic import DICParams
+
+        # 1. Reset the dataclass to absolute defaults
+        self._analysis.params = DICParams()
+        self._analysis.save_settings()  # Overwrite the ghost JSON file
+
+        # 2. Update all the spinboxes silently
+        p = self._analysis.params
+        for attr, sb in self._spinboxes.items():
+            sb.blockSignals(True)
+            sb.setValue(getattr(p, attr))
+            sb.blockSignals(False)
+
+        self._tol_box.blockSignals(True)
+        self._tol_box.setValue(p.conv_tol)
+        self._tol_box.blockSignals(False)
+
+        self._corr_box.blockSignals(True)
+        self._corr_box.setValue(p.corr_cutoff)
+        self._corr_box.blockSignals(False)
