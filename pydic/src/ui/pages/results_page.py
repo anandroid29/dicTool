@@ -293,7 +293,7 @@ class ResultsPage(QWidget):
         self._fps_spin = QSpinBox()
         self._fps_spin.setRange(1, 30)
         self._fps_spin.setValue(5)
-        self._fps_spin.setFixedWidth(48)
+        self._fps_spin.setFixedWidth(64)
         self._fps_spin.valueChanged.connect(
             lambda v: self._play_timer.setInterval(1000 // v)
         )
