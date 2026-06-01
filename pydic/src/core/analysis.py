@@ -52,7 +52,7 @@ class DICAnalysis:
         self.results: List[PairResult] = []
         self.fps: float = 1.0
         self._cancel: list = [False]
-
+        self.load_settings()
     # -- configuration --
     def set_reference(self, path: str) -> None:
         self.ref_path = path
@@ -220,7 +220,40 @@ class DICAnalysis:
                         g.create_dataset(name, data=arr.astype(np.float32),
                                          compression="gzip", compression_opts=4)
 
+    def load_settings(self) -> None:
+        import json, os
+        path = os.path.join(os.getcwd(), "pydic_settings.json")
 
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                for k, v in data.items():
+                    if hasattr(self.params, k):
+                        setattr(self.params, k, v)
+            except Exception:
+                pass
+        else:
+            self.save_settings()
+
+    def save_settings(self) -> None:
+        import json, os
+        path = os.path.join(os.getcwd(), "pydic_settings.json")
+
+        try:
+            data = {
+                "subset_radius": self.params.subset_radius,
+                "subset_spacing": self.params.subset_spacing,
+                "strain_window": self.params.strain_window,
+                "max_iter": self.params.max_iter,
+                "conv_tol": self.params.conv_tol,
+                "corr_cutoff": self.params.corr_cutoff,
+                "search_radius": self.params.search_radius
+            }
+            with open(path, "w") as f:
+                json.dump(data, f, indent=4)  # Added indent for readability
+        except Exception:
+            pass
 
 def _load_image(path: str) -> np.ndarray:
     if _HAVE_CV2:

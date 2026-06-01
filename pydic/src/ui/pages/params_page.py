@@ -152,6 +152,16 @@ class ParamsPage(QWidget):
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Optimizer"))
 
+        # --- PASTE THIS NEW BLOCK RIGHT HERE ---
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.setStyleSheet(
+            "background: #132035; color: #94a3b8; border: 1px solid #1e3a5a; "
+            "padding: 6px; border-radius: 4px; margin-top: 10px;"
+        )
+        reset_btn.clicked.connect(self._reset_defaults)
+        right_lay.addWidget(reset_btn)
+        # ---------------------------------------
+
         self._sp_maxiter = spin(5, 200, params.max_iter, 5)
         right_lay.addLayout(_param_row(
             "Max iterations", "Maximum IC-GN iterations per subset.",
@@ -245,3 +255,36 @@ class ParamsPage(QWidget):
         f.setFrameShape(QFrame.Shape.HLine)
         f.setStyleSheet(f"background:{_C_BORDER}; max-height:1px;")
         return f
+
+    def _reset_defaults(self) -> None:
+        from src.core.rg_dic import DICParams
+        from PyQt6.QtWidgets import QMessageBox
+
+        # 1. Reset core settings and overwrite JSON
+        self._wizard.analysis.params = DICParams()
+        self._wizard.analysis.save_settings()
+        p = self._wizard.analysis.params
+
+        # 2. Update all spinboxes silently
+        for sb, val in [
+            (self._sp_radius, p.subset_radius),
+            (self._sp_spacing, p.subset_spacing),
+            (self._sp_strain, p.strain_window),
+            (self._sp_maxiter, p.max_iter),
+            (self._sp_search, p.search_radius),
+            (self._sp_tol, p.conv_tol),
+            (self._sp_cutoff, p.corr_cutoff)
+        ]:
+            sb.blockSignals(True)
+            sb.setValue(val)
+            sb.blockSignals(False)
+
+        self._on_param_changed()  # Update the subset counter text
+
+        QMessageBox.information(
+            self, "Defaults Reset",
+            f"Parameters reset to defaults.\n\n"
+            f"Radius: {p.subset_radius}\n"
+            f"Spacing: {p.subset_spacing}\n"
+            f"Strain Window: {p.strain_window}"
+        )

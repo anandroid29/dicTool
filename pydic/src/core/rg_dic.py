@@ -16,7 +16,7 @@ from .icgn import precompute_subset, run_icgn
 class DICParams:
     """All defaults match Ncorr exactly (Blaber et al. 2015)."""
     subset_radius:  int   = 21
-    subset_spacing: int   = 1
+    subset_spacing: int   = 3
     strain_window:  int   = 15
     max_iter:       int   = 50
     conv_tol:       float = 1e-6
@@ -61,7 +61,7 @@ def run_rg_dic(
         ys_roi, xs_roi = np.where(roi_mask)
         seed_xy = (int(xs_roi.mean()), int(ys_roi.mean()))
 
-    n_workers = min(os.cpu_count() or 4, 8)
+    n_workers = os.cpu_count() or 4
     if n_total < 200 or n_workers < 2:
         n_workers = 1
 
@@ -82,17 +82,20 @@ def run_rg_dic(
 
     shape = (H, W)
 
-    def make_cb(i):
-        def cb(frac, msg):
-            if progress_cb:
-                try: progress_cb(min(0.05 + 0.93*(i+frac)/n_workers, 0.98), msg)
-                except Exception: pass
-        return cb
+    # NEW: Global progress tracking across all threads
+    import threading
+    shared_state = {"done": 0, "total": n_total}
+    progress_lock = threading.Lock()
+
+    def global_cb(frac, msg):
+        if progress_cb:
+            try: progress_cb(min(0.05 + 0.93 * frac, 0.98), msg)
+            except Exception: pass
 
     args_list = [
         (ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
          dxg, dyg, dx_sub, dy_sub,
-         params, seed, shape, cancel_flag, make_cb(i))
+         params, seed, shape, cancel_flag, global_cb, shared_state, progress_lock)
         for i, ((dxg, dyg), seed) in enumerate(zip(domains, domain_seeds))
     ]
 
@@ -128,70 +131,91 @@ def run_rg_dic(
 
 def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
                 domain_gx, domain_gy, dx_sub, dy_sub,
-                params, seed_xy, shape, cancel_flag, progress_cb):
+                params, seed_xy, shape, cancel_flag, progress_cb,
+                shared_state, lock):
     """RG-DIC on one spatial domain — runs in its own thread."""
     step = params.subset_spacing
     cutoff_disp = float(step + 1)
 
     grid_map = {(int(domain_gx[i]), int(domain_gy[i])): i
                 for i in range(len(domain_gx))}
-    n_total = len(domain_gx)
-    done    = np.zeros(n_total, dtype=bool)
 
-    u_f=np.full(shape,np.nan); v_f=np.full(shape,np.nan)
-    du_dx=np.full(shape,np.nan); du_dy=np.full(shape,np.nan)
-    dv_dx=np.full(shape,np.nan); dv_dy=np.full(shape,np.nan)
-    corr_f=np.full(shape,np.nan); ana=np.zeros(shape,dtype=bool)
+    u_f = np.full(shape, np.nan);
+    v_f = np.full(shape, np.nan)
+    du_dx = np.full(shape, np.nan);
+    du_dy = np.full(shape, np.nan)
+    dv_dx = np.full(shape, np.nan);
+    dv_dy = np.full(shape, np.nan)
+    corr_f = np.full(shape, np.nan);
+    ana = np.zeros(shape, dtype=bool)
 
     sx, sy = _snap(seed_xy[0], seed_xy[1], domain_gx, domain_gy)
     seed_idx = grid_map.get((sx, sy), 0)
 
     u0, v0, _ = ncc_initial_guess(ref_f64, cur_image_raw, sx, sy,
-                                   params.subset_radius, params.search_radius)
+                                  params.subset_radius, params.search_radius)
     p0 = np.array([u0, v0, 0., 0., 0., 0.])
     sd = precompute_subset(ref_f64, grad_x, grad_y, sx, sy, dx_sub, dy_sub)
     p0, cls0, _ = run_icgn(cur_interp, sd, p0, params.max_iter, params.conv_tol)
-    _store(u_f,v_f,du_dx,du_dy,dv_dx,dv_dy,corr_f,ana, sx,sy,p0,cls0)
+    _store(u_f, v_f, du_dx, du_dy, dv_dx, dv_dy, corr_f, ana, sx, sy, p0, cls0)
+
+    done = np.zeros(len(domain_gx), dtype=bool)
     done[seed_idx] = True
 
+    with lock:
+        shared_state["done"] += 1
+
     heap = [(cls0, seed_idx, p0.copy())]
-    n_done = 1
+
+    # NEW: Local steps to avoid locking on every single subset (performance)
+    local_steps = 0
+    report_interval = max(1, shared_state["total"] // 100)
 
     while heap and not cancel_flag[0]:
         cls_p, pidx, p_par = heapq.heappop(heap)
         px, py = int(domain_gx[pidx]), int(domain_gy[pidx])
 
-        for nx, ny in [(px+step,py),(px-step,py),(px,py+step),(px,py-step)]:
+        for nx, ny in [(px + step, py), (px - step, py), (px, py + step), (px, py - step)]:
             nbidx = grid_map.get((nx, ny))
             if nbidx is None or done[nbidx]:
                 continue
 
             # Taylor-extrapolated initial guess (Ncorr calcpoint)
-            ddx, ddy = float(nx-px), float(ny-py)
-            u_i = p_par[0]+p_par[2]*ddx+p_par[3]*ddy
-            v_i = p_par[1]+p_par[4]*ddx+p_par[5]*ddy
-            p_i = np.array([u_i,v_i,p_par[2],p_par[3],p_par[4],p_par[5]])
+            ddx, ddy = float(nx - px), float(ny - py)
+            u_i = p_par[0] + p_par[2] * ddx + p_par[3] * ddy
+            v_i = p_par[1] + p_par[4] * ddx + p_par[5] * ddy
+            p_i = np.array([u_i, v_i, p_par[2], p_par[3], p_par[4], p_par[5]])
 
             sd_nb = precompute_subset(ref_f64, grad_x, grad_y, nx, ny, dx_sub, dy_sub)
             p_opt, cls_opt, _ = run_icgn(cur_interp, sd_nb, p_i,
-                                          params.max_iter, params.conv_tol)
+                                         params.max_iter, params.conv_tol)
             done[nbidx] = True
-            n_done += 1
+            local_steps += 1
 
             if (cls_opt < params.corr_cutoff and
-                    abs(p_opt[0]-u_i) < cutoff_disp and
-                    abs(p_opt[1]-v_i) < cutoff_disp):
-                _store(u_f,v_f,du_dx,du_dy,dv_dx,dv_dy,
-                       corr_f,ana, nx,ny,p_opt,cls_opt)
+                    abs(p_opt[0] - u_i) < cutoff_disp and
+                    abs(p_opt[1] - v_i) < cutoff_disp):
+                _store(u_f, v_f, du_dx, du_dy, dv_dx, dv_dy,
+                       corr_f, ana, nx, ny, p_opt, cls_opt)
                 heapq.heappush(heap, (cls_opt, nbidx, p_opt.copy()))
 
-        if n_done % max(1, n_total//50) == 0:
-            _report(progress_cb, 0.05+0.93*n_done/n_total,
-                    f"Analysing … {n_done}/{n_total}")
+            if local_steps >= report_interval:
+                with lock:
+                    shared_state["done"] += local_steps
+                    curr_done = shared_state["done"]
+                local_steps = 0
+                _report(progress_cb, curr_done / shared_state["total"],
+                        f"Analysing … {curr_done}/{shared_state['total']}")
 
-    return dict(u=u_f,v=v_f,du_dx=du_dx,du_dy=du_dy,
-                dv_dx=dv_dx,dv_dy=dv_dy,corr=corr_f,analyzed=ana)
+    if local_steps > 0:
+        with lock:
+            shared_state["done"] += local_steps
+            curr_done = shared_state["done"]
+        _report(progress_cb, curr_done / shared_state["total"],
+                f"Analysing … {curr_done}/{shared_state['total']}")
 
+    return dict(u=u_f, v=v_f, du_dx=du_dx, du_dy=du_dy,
+                dv_dx=dv_dx, dv_dy=dv_dy, corr=corr_f, analyzed=ana)
 
 def _build_grid(roi_mask, radius, spacing):
     H, W = roi_mask.shape
