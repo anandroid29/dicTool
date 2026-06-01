@@ -9,7 +9,7 @@ from PyQt6.QtGui import QFont
 from src.ui.wizard import Wizard
 
 def main():
-    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
+    # QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
     app = QApplication(sys.argv)
     app.setApplicationName("PyDIC")
     app.setApplicationVersion("2.0.0")

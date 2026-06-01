@@ -491,10 +491,14 @@ class VideoImporterDialog(QDialog):
         self._ref_spin.setMaximum(max(0, count - 1))
 
     def _browse_out(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Output Directory")
+        path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if path:
-            self._out_edit.setText(path)
-
+            if self._video_path:
+                vid_name = os.path.splitext(os.path.basename(self._video_path))[0]
+                subfolder = f"{vid_name}_frames"
+                self._out_edit.setText(os.path.join(path, subfolder))
+            else:
+                self._out_edit.setText(path)
     # ------------------------------------------------------------------
     # Extraction
     # ------------------------------------------------------------------
@@ -568,7 +572,17 @@ class VideoImporterDialog(QDialog):
         self._extract_status.setText(
             f"Done — {len(paths)} frames saved."
         )
-        self.accept()   # close dialog with Accepted
+
+        try:
+            import json
+            out_dir = os.path.dirname(paths[0])
+            meta_path = os.path.join(out_dir, "dic_metadata.json")
+            with open(meta_path, "w") as f:
+                json.dump({"fps": self._fps}, f)
+        except Exception as e:
+            print(f"Failed to save metadata: {e}")
+
+        self.accept()
 
     @pyqtSlot(str)
     def _on_error(self, msg: str) -> None:
