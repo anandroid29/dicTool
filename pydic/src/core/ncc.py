@@ -5,7 +5,6 @@ Normalized Cross-Correlation (NCC) initial guess for DIC.
 """
 
 from __future__ import annotations
-
 import numpy as np
 
 try:
@@ -14,11 +13,6 @@ try:
 except ImportError:
     _HAVE_CV2 = False
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def ncc_initial_guess(
     ref_image: np.ndarray,
     cur_image: np.ndarray,
@@ -26,33 +20,14 @@ def ncc_initial_guess(
     center_y: int,
     subset_radius: int,
     search_radius: int = 30,
+    guess_u: float = 0.0,
+    guess_v: float = 0.0,
 ) -> tuple[float, float, float]:
-    """
-    Find the integer-pixel displacement (u0, v0) of a subset by NCC.
 
-    Parameters
-    ----------
-    ref_image, cur_image : (H, W) float arrays
-        Reference and current greyscale images.
-    center_x, center_y : int
-        Pixel coordinates of the subset centre in the reference image.
-    subset_radius : int
-        Radius of the circular subset (a square of side 2r+1 is used here
-        for the template, consistent with Ncorr's NCC pass).
-    search_radius : int
-        Half-extent of the search window beyond the template boundary.
-
-    Returns
-    -------
-    u0, v0 : float
-        Integer-pixel x and y displacements.
-    ncc_score : float
-        Peak NCC value (close to 1.0 = good match).
-    """
     H, W = ref_image.shape
     r = subset_radius
 
-    # ---- Template from reference image (square bounding box of circle) ----
+    # ---- Template from reference image ----
     r1 = max(0, center_y - r)
     r2 = min(H, center_y + r + 1)
     c1 = max(0, center_x - r)
@@ -61,30 +36,34 @@ def ncc_initial_guess(
     template = ref_image[r1:r2, c1:c2].astype(np.float32)
     th, tw = template.shape
     if th < 3 or tw < 3:
-        return 0.0, 0.0, 0.0
+        return guess_u, guess_v, 0.0
 
-    # ---- Search region in current image -----------------------------------
-    sr1 = max(0, r1 - search_radius)
-    sr2 = min(H, r2 + search_radius)
-    sc1 = max(0, c1 - search_radius)
-    sc2 = min(W, c2 + search_radius)
+    # ---- Shifted search region in current image ----
+    tgt_x = int(round(center_x + guess_u))
+    tgt_y = int(round(center_y + guess_v))
+
+    sr1 = max(0, tgt_y - r - search_radius)
+    sr2 = min(H, tgt_y + r + search_radius + 1)
+    sc1 = max(0, tgt_x - r - search_radius)
+    sc2 = min(W, tgt_x + r + search_radius + 1)
 
     search = cur_image[sr1:sr2, sc1:sc2].astype(np.float32)
 
     if search.shape[0] < th or search.shape[1] < tw:
-        return 0.0, 0.0, 0.0
+        return guess_u, guess_v, 0.0
 
-    # ---- Correlation ------------------------------------------------------
+    # ---- Correlation ----
     if _HAVE_CV2:
         result = cv2.matchTemplate(search, template, cv2.TM_CCORR_NORMED)
         _, score, _, max_loc = cv2.minMaxLoc(result)
-        col0, row0 = max_loc 
+        col0, row0 = max_loc
     else:
         result = _fft_ncc(search, template)
         idx = np.unravel_index(np.argmax(result), result.shape)
         row0, col0 = idx
         score = float(result[row0, col0])
-    match_row = sr1 + row0  
+
+    match_row = sr1 + row0
     match_col = sc1 + col0
 
     u0 = float(match_col - c1)
@@ -93,10 +72,6 @@ def ncc_initial_guess(
     return u0, v0, float(score)
 
 def _fft_ncc(image: np.ndarray, template: np.ndarray) -> np.ndarray:
-    """
-    Compute NCC between *image* and *template* using FFT cross-correlation.
-    Returns correlation map with the same valid-region shape as cv2.matchTemplate.
-    """
     ih, iw = image.shape
     th, tw = template.shape
     t = template - template.mean()

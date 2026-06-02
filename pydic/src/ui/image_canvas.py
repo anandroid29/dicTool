@@ -7,6 +7,7 @@ Enhanced canvas with:
   - ROI edit mode: after committing a polygon or rectangle, switch to
     ROITool.NONE and click inside the shape to enter edit mode.
   - Snap-to-close for polygon (green ring + one click to finish)
+  - Visible Seed Marker on Right-Click
 """
 
 from __future__ import annotations
@@ -36,11 +37,11 @@ class ROITool(Enum):
     CIRCLE    = auto()
     ERASE     = auto()
 
-POLYGON_SNAP_RADIUS_PX: int = 12
-VERTEX_HIT_PX:          int = 14
-EDGE_HIT_PX:            int = 10
-HANDLE_HIT_PX:          int = 10
-HANDLE_HALF:            int = 5
+POLYGON_SNAP_RADIUS_PX: int = 12   
+VERTEX_HIT_PX:          int = 14   
+EDGE_HIT_PX:            int = 10   
+HANDLE_HIT_PX:          int = 10   
+HANDLE_HALF:            int = 5    
 
 TOOL_TOOLTIPS: dict = {
     ROITool.NONE:
@@ -66,7 +67,7 @@ def make_polygon_tool_icon(size: int = 24, color: QColor = None) -> QIcon:
     if color is None: color = QColor("#2f81f7")
     px = QPixmap(size, size); px.fill(Qt.GlobalColor.transparent)
     p = QPainter(px); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    s = size - 2
+    s = size - 2  
     raw = [(0.48, 0.03), (0.90, 0.22), (0.97, 0.64), (0.68, 0.97), (0.19, 0.88), (0.04, 0.46)]
     pts = [QPointF(x * s + 1, y * s + 1) for x, y in raw]
     fill = QColor(color); fill.setAlpha(38)
@@ -149,8 +150,8 @@ class _PolyEdit:
 class _RectEdit:
     def __init__(self, rect: QRectF):
         self.rect = QRectF(rect)
-        self.handle: Optional[int] = None
-        self.moving: bool = False
+        self.handle: Optional[int] = None   
+        self.moving: bool = False            
 
     def hit_handle(self, wx, wy, zoom, pan_x, pan_y) -> Optional[int]:
         handles = _rect_handles(self.rect)
@@ -176,8 +177,8 @@ class ImageCanvas(QWidget):
     _POLY_VERT_COLOR  = QColor(255, 200,  50, 230)
     _ERASE_COLOR      = QColor(248,  81,  73, 120)
     _SNAP_RING_COLOR  = QColor( 80, 220, 120, 220)
-    _EDIT_VERT_COLOR  = QColor(  0, 229, 255, 240)
-    _EDIT_SEL_COLOR   = QColor(255, 107,  53, 240)
+    _EDIT_VERT_COLOR  = QColor(  0, 229, 255, 240)   
+    _EDIT_SEL_COLOR   = QColor(255, 107,  53, 240)   
     _HANDLE_COLOR     = QColor(  0, 229, 255, 220)
 
     def __init__(self, parent=None) -> None:
@@ -187,24 +188,26 @@ class ImageCanvas(QWidget):
         self.setMouseTracking(True)
 
         # ── MEMORY SAFETY: Instance-bound NumPy & QImage variables ──
-        # These prevent aggressive garbage collection from causing Qt segfaults
         self._image_arr:   Optional[np.ndarray] = None
         self._image_u8:    Optional[np.ndarray] = None
         self._image_qimg:  Optional[QImage]     = None
         self._image_px:    Optional[QPixmap]    = None
-
+        
         self._result_arr:  Optional[np.ndarray] = None
         self._result_rgba: Optional[np.ndarray] = None
         self._result_qimg: Optional[QImage]     = None
         self._result_px:   Optional[QPixmap]    = None
-
+        
         self._roi_mask:    Optional[np.ndarray] = None
         self._roi_rgba:    Optional[np.ndarray] = None
         self._roi_qimg:    Optional[QImage]     = None
         self._roi_px:      Optional[QPixmap]    = None
+        
+        # VISUAL SEED
+        self._seed_xy:     Optional[Tuple[int, int]] = None
         # ─────────────────────────────────────────────────────────────
 
-        self._committed_poly: Optional[List[QPointF]] = None
+        self._committed_poly: Optional[List[QPointF]] = None   
         self._committed_rect: Optional[QRectF]        = None
 
         self._zoom:       float  = 1.0
@@ -236,15 +239,11 @@ class ImageCanvas(QWidget):
 
     def set_image(self, arr: np.ndarray) -> None:
         self._image_arr = arr
-
-        # 100% MEMORY SAFE CONVERSION
-        # Convert float image to contiguous uint8, store to class instance
         self._image_u8 = np.ascontiguousarray(np.clip(arr * 255, 0, 255).astype(np.uint8))
         H, W = self._image_u8.shape
-        # Create QImage passing W as bytesPerLine (avoids 32-bit unaligned crash)
         self._image_qimg = QImage(self._image_u8.data, W, H, W, QImage.Format.Format_Grayscale8)
         self._image_px = QPixmap.fromImage(self._image_qimg)
-
+        
         self.clear_result_overlay()
         self.clear_roi()
         self._fit_to_window()
@@ -253,7 +252,7 @@ class ImageCanvas(QWidget):
     def set_result_overlay_rgba(self, rgba) -> None:
         if rgba is None:
             self.clear_result_overlay(); return
-
+            
         self._result_rgba = np.ascontiguousarray(rgba)
         H, W = self._result_rgba.shape[:2]
         self._result_qimg = QImage(self._result_rgba.data, W, H, W * 4, QImage.Format.Format_RGBA8888)
@@ -288,7 +287,7 @@ class ImageCanvas(QWidget):
         border = self._roi_mask & ~binary_erosion(self._roi_mask)
         rgba[border, 0] = 47; rgba[border, 1] = 129
         rgba[border, 2] = 247; rgba[border, 3] = 180
-
+        
         self._roi_rgba = np.ascontiguousarray(rgba)
         self._roi_qimg = QImage(self._roi_rgba.data, W, H, W * 4, QImage.Format.Format_RGBA8888)
         self._roi_px = QPixmap.fromImage(self._roi_qimg)
@@ -307,7 +306,7 @@ class ImageCanvas(QWidget):
     # ─────────────────────────────────────────────────────────────────────
     # Public API Overrides
     # ─────────────────────────────────────────────────────────────────────
-
+    
     def set_roi_mask(self, mask: np.ndarray) -> None:
         self._roi_mask = mask.astype(bool)
         self._rebuild_roi_pixmap(); self.update()
@@ -319,6 +318,10 @@ class ImageCanvas(QWidget):
         self._poly_edit = None; self._rect_edit = None
         cursor = Qt.CursorShape.ArrowCursor if tool == ROITool.NONE else Qt.CursorShape.CrossCursor
         self.setCursor(cursor); self.update()
+        
+    def set_seed_xy(self, xy: Optional[Tuple[int, int]]) -> None:
+        self._seed_xy = xy
+        self.update()
 
     @property
     def roi_mask(self) -> Optional[np.ndarray]: return self._roi_mask
@@ -390,7 +393,10 @@ class ImageCanvas(QWidget):
             if img_pt and self._image_arr is not None:
                 x, y = int(round(img_pt.x())), int(round(img_pt.y()))
                 H, W = self._image_arr.shape
-                if 0 <= x < W and 0 <= y < H: self.seed_placed.emit(x, y)
+                if 0 <= x < W and 0 <= y < H: 
+                    self._seed_xy = (x, y)
+                    self.seed_placed.emit(x, y)
+                    self.update()
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
@@ -539,6 +545,29 @@ class ImageCanvas(QWidget):
         if self._result_px is not None: painter.drawPixmap(0, 0, self._result_px)
         if self._roi_px is not None: painter.drawPixmap(0, 0, self._roi_px)
         self._paint_roi_preview(painter)
+        
+        # ─── DRAW VISUAL SEED ───
+        if self._seed_xy is not None:
+            sx, sy = self._seed_xy
+            cross_l = 12.0 / self._zoom
+            dot_r   = 3.5 / self._zoom
+            
+            # Neon Pink Crosshair
+            seed_color = QColor(255, 0, 128, 255) 
+            painter.setPen(QPen(seed_color, 2.0 / self._zoom))
+            painter.drawLine(QPointF(sx - cross_l, sy), QPointF(sx + cross_l, sy))
+            painter.drawLine(QPointF(sx, sy - cross_l), QPointF(sx, sy + cross_l))
+            
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(seed_color))
+            painter.drawEllipse(QPointF(sx, sy), dot_r, dot_r)
+            
+            # White outline to guarantee contrast on both light and dark backgrounds
+            painter.setPen(QPen(QColor(255, 255, 255, 200), 1.0 / self._zoom))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QPointF(sx, sy), dot_r + 1.0/self._zoom, dot_r + 1.0/self._zoom)
+        # ────────────────────────
+
         painter.restore()
 
         if self._poly_edit is not None: self._paint_poly_edit(painter)

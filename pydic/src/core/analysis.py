@@ -53,6 +53,7 @@ class DICAnalysis:
         self.fps: float = 1.0
         self._cancel: list = [False]
         self.load_settings()
+
     # -- configuration --
     def set_reference(self, path: str) -> None:
         self.ref_path = path
@@ -72,11 +73,6 @@ class DICAnalysis:
         self._roi_mask = mask.astype(bool)
 
     def set_roi_from_file(self, path: str) -> None:
-        """
-        Load a binary ROI mask from an image file, .npy array, or Ncorr MAT file.
-        Supported formats: PNG, TIF, JPG, BMP (white=ROI), .npy, .mat/.h5.
-        The mask must match the reference image dimensions.
-        """
         if self._ref_image is None:
             raise RuntimeError("Load reference image before setting ROI from file.")
         mask = load_roi_mask(path, expected_shape=self._ref_image.shape)
@@ -104,9 +100,9 @@ class DICAnalysis:
         self._cancel[0] = True
 
     def run(
-        self,
-        progress_cb: Optional[Callable[[float, str], None]] = None,
-        seed_xy: Optional[tuple] = None,
+            self,
+            progress_cb: Optional[Callable[[float, str], None]] = None,
+            seed_xy: Optional[tuple] = None,
     ) -> None:
         self._cancel[0] = False
         self.results.clear()
@@ -121,6 +117,9 @@ class DICAnalysis:
         mask = self._roi_mask
         n = len(self.def_paths)
 
+        # Track previous displacements to prevent losing fast-moving subsets
+        guess_u, guess_v = 0.0, 0.0
+
         for i, def_path in enumerate(self.def_paths):
             if self._cancel[0]:
                 break
@@ -128,7 +127,7 @@ class DICAnalysis:
 
             def pair_cb(frac, msg, _i=i, _n=n):
                 if progress_cb:
-                    progress_cb(_i/n + frac*0.95/_n, f"[{_i+1}/{_n}] {msg}")
+                    progress_cb(_i / n + frac * 0.95 / _n, f"[{_i + 1}/{_n}] {msg}")
 
             pair_cb(0, f"Loading {os.path.basename(def_path)}…")
             cur = _load_image(def_path)
@@ -139,11 +138,17 @@ class DICAnalysis:
             dic: DICResult = run_rg_dic(
                 ref, cur, mask, self.params,
                 seed_xy=seed_xy, progress_cb=pair_cb, cancel_flag=self._cancel,
+                guess_u=guess_u, guess_v=guess_v
             )
             elapsed = time.perf_counter() - t0
 
-            pair_cb(0.98, "Strains…")
+            # Update guesses for the next frame using robust median displacement
             valid = dic.analyzed & ~np.isnan(dic.u)
+            if valid.any():
+                guess_u = float(np.median(dic.u[valid]))
+                guess_v = float(np.median(dic.v[valid]))
+
+            pair_cb(0.98, "Strains…")
             sf = compute_strains(dic.u, dic.v, valid, self.params.strain_window)
 
             self.results.append(PairResult(
@@ -158,11 +163,12 @@ class DICAnalysis:
         if not self._cancel[0] and self.results:
             if progress_cb:
                 progress_cb(0.97, "Computing strain rates…")
-            # self._compute_strain_rates()
+            self._compute_strain_rates()
 
         if progress_cb:
             progress_cb(1.0, "Complete.")
 
+    def _compute_strain_rates(self) -> None:
         N = len(self.results)
         dt = 1.0 / max(self.fps, 1e-9)
 
@@ -188,7 +194,7 @@ class DICAnalysis:
             res.Eyy_rate  = _fd(prev.Eyy,  nxt.Eyy)
             res.Eeff_rate = _fd(prev.Eeff, nxt.Eeff)
 
-    # -- export --
+    # -- export / import --
     def export_csv(self, result_index: int, directory: str) -> None:
         res = self.results[result_index]
         base = os.path.splitext(os.path.basename(res.image_path))[0]
@@ -219,6 +225,48 @@ class DICAnalysis:
                     if arr is not None:
                         g.create_dataset(name, data=arr.astype(np.float32),
                                          compression="gzip", compression_opts=4)
+
+    def load_hdf5(self, path: str) -> None:
+        import h5py
+        self.results.clear()
+        self.def_paths.clear()
+        with h5py.File(path, "r") as f:
+            self.ref_path = f.attrs.get("reference_image", "")
+            try:
+                if self.ref_path and os.path.exists(self.ref_path):
+                    self._ref_image = _load_image(self.ref_path)
+            except Exception:
+                pass
+
+            self.params.subset_radius = int(f.attrs.get("subset_radius", self.params.subset_radius))
+            self.params.subset_spacing = int(f.attrs.get("subset_spacing", self.params.subset_spacing))
+            self.params.strain_window = int(f.attrs.get("strain_window", self.params.strain_window))
+            self.fps = float(f.attrs.get("fps", 1.0))
+
+            for k in sorted([key for key in f.keys() if key.startswith("frame_")]):
+                g = f[k]
+                ipath = g.attrs.get("image_path", "")
+                self.def_paths.append(ipath)
+
+                res = PairResult(
+                    image_path=ipath,
+                    u=g["u"][:] if "u" in g else np.zeros(0),
+                    v=g["v"][:] if "v" in g else np.zeros(0),
+                    Exx=g["Exx"][:] if "Exx" in g else np.zeros(0),
+                    Exy=g["Exy"][:] if "Exy" in g else np.zeros(0),
+                    Eyy=g["Eyy"][:] if "Eyy" in g else np.zeros(0),
+                    Eeff=g["Eeff"][:] if "Eeff" in g else np.zeros(0),
+                    du_dx=g["du_dx"][:] if "du_dx" in g else np.zeros(0),
+                    du_dy=g["du_dy"][:] if "du_dy" in g else np.zeros(0),
+                    dv_dx=g["dv_dx"][:] if "dv_dx" in g else np.zeros(0),
+                    dv_dy=g["dv_dy"][:] if "dv_dy" in g else np.zeros(0),
+                    corr=g["corr"][:] if "corr" in g else np.zeros(0),
+                    elapsed=float(g.attrs.get("elapsed_s", 0.0))
+                )
+                for rate in ("Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate"):
+                    if rate in g:
+                        setattr(res, rate, g[rate][:])
+                self.results.append(res)
 
     def load_settings(self) -> None:
         import json, os
@@ -251,7 +299,7 @@ class DICAnalysis:
                 "search_radius": self.params.search_radius
             }
             with open(path, "w") as f:
-                json.dump(data, f, indent=4)  # Added indent for readability
+                json.dump(data, f, indent=4)
         except Exception:
             pass
 
