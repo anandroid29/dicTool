@@ -14,7 +14,6 @@ from .icgn import precompute_subset, run_icgn
 
 @dataclass
 class DICParams:
-    """All defaults match Ncorr exactly (Blaber et al. 2015)."""
     subset_radius:  int   = 21
     subset_spacing: int   = 3
     strain_window:  int   = 15
@@ -41,6 +40,8 @@ def run_rg_dic(
     seed_xy:   Optional[tuple] = None,
     progress_cb: Optional[Callable] = None,
     cancel_flag: Optional[list] = None,
+    guess_u: float = 0.0,
+    guess_v: float = 0.0,
 ) -> DICResult:
     if cancel_flag is None:
         cancel_flag = [False]
@@ -82,7 +83,6 @@ def run_rg_dic(
 
     shape = (H, W)
 
-    # NEW: Global progress tracking across all threads
     import threading
     shared_state = {"done": 0, "total": n_total}
     progress_lock = threading.Lock()
@@ -95,7 +95,7 @@ def run_rg_dic(
     args_list = [
         (ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
          dxg, dyg, dx_sub, dy_sub,
-         params, seed, shape, cancel_flag, global_cb, shared_state, progress_lock)
+         params, seed, shape, cancel_flag, global_cb, shared_state, progress_lock, guess_u, guess_v)
         for i, ((dxg, dyg), seed) in enumerate(zip(domains, domain_seeds))
     ]
 
@@ -132,28 +132,26 @@ def run_rg_dic(
 def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
                 domain_gx, domain_gy, dx_sub, dy_sub,
                 params, seed_xy, shape, cancel_flag, progress_cb,
-                shared_state, lock):
-    """RG-DIC on one spatial domain — runs in its own thread."""
+                shared_state, lock, guess_u, guess_v):
+
     step = params.subset_spacing
     cutoff_disp = float(step + 1)
 
     grid_map = {(int(domain_gx[i]), int(domain_gy[i])): i
                 for i in range(len(domain_gx))}
 
-    u_f = np.full(shape, np.nan);
-    v_f = np.full(shape, np.nan)
-    du_dx = np.full(shape, np.nan);
-    du_dy = np.full(shape, np.nan)
-    dv_dx = np.full(shape, np.nan);
-    dv_dy = np.full(shape, np.nan)
-    corr_f = np.full(shape, np.nan);
-    ana = np.zeros(shape, dtype=bool)
+    u_f = np.full(shape, np.nan); v_f = np.full(shape, np.nan)
+    du_dx = np.full(shape, np.nan); du_dy = np.full(shape, np.nan)
+    dv_dx = np.full(shape, np.nan); dv_dy = np.full(shape, np.nan)
+    corr_f = np.full(shape, np.nan); ana = np.zeros(shape, dtype=bool)
 
     sx, sy = _snap(seed_xy[0], seed_xy[1], domain_gx, domain_gy)
     seed_idx = grid_map.get((sx, sy), 0)
 
     u0, v0, _ = ncc_initial_guess(ref_f64, cur_image_raw, sx, sy,
-                                  params.subset_radius, params.search_radius)
+                                  params.subset_radius, params.search_radius,
+                                  guess_u, guess_v)
+
     p0 = np.array([u0, v0, 0., 0., 0., 0.])
     sd = precompute_subset(ref_f64, grad_x, grad_y, sx, sy, dx_sub, dy_sub)
     p0, cls0, _ = run_icgn(cur_interp, sd, p0, params.max_iter, params.conv_tol)
@@ -167,7 +165,6 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
 
     heap = [(cls0, seed_idx, p0.copy())]
 
-    # NEW: Local steps to avoid locking on every single subset (performance)
     local_steps = 0
     report_interval = max(1, shared_state["total"] // 100)
 
@@ -180,7 +177,6 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
             if nbidx is None or done[nbidx]:
                 continue
 
-            # Taylor-extrapolated initial guess (Ncorr calcpoint)
             ddx, ddy = float(nx - px), float(ny - py)
             u_i = p_par[0] + p_par[2] * ddx + p_par[3] * ddy
             v_i = p_par[1] + p_par[4] * ddx + p_par[5] * ddy

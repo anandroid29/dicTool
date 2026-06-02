@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, List, Optional
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QEvent
 from PyQt6.QtGui import QFont, QPixmap, QImage
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -26,6 +26,19 @@ _C_TEXT    = "#e2e8f0"
 _C_TEXT2   = "#94a3b8"
 _C_TEXT3   = "#475569"
 _C_SUCCESS = "#10b981"
+
+
+class _FocusFilter(QObject):
+    """Event filter to auto-check a radio button when a widget is interacted with."""
+    def __init__(self, target_radio: QRadioButton):
+        super().__init__()
+        self._target = target_radio
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.FocusIn, QEvent.Type.Wheel):
+            if not self._target.isChecked():
+                self._target.setChecked(True)
+        return super().eventFilter(obj, event)
 
 
 class _ImportCard(QFrame):
@@ -102,7 +115,7 @@ class WelcomePage(QWidget):
         hero = QWidget()
         hero.setStyleSheet(f"background:#0e1c2e;")
         hero_lay = QVBoxLayout(hero)
-        hero_lay.setContentsMargins(60, 40, 60, 30) # Reduced margins
+        hero_lay.setContentsMargins(60, 40, 60, 30)
         hero_lay.setSpacing(6)
 
         logo = QLabel("PyDIC")
@@ -125,8 +138,8 @@ class WelcomePage(QWidget):
         # ── Body ──────────────────────────────────────────────────────
         body = QWidget()
         body_lay = QVBoxLayout(body)
-        body_lay.setContentsMargins(60, 30, 60, 30) # Reduced margins
-        body_lay.setSpacing(24)                     # Reduced spacing
+        body_lay.setContentsMargins(60, 30, 60, 30)
+        body_lay.setSpacing(24)
 
         step_lbl = QLabel("Step 1  —  Import your footage")
         step_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:13px; font-weight:600;")
@@ -151,12 +164,18 @@ class WelcomePage(QWidget):
         self._card_images.clicked.connect(self._load_images)
         cards_row.addWidget(self._card_images)
 
+        self._card_hdf5 = _ImportCard(
+            "🗄️", "Load Session",
+            "HDF5 (.h5)\nRestore previous analysis"
+        )
+        self._card_hdf5.clicked.connect(self._load_hdf5)
+        cards_row.addWidget(self._card_hdf5)
+
         cards_row.addStretch()
         body_lay.addLayout(cards_row)
 
         # ── Frame Sampling Settings ───────────────────────────────────
         self.frame_options_grp = QGroupBox("FRAME SAMPLING SETTINGS")
-        # Hard minimum height guarantees it never squishes
         self.frame_options_grp.setMinimumHeight(140)
         self.frame_options_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.frame_options_grp.setStyleSheet(f"""
@@ -204,11 +223,11 @@ class WelcomePage(QWidget):
         self.max_frames_spin = QSpinBox()
         self.max_frames_spin.setRange(1, 999999)
         self.max_frames_spin.setValue(30)
-        self.max_frames_spin.setEnabled(False)
         self.max_frames_spin.setStyleSheet(f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px;")
 
-        # Tie spinbox enabled state to radio button
-        self.radio_limit_frames.toggled.connect(self.max_frames_spin.setEnabled)
+        # CRITICAL FIX: Intercept mouse clicks, scrolling, and keyboard focus to auto-select the radio button
+        self._spin_focus_filter = _FocusFilter(self.radio_limit_frames)
+        self.max_frames_spin.installEventFilter(self._spin_focus_filter)
 
         limit_lay.addWidget(self.max_frames_spin)
         limit_lay.addStretch()
@@ -219,7 +238,6 @@ class WelcomePage(QWidget):
 
         # Status area
         self._status_box = QFrame()
-        # Hard minimum height guarantees it never squishes
         self._status_box.setMinimumHeight(80)
         self._status_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._status_box.setStyleSheet(
@@ -286,7 +304,6 @@ class WelcomePage(QWidget):
 
         analysis = self._wizard.analysis
 
-        # Calculate effective FPS (scales time correctly for strain rates)
         original_fps = dlg._fps if hasattr(dlg, '_fps') else 1.0
         analysis.fps = original_fps / step
 
@@ -300,26 +317,23 @@ class WelcomePage(QWidget):
     def _load_images(self) -> None:
         analysis = self._wizard.analysis
 
-        # 1. Ask for a folder
         folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
         if not folder:
             return
 
-        # 2. Gather and sort image files
         valid_exts = {".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"}
         img_files = []
         for f in os.listdir(folder):
             if os.path.splitext(f)[1].lower() in valid_exts:
                 img_files.append(os.path.join(folder, f))
 
-        img_files.sort()  # Lexicographical sort
+        img_files.sort()
 
         if len(img_files) < 2:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Not Enough Images", "The folder must contain at least 2 images.")
             return
 
-        # 3. Apply Slicing Logic
         step = self.step_spin.value()
         ref = img_files[0]
         defs = img_files[1:]
@@ -335,7 +349,6 @@ class WelcomePage(QWidget):
             QMessageBox.warning(self, "Empty Selection", "Your sampling settings filtered out all deformed frames.")
             return
 
-        # 4. Look for invisible metadata file to calculate original FPS
         original_fps = 1.0
         import json
         meta_path = os.path.join(folder, "dic_metadata.json")
@@ -348,10 +361,8 @@ class WelcomePage(QWidget):
             except Exception:
                 pass
 
-        # Update effective FPS
         analysis.fps = original_fps / step
 
-        # 5. Assign reference and deformed
         analysis.set_reference(ref)
         analysis.clear_deformed()
         for p in defs:
@@ -359,9 +370,20 @@ class WelcomePage(QWidget):
 
         self._update_status(ref, defs, analysis.fps)
 
+    def _load_hdf5(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load HDF5 Session", "", "HDF5 Files (*.h5 *.hdf5)")
+        if not path:
+            return
+        try:
+            self._wizard.analysis.load_hdf5(path)
+            self._wizard.go_results()
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Load Error", f"Failed to load session:\n{e}")
+
     def _update_status(self, ref: str, defs: list, fps: float) -> None:
         self._status_ref.setText(
-            f"Reference: {os.path.basename(ref)}"
+            f"✓  Reference: {os.path.basename(ref)}"
         )
         self._status_ref.setStyleSheet(f"color:{_C_SUCCESS}; font-size:12px; border:none;")
         self._status_def.setText(
