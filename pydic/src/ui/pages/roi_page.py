@@ -133,7 +133,7 @@ class ROIPage(QWidget):
         clr_btn = QPushButton("⟳")
         clr_btn.setToolTip("Clear ROI")
         clr_btn.setFixedSize(44, 36)
-        clr_btn.clicked.connect(lambda: self._canvas.clear_roi())
+        clr_btn.clicked.connect(self._clear_roi)  # <-- Changed here
         clr_btn.setStyleSheet(
             f"QPushButton {{ background:{_C_CARD}; color:{_C_TEXT2}; "
             f"border:1px solid {_C_BORDER}; border-radius:8px; font-size:16px; }} "
@@ -165,7 +165,7 @@ class ROIPage(QWidget):
         full_btn.clicked.connect(self._use_full)
         foot_lay.addWidget(full_btn)
 
-        load_btn = QPushButton("📁  Load ROI from File")
+        load_btn = QPushButton("Load ROI from File")
         load_btn.setFixedWidth(180)
         load_btn.setToolTip(
             "Load a pre-defined ROI mask from:\n"
@@ -199,8 +199,47 @@ class ROIPage(QWidget):
         """Called by wizard when this page becomes visible."""
         img = self._wizard.analysis.reference_image
         if img is not None:
-            self._canvas.set_image(img)
-            self._canvas.zoom_fit()
+            # Only set the image if it's new so we don't reset the user's pan/zoom
+            if self._canvas._image_arr is not img:
+                self._canvas.set_image(img)
+                self._canvas.zoom_fit()
+
+        # Restore ROI Mask & update labels
+        mask = self._wizard.analysis.roi_mask
+        if mask is not None:
+            self._canvas.set_roi_mask(mask)
+            n = int(mask.sum())
+            self._roi_lbl.setText(f"ROI: {n:,} px selected")
+            self._roi_lbl.setStyleSheet("color:#10b981; font-size:11px;")
+            self._next_btn.setEnabled(n > 0)
+        else:
+            self._roi_lbl.setText("No ROI drawn")
+            self._roi_lbl.setStyleSheet("color:#94a3b8; font-size:11px;")
+            self._next_btn.setEnabled(False)
+
+        # Restore Seed & update labels
+        if getattr(self._wizard, "seed_xy", None) is not None:
+            sx, sy = self._wizard.seed_xy
+            self._canvas.set_seed_xy((sx, sy))
+            self._seed_status.setText(f"Seed: ({sx}, {sy})")
+            self._seed_status.setStyleSheet("color:#10b981; font-size:11px;")
+        else:
+            self._seed_status.setText("No seed — will default to ROI centroid")
+            self._seed_status.setStyleSheet("color:#94a3b8; font-size:11px;")
+
+        # Hide the subset radius square/circle on the ROI page
+        if hasattr(self._canvas, "set_subset_radius"):
+            self._canvas.set_subset_radius(None)
+
+    def _clear_roi(self) -> None:
+        """Reset the ROI and drop any existing seed."""
+        self._canvas.clear_roi()
+        self._wizard.seed_xy = None
+        self._seed_status.setText("No seed — will default to ROI centroid")
+        self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        self._roi_lbl.setText("No ROI drawn")
+        self._roi_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        self._next_btn.setEnabled(False)
 
     def _on_roi_changed(self, mask: np.ndarray) -> None:
         self._wizard.analysis.set_roi_mask(mask)
@@ -208,6 +247,15 @@ class ROIPage(QWidget):
         self._roi_lbl.setText(f"ROI: {n:,} px selected")
         self._roi_lbl.setStyleSheet(f"color:{_C_SUCCESS}; font-size:11px;")
         self._next_btn.setEnabled(n > 0)
+
+        # Verify existing seed is still inside the newly edited ROI
+        if getattr(self._wizard, 'seed_xy', None) is not None:
+            sx, sy = self._wizard.seed_xy
+            if not mask[sy, sx]:
+                self._wizard.seed_xy = None
+                self._canvas.set_seed_xy(None)
+                self._seed_status.setText("No seed — will default to ROI centroid")
+                self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
 
     def _on_seed_placed(self, x: int, y: int) -> None:
         self._wizard.seed_xy = (x, y)

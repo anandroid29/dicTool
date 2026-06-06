@@ -577,8 +577,13 @@ class VideoImporterDialog(QDialog):
             import json
             out_dir = os.path.dirname(paths[0])
             meta_path = os.path.join(out_dir, "dic_metadata.json")
+
+            # Calculate effective FPS based on extraction step ---
+            extraction_step = self._step_spin.value()
+            effective_fps = self._fps / extraction_step if extraction_step > 0 else self._fps
+
             with open(meta_path, "w") as f:
-                json.dump({"fps": self._fps}, f)
+                json.dump({"fps": effective_fps}, f)
         except Exception as e:
             print(f"Failed to save metadata: {e}")
 

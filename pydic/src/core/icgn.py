@@ -28,9 +28,9 @@ class SubsetData:
         self.dy = dy
         self.f_norm = f_norm
         self.sigma_f = sigma_f
-        self.sd = sd
-        self.H = H
-        self.L_fac = L_fac
+        self.sd = sd  # steepest descent -> Jacobian
+        self.H = H  # Hessian matrix
+        self.L_fac = L_fac  # Cholesky factorization of Hessian
         self.valid = (L_fac is not None) and (sigma_f > 1e-12)
 
 
