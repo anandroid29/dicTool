@@ -188,45 +188,47 @@ class ImageCanvas(QWidget):
         self.setMouseTracking(True)
 
         # ── MEMORY SAFETY: Instance-bound NumPy & QImage variables ──
-        self._image_arr:   Optional[np.ndarray] = None
-        self._image_u8:    Optional[np.ndarray] = None
-        self._image_qimg:  Optional[QImage]     = None
-        self._image_px:    Optional[QPixmap]    = None
-        
-        self._result_arr:  Optional[np.ndarray] = None
+        self._image_arr: Optional[np.ndarray] = None
+        self._image_u8: Optional[np.ndarray] = None
+        self._image_qimg: Optional[QImage] = None
+        self._image_px: Optional[QPixmap] = None
+
+        self._result_arr: Optional[np.ndarray] = None
         self._result_rgba: Optional[np.ndarray] = None
-        self._result_qimg: Optional[QImage]     = None
-        self._result_px:   Optional[QPixmap]    = None
-        
-        self._roi_mask:    Optional[np.ndarray] = None
-        self._roi_rgba:    Optional[np.ndarray] = None
-        self._roi_qimg:    Optional[QImage]     = None
-        self._roi_px:      Optional[QPixmap]    = None
-        
-        # VISUAL SEED
-        self._seed_xy:     Optional[Tuple[int, int]] = None
+        self._result_qimg: Optional[QImage] = None
+        self._result_px: Optional[QPixmap] = None
+
+        self._roi_mask: Optional[np.ndarray] = None
+        self._roi_rgba: Optional[np.ndarray] = None
+        self._roi_qimg: Optional[QImage] = None
+        self._roi_px: Optional[QPixmap] = None
+
+        # VISUAL SEED & SUBSET PREVIEW
+        self._seed_xy: Optional[Tuple[int, int]] = None
+        self._subset_radius: Optional[int] = None
+        self.seed_enabled: bool = True
         # ─────────────────────────────────────────────────────────────
 
-        self._committed_poly: Optional[List[QPointF]] = None   
-        self._committed_rect: Optional[QRectF]        = None
+        self._committed_poly: Optional[List[QPointF]] = None
+        self._committed_rect: Optional[QRectF] = None
 
-        self._zoom:       float  = 1.0
-        self._pan_x:      float  = 0.0
-        self._pan_y:      float  = 0.0
-        self._dragging:   bool   = False
+        self._zoom: float = 1.0
+        self._pan_x: float = 0.0
+        self._pan_y: float = 0.0
+        self._dragging: bool = False
         self._drag_start: QPoint = QPoint()
 
-        self._tool:         ROITool           = ROITool.NONE
-        self._poly_pts:     List[QPointF]     = []
-        self._poly_snapped: bool              = False
-        self._rect_start:   Optional[QPointF] = None
-        self._rect_cur:     Optional[QPointF] = None
-        self._circ_centre:  Optional[QPointF] = None
-        self._circ_radius:  float             = 0.0
-        self._mouse_img:    Optional[QPointF] = None
+        self._tool: ROITool = ROITool.NONE
+        self._poly_pts: List[QPointF] = []
+        self._poly_snapped: bool = False
+        self._rect_start: Optional[QPointF] = None
+        self._rect_cur: Optional[QPointF] = None
+        self._circ_centre: Optional[QPointF] = None
+        self._circ_radius: float = 0.0
+        self._mouse_img: Optional[QPointF] = None
         self._mouse_widget: Optional[QPointF] = None
-        self._erase_pts:    List[QPointF]     = []
-        self._erase_radius: int               = 20
+        self._erase_pts: List[QPointF] = []
+        self._erase_radius: int = 20
 
         self._poly_edit: Optional[_PolyEdit] = None
         self._rect_edit: Optional[_RectEdit] = None
@@ -265,15 +267,23 @@ class ImageCanvas(QWidget):
         import matplotlib, matplotlib.cm as mcm
         cmap = mcm.get_cmap(colormap)
         valid = mask & ~np.isnan(field)
-        if vmin is None: vmin = float(np.nanmin(field[valid])) if valid.any() else 0.0
-        if vmax is None: vmax = float(np.nanmax(field[valid])) if valid.any() else 1.0
+
+        if valid.any():
+            valid_data = field[valid]
+            # Robust scaling: ignore top/bottom 2% of extreme outliers
+            if vmin is None: vmin = float(np.nanpercentile(valid_data, 2))
+            if vmax is None: vmax = float(np.nanpercentile(valid_data, 98))
+        else:
+            if vmin is None: vmin = 0.0
+            if vmax is None: vmax = 1.0
+
         if vmax == vmin: vmax = vmin + 1e-12
         norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
         H, W = field.shape
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
         colors = cmap(norm(np.where(valid, field, 0.0)))
         rgba[..., :3] = (colors[..., :3] * 255).astype(np.uint8)
-        rgba[..., 3]  = np.where(valid, int(alpha * 255), 0).astype(np.uint8)
+        rgba[..., 3] = np.where(valid, int(alpha * 255), 0).astype(np.uint8)
         self.set_result_overlay_rgba(rgba)
 
     def _rebuild_roi_pixmap(self) -> None:
@@ -297,10 +307,17 @@ class ImageCanvas(QWidget):
         self.update()
 
     def clear_roi(self) -> None:
-        self._roi_mask = None; self._roi_rgba = None; self._roi_qimg = None; self._roi_px = None
-        self._poly_pts = []; self._rect_start = None
-        self._committed_poly = None; self._committed_rect = None
-        self._poly_edit = None; self._rect_edit = None
+        self._roi_mask = None;
+        self._roi_rgba = None;
+        self._roi_qimg = None;
+        self._roi_px = None
+        self._poly_pts = [];
+        self._rect_start = None
+        self._committed_poly = None;
+        self._committed_rect = None
+        self._poly_edit = None;
+        self._rect_edit = None
+        self._seed_xy = None
         self.update()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -350,27 +367,38 @@ class ImageCanvas(QWidget):
         pos, wx, wy = event.position(), event.position().x(), event.position().y()
 
         if event.button() == Qt.MouseButton.MiddleButton:
-            self._dragging = True; self._drag_start = pos.toPoint()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor); return
+            self._dragging = True;
+            self._drag_start = pos.toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor);
+            return
 
         if self._poly_edit is not None:
             pe = self._poly_edit
             if event.button() == Qt.MouseButton.LeftButton:
                 vi = pe.hit_vertex(wx, wy, self._zoom, self._pan_x, self._pan_y)
                 if vi is not None:
-                    pe.selected = vi; pe.dragging = True; self.update(); return
+                    pe.selected = vi;
+                    pe.dragging = True;
+                    self.update();
+                    return
                 ei, t = pe.hit_edge(wx, wy, self._zoom, self._pan_x, self._pan_y)
                 if ei is not None:
                     p1, p2 = pe.pts[ei], pe.pts[(ei + 1) % len(pe.pts)]
                     pe.pts.insert(ei + 1, QPointF(p1.x() + t * (p2.x() - p1.x()), p1.y() + t * (p2.y() - p1.y())))
-                    pe.selected = ei + 1; pe.dragging = True; self.update(); return
-                self._commit_poly_edit(); self.update()
+                    pe.selected = ei + 1;
+                    pe.dragging = True;
+                    self.update();
+                    return
+                self._commit_poly_edit();
+                self.update()
             elif event.button() == Qt.MouseButton.RightButton:
                 vi = pe.hit_vertex(wx, wy, self._zoom, self._pan_x, self._pan_y)
                 if vi is not None and len(pe.pts) > 3:
                     pe.pts.pop(vi)
-                    if pe.selected == vi: pe.selected = None
-                    elif pe.selected is not None and pe.selected > vi: pe.selected -= 1
+                    if pe.selected == vi:
+                        pe.selected = None
+                    elif pe.selected is not None and pe.selected > vi:
+                        pe.selected -= 1
                     self.update()
             return
 
@@ -379,39 +407,55 @@ class ImageCanvas(QWidget):
             if event.button() == Qt.MouseButton.LeftButton:
                 hi = re.hit_handle(wx, wy, self._zoom, self._pan_x, self._pan_y)
                 if hi is not None:
-                    re.handle = hi; self.update(); return
+                    re.handle = hi;
+                    self.update();
+                    return
                 img_pt = self._widget_to_image(pos)
                 if img_pt and re.hit_interior(img_pt):
-                    re.moving = True; self._drag_start = pos.toPoint(); self.update(); return
-                self._commit_rect_edit(); self.update()
+                    re.moving = True;
+                    self._drag_start = pos.toPoint();
+                    self.update();
+                    return
+                self._commit_rect_edit();
+                self.update()
             return
 
         if event.button() == Qt.MouseButton.RightButton:
             if self._tool == ROITool.POLYGON and self._poly_pts:
-                self._poly_pts.pop(); self._poly_snapped = False; self.update(); return
+                self._poly_pts.pop();
+                self._poly_snapped = False;
+                self.update();
+                return
             img_pt = self._widget_to_image(pos)
-            if img_pt and self._image_arr is not None:
+            if self.seed_enabled and img_pt and self._image_arr is not None:
                 x, y = int(round(img_pt.x())), int(round(img_pt.y()))
                 H, W = self._image_arr.shape
-                if 0 <= x < W and 0 <= y < H: 
-                    self._seed_xy = (x, y)
-                    self.seed_placed.emit(x, y)
-                    self.update()
+                if 0 <= x < W and 0 <= y < H:
+                    # ── ONLY place seed if an ROI exists and the point is inside it ──
+                    if self._roi_mask is not None and self._roi_mask[y, x]:
+                        self._seed_xy = (x, y)
+                        self.seed_placed.emit(x, y)
+                        self.update()
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
             img_pt = self._widget_to_image(pos)
             if img_pt is None: return
 
-            if self._tool == ROITool.NONE: self._try_enter_edit(pos, img_pt)
+            if self._tool == ROITool.NONE:
+                self._try_enter_edit(pos, img_pt)
             elif self._tool == ROITool.POLYGON:
                 if self._poly_snapped and len(self._poly_pts) >= 3:
-                    self._commit_polygon(); return
-                self._poly_pts.append(img_pt); self.update()
+                    self._commit_polygon();
+                    return
+                self._poly_pts.append(img_pt);
+                self.update()
             elif self._tool == ROITool.RECTANGLE:
-                self._rect_start = img_pt; self._rect_cur = img_pt
+                self._rect_start = img_pt;
+                self._rect_cur = img_pt
             elif self._tool == ROITool.CIRCLE:
-                self._circ_centre = img_pt; self._circ_radius = 0.0
+                self._circ_centre = img_pt;
+                self._circ_radius = 0.0
             elif self._tool == ROITool.ERASE:
                 self._erase_pts = [img_pt]
 
@@ -545,28 +589,23 @@ class ImageCanvas(QWidget):
         if self._result_px is not None: painter.drawPixmap(0, 0, self._result_px)
         if self._roi_px is not None: painter.drawPixmap(0, 0, self._roi_px)
         self._paint_roi_preview(painter)
-        
-        # ─── DRAW VISUAL SEED ───
+
+        # ─── DRAW VISUAL SEED & SUBSET CIRCLE ───
         if self._seed_xy is not None:
             sx, sy = self._seed_xy
-            cross_l = 12.0 / self._zoom
-            dot_r   = 3.5 / self._zoom
-            
-            # Neon Pink Crosshair
-            seed_color = QColor(255, 0, 128, 255) 
-            painter.setPen(QPen(seed_color, 2.0 / self._zoom))
-            painter.drawLine(QPointF(sx - cross_l, sy), QPointF(sx + cross_l, sy))
-            painter.drawLine(QPointF(sx, sy - cross_l), QPointF(sx, sy + cross_l))
-            
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(seed_color))
-            painter.drawEllipse(QPointF(sx, sy), dot_r, dot_r)
-            
-            # White outline to guarantee contrast on both light and dark backgrounds
-            painter.setPen(QPen(QColor(255, 255, 255, 200), 1.0 / self._zoom))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QPointF(sx, sy), dot_r + 1.0/self._zoom, dot_r + 1.0/self._zoom)
-        # ────────────────────────
+
+            # If radius is set (Params Page), use it. Otherwise (ROI page), use a small dot.
+            sr = float(self._subset_radius) if getattr(self, '_subset_radius', None) is not None else (4.0 / self._zoom)
+
+            # Red theme for the circle
+            outline_color = QColor(255, 60, 60, 220)
+            fill_color = QColor(255, 60, 60, 45)
+
+            painter.setPen(QPen(outline_color, 1.5 / self._zoom, Qt.PenStyle.SolidLine))
+            painter.setBrush(QBrush(fill_color))
+
+            painter.drawEllipse(QPointF(sx, sy), sr, sr)
+        # ────────────────────────────────────────
 
         painter.restore()
 
@@ -577,7 +616,7 @@ class ImageCanvas(QWidget):
             x, y = self._mouse_img.x(), self._mouse_img.y()
             H, W = self._image_arr.shape
             if 0 <= x < W and 0 <= y < H:
-                val   = self._image_arr[int(y), int(x)]
+                val = self._image_arr[int(y), int(x)]
                 extra = ""
                 if self._tool == ROITool.POLYGON and self._poly_pts:
                     extra = f"  pts={len(self._poly_pts)}"
@@ -771,6 +810,10 @@ class ImageCanvas(QWidget):
     def resizeEvent(self, event) -> None:
         if self._image_px is not None: self._fit_to_window()
         super().resizeEvent(event)
+
+    def set_subset_radius(self, radius: Optional[int]) -> None:
+        self._subset_radius = radius
+        self.update()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

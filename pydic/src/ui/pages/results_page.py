@@ -180,6 +180,7 @@ class ResultsPage(QWidget):
 
         # Canvas
         self._canvas = ImageCanvas()
+        self._canvas.seed_enabled = False  # Disable seed placement here
         self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
                                    QSizePolicy.Policy.Expanding)
         body_lay.addWidget(self._canvas, 1)

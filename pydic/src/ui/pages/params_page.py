@@ -220,8 +220,21 @@ class ParamsPage(QWidget):
     def on_enter(self) -> None:
         img = self._wizard.analysis.reference_image
         if img is not None:
-            self._canvas.set_image(img)
-            self._canvas.zoom_fit()
+            # Only set the image if it's new to preserve pan/zoom
+            if self._canvas._image_arr is not img:
+                self._canvas.set_image(img)
+                self._canvas.zoom_fit()
+
+        # Restore Mask
+        mask = self._wizard.analysis.roi_mask
+        if mask is not None:
+            self._canvas.set_roi_mask(mask)
+
+        # Restore Seed
+        if getattr(self._wizard, "seed_xy", None) is not None:
+            self._canvas.set_seed_xy(self._wizard.seed_xy)
+
+        # Trigger parameter refresh to draw the subset radius
         self._on_param_changed()
 
     def _on_param_changed(self) -> None:
@@ -233,6 +246,9 @@ class ParamsPage(QWidget):
         p.conv_tol       = self._sp_tol.value()
         p.corr_cutoff    = self._sp_cutoff.value()
         p.search_radius  = self._sp_search.value()
+
+        if hasattr(self._canvas, "set_subset_radius"):
+            self._canvas.set_subset_radius(p.subset_radius)
 
         # Count estimated subsets
         img = self._wizard.analysis.reference_image
