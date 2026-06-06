@@ -43,22 +43,31 @@ _C_TEXT3   = "#475569"
 _C_SUCCESS = "#10b981"
 
 FIELDS = {
+    # 1. Displacements
+    "u": ("Displacement u", "px"),
+    "v": ("Displacement v", "px"),
+
+    # 2. Velocities
+    "Vx": ("Velocity Vx", "px/s"),
+    "Vy": ("Velocity Vy", "px/s"),
+    "Veff": ("Effective Velocity", "px/s"),
+
+    # 3. Strain Rates
+    "Exx_rate": ("Strain Rate  Ėxx", "s⁻¹"),
+    "Exy_rate": ("Strain Rate  Ėxy", "s⁻¹"),
+    "Eyy_rate": ("Strain Rate  Ėyy", "s⁻¹"),
     "Eeff_rate": ("Effective Strain Rate", "s⁻¹"),
-    "Exx_rate":  ("Strain Rate  Ėxx",      "s⁻¹"),
-    "Exy_rate":  ("Strain Rate  Ėxy",      "s⁻¹"),
-    "Eyy_rate":  ("Strain Rate  Ėyy",      "s⁻¹"),
-    "Eeff":      ("Effective Strain",       "ε"),
-    "Exx":       ("Strain  Exx",            "ε"),
-    "Exy":       ("Strain  Exy",            "ε"),
-    "Eyy":       ("Strain  Eyy",            "ε"),
-    "u":         ("Displacement u",         "px"),
-    "v":         ("Displacement v",         "px"),
+
+    # 4. Accumulated Strains
+    "Exx": ("Strain  Exx", "ε"),
+    "Exy": ("Strain  Exy", "ε"),
+    "Eyy": ("Strain  Eyy", "ε"),
+    "Eeff": ("Effective Strain", "ε"),
 }
 
 CMAPS = ["inferno","magma","plasma","cividis","hot","afmhot",
          "gist_heat","copper","RdBu_r","seismic","bwr","coolwarm",
          "viridis","turbo","jet","gray"]
-
 
 class _ColorBar(QWidget):
     """A thin horizontal gradient bar with vmin/vmax labels."""

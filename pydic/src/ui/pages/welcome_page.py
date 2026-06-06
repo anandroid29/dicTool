@@ -426,8 +426,9 @@ class WelcomePage(QWidget):
             QMessageBox.critical(self, "Dialog Error", f"Failed to open settings dialog:\n{e}")
             return
 
-        if roi_path and roi_path in img_files:
-            img_files.remove(roi_path)
+        if roi_path:
+            roi_norm = os.path.normpath(roi_path)
+            img_files = [f for f in img_files if os.path.normpath(f) != roi_norm]
 
         if len(img_files) < 2:
             QMessageBox.warning(self, "Invalid Selection", "Not enough images remaining after excluding the ROI mask.")
