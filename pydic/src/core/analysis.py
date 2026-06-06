@@ -18,7 +18,6 @@ except ImportError:
 
 from .rg_dic import DICParams, DICResult, run_rg_dic
 from .roi_loader import load_roi_mask
-from .strain import compute_strains
 
 
 @dataclass
@@ -35,6 +34,13 @@ class PairResult:
     dv_dx: np.ndarray
     dv_dy: np.ndarray
     corr:  np.ndarray
+    Vx:    Optional[np.ndarray] = None
+    Vy:    Optional[np.ndarray] = None
+    Veff:  Optional[np.ndarray] = None
+    dVx_dx: Optional[np.ndarray] = None
+    dVx_dy: Optional[np.ndarray] = None
+    dVy_dx: Optional[np.ndarray] = None
+    dVy_dy: Optional[np.ndarray] = None
     Exx_rate:  Optional[np.ndarray] = None
     Exy_rate:  Optional[np.ndarray] = None
     Eyy_rate:  Optional[np.ndarray] = None
@@ -135,7 +141,7 @@ class DICAnalysis:
                 raise ValueError(f"Shape mismatch: {def_path}")
 
             t0 = time.perf_counter()
-            dic: DICResult = run_rg_dic(
+            dic = run_rg_dic(
                 ref, cur, mask, self.params,
                 seed_xy=seed_xy, progress_cb=pair_cb, cancel_flag=self._cancel,
                 guess_u=guess_u, guess_v=guess_v
@@ -148,61 +154,126 @@ class DICAnalysis:
                 guess_u = float(np.median(dic.u[valid]))
                 guess_v = float(np.median(dic.v[valid]))
 
-            pair_cb(0.98, "Strains…")
-            sf = compute_strains(dic.u, dic.v, valid, self.params.strain_window)
+            # We no longer calculate strains from displacement here.
+            # Fill with NaNs temporarily; they will be computed via integration.
+            nan_arr = np.full_like(dic.u, np.nan)
 
             self.results.append(PairResult(
                 image_path=def_path,
                 u=dic.u, v=dic.v,
-                Exx=sf["Exx"], Exy=sf["Exy"], Eyy=sf["Eyy"], Eeff=sf["Eeff"],
-                du_dx=sf["du_dx"], du_dy=sf["du_dy"],
-                dv_dx=sf["dv_dx"], dv_dy=sf["dv_dy"],
+                Exx=nan_arr.copy(), Exy=nan_arr.copy(), Eyy=nan_arr.copy(), Eeff=nan_arr.copy(),
+                du_dx=nan_arr.copy(), du_dy=nan_arr.copy(),
+                dv_dx=nan_arr.copy(), dv_dy=nan_arr.copy(),
                 corr=dic.corr, elapsed=elapsed,
             ))
 
         if not self._cancel[0] and self.results:
             if progress_cb:
-                progress_cb(0.97, "Computing strain rates…")
-            self._compute_strain_rates()
+                progress_cb(0.97, "Computing velocities & integrating strains…")
+            self._compute_velocities_and_rates()
 
         if progress_cb:
             progress_cb(1.0, "Complete.")
 
-    def _compute_strain_rates(self) -> None:
+    def _compute_velocities_and_rates(self) -> None:
         N = len(self.results)
         dt = 1.0 / max(self.fps, 1e-9)
 
+        # 1. Compute Velocities via temporal finite difference
         for i, res in enumerate(self.results):
             if N == 1:
-                nan = np.full_like(res.Exx, np.nan)
-                res.Exx_rate = res.Exy_rate = res.Eyy_rate = res.Eeff_rate = nan.copy()
+                nan = np.full_like(res.u, np.nan)
+                res.Vx = res.Vy = res.Veff = nan.copy()
                 continue
 
             if i == 0:
                 prev, nxt, dt_tot = res, self.results[1], dt
             elif i == N - 1:
-                prev, nxt, dt_tot = self.results[i-1], res, dt
+                prev, nxt, dt_tot = self.results[i - 1], res, dt
             else:
-                prev, nxt, dt_tot = self.results[i-1], self.results[i+1], 2*dt
+                prev, nxt, dt_tot = self.results[i - 1], self.results[i + 1], 2 * dt
 
             def _fd(a, b):
                 with np.errstate(invalid="ignore"):
                     return (b - a) / dt_tot
 
-            res.Exx_rate  = _fd(prev.Exx,  nxt.Exx)
-            res.Exy_rate  = _fd(prev.Exy,  nxt.Exy)
-            res.Eyy_rate  = _fd(prev.Eyy,  nxt.Eyy)
-            res.Eeff_rate = _fd(prev.Eeff, nxt.Eeff)
+            res.Vx = _fd(prev.u, nxt.u)
+            res.Vy = _fd(prev.v, nxt.v)
+            with np.errstate(invalid="ignore"):
+                res.Veff = np.sqrt(res.Vx ** 2 + res.Vy ** 2)
 
-    # -- export / import --
+        # 2. Compute Strain Rates via spatial gradient of Velocity
+        from .strain import compute_velocity_strains
+        mask = self._roi_mask if self._roi_mask is not None else np.ones_like(self.results[0].u, dtype=bool)
+
+        for res in self.results:
+            if N == 1:
+                nan = np.full_like(res.u, np.nan)
+                res.dVx_dx = res.dVx_dy = res.dVy_dx = res.dVy_dy = nan.copy()
+                res.Exx_rate = res.Exy_rate = res.Eyy_rate = res.Eeff_rate = nan.copy()
+                continue
+
+            valid = mask & ~np.isnan(res.Vx) & ~np.isnan(res.Vy)
+            rates = compute_velocity_strains(res.Vx, res.Vy, valid, self.params.strain_window)
+
+            res.dVx_dx = rates["dVx_dx"]
+            res.dVx_dy = rates["dVx_dy"]
+            res.dVy_dx = rates["dVy_dx"]
+            res.dVy_dy = rates["dVy_dy"]
+            res.Exx_rate = rates["Exx_rate"]
+            res.Exy_rate = rates["Exy_rate"]
+            res.Eyy_rate = rates["Eyy_rate"]
+            res.Eeff_rate = rates["Eeff_rate"]
+
+        # 3. Integrate Strain Rates to compute Cumulative Strains (Trapezoidal Rule)
+        if N > 0:
+            res0 = self.results[0]
+            # Initialize accumulators at 0
+            curr_Exx = np.zeros_like(res0.u)
+            curr_Exy = np.zeros_like(res0.u)
+            curr_Eyy = np.zeros_like(res0.u)
+
+            for i in range(N):
+                curr = self.results[i]
+                valid = ~np.isnan(curr.u)
+
+                if i > 0:
+                    prev = self.results[i - 1]
+                    # Safe fetch of rates (treat NaN as 0 so integration doesn't explode if a point briefly drops out)
+                    rate_prev_xx = np.nan_to_num(prev.Exx_rate, nan=0.0)
+                    rate_curr_xx = np.nan_to_num(curr.Exx_rate, nan=0.0)
+                    curr_Exx += 0.5 * (rate_prev_xx + rate_curr_xx) * dt
+
+                    rate_prev_xy = np.nan_to_num(prev.Exy_rate, nan=0.0)
+                    rate_curr_xy = np.nan_to_num(curr.Exy_rate, nan=0.0)
+                    curr_Exy += 0.5 * (rate_prev_xy + rate_curr_xy) * dt
+
+                    rate_prev_yy = np.nan_to_num(prev.Eyy_rate, nan=0.0)
+                    rate_curr_yy = np.nan_to_num(curr.Eyy_rate, nan=0.0)
+                    curr_Eyy += 0.5 * (rate_prev_yy + rate_curr_yy) * dt
+
+                # Apply integrated strains to current frame, masked by validity
+                curr.Exx = np.where(valid, curr_Exx, np.nan)
+                curr.Exy = np.where(valid, curr_Exy, np.nan)
+                curr.Eyy = np.where(valid, curr_Eyy, np.nan)
+
+                # Compute Effective Strain from integrated components
+                with np.errstate(invalid='ignore'):
+                    curr.Eeff = np.sqrt(np.maximum(
+                        (2.0 / 3.0) * (curr.Exx ** 2 + curr.Eyy ** 2 + 2.0 * curr.Exy ** 2 - curr.Exx * curr.Eyy), 0.0
+                    ))
+
     def export_csv(self, result_index: int, directory: str) -> None:
         res = self.results[result_index]
         base = os.path.splitext(os.path.basename(res.image_path))[0]
-        for name in ("u","v","Exx","Exy","Eyy","Eeff",
-                     "Exx_rate","Exy_rate","Eyy_rate","Eeff_rate","corr"):
+        fields = ("u", "v", "Exx", "Exy", "Eyy", "Eeff",
+                  "Vx", "Vy", "Veff",
+                  "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+                  "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate", "corr")
+        for name in fields:
             arr = getattr(res, name, None)
             if arr is not None:
-                np.savetxt(os.path.join(directory,f"{base}_{name}.csv"), arr, delimiter=",")
+                np.savetxt(os.path.join(directory, f"{base}_{name}.csv"), arr, delimiter=",")
 
     def export_hdf5(self, path: str) -> None:
         import h5py
@@ -217,10 +288,13 @@ class DICAnalysis:
             for i, res in enumerate(self.results):
                 g = f.create_group(f"frame_{i:04d}")
                 g.attrs["image_path"] = res.image_path
-                g.attrs["elapsed_s"]  = res.elapsed
-                for name in ("u","v","Exx","Exy","Eyy","Eeff",
-                             "Exx_rate","Exy_rate","Eyy_rate","Eeff_rate",
-                             "du_dx","du_dy","dv_dx","dv_dy","corr"):
+                g.attrs["elapsed_s"] = res.elapsed
+                fields = ("u", "v", "Exx", "Exy", "Eyy", "Eeff",
+                          "Vx", "Vy", "Veff",
+                          "du_dx", "du_dy", "dv_dx", "dv_dy",
+                          "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+                          "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate", "corr")
+                for name in fields:
                     arr = getattr(res, name, None)
                     if arr is not None:
                         g.create_dataset(name, data=arr.astype(np.float32),
@@ -263,7 +337,9 @@ class DICAnalysis:
                     corr=g["corr"][:] if "corr" in g else np.zeros(0),
                     elapsed=float(g.attrs.get("elapsed_s", 0.0))
                 )
-                for rate in ("Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate"):
+                extra_fields = ("Vx", "Vy", "Veff", "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+                                "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate")
+                for rate in extra_fields:
                     if rate in g:
                         setattr(res, rate, g[rate][:])
                 self.results.append(res)
