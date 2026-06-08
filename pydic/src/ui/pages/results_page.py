@@ -160,6 +160,49 @@ class ResultsPage(QWidget):
             self._field_btns[key] = btn
 
         self._apply_tab_style()
+
+        # ─── PROMINENT STREAKLINES BLOCK (Just after Eff) ───
+        top_lay.addSpacing(12)
+
+        vsep1 = QFrame()
+        vsep1.setFrameShape(QFrame.Shape.VLine)
+        vsep1.setStyleSheet(f"background:{_C_BORDER}; max-width:1px;")
+        top_lay.addWidget(vsep1)
+        top_lay.addSpacing(12)
+
+        self._streak_chk = QCheckBox("Streaklines")
+        self._streak_chk.setToolTip("Show particle trajectories up to the current frame")
+        self._streak_chk.setStyleSheet(f"color:{_C_ACCENT}; font-size: 12px; font-weight: 800;")
+        self._streak_chk.stateChanged.connect(self._refresh_overlay)
+        top_lay.addWidget(self._streak_chk)
+
+        self._streak_lbl = QLabel("Spacing:")
+        self._streak_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        top_lay.addWidget(self._streak_lbl)
+
+        self._streak_spin = QSpinBox()
+        self._streak_spin.setRange(1, 100)
+        self._streak_spin.setValue(10)
+        self._streak_spin.setToolTip("Higher spacing = fewer streaklines but thicker paths")
+        self._streak_spin.setStyleSheet(
+            f"background:{_C_CARD}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:2px 6px; border-radius:4px;"
+        )
+        self._streak_spin.valueChanged.connect(self._refresh_overlay)
+        top_lay.addWidget(self._streak_spin)
+
+        self._streak_chk.toggled.connect(self._streak_lbl.setVisible)
+        self._streak_chk.toggled.connect(self._streak_spin.setVisible)
+        self._streak_lbl.setVisible(False)
+        self._streak_spin.setVisible(False)
+
+        top_lay.addSpacing(12)
+
+        vsep2 = QFrame()
+        vsep2.setFrameShape(QFrame.Shape.VLine)
+        vsep2.setStyleSheet(f"background:{_C_BORDER}; max-width:1px;")
+        top_lay.addWidget(vsep2)
+        # ────────────────────────────────────────────────────
+
         top_lay.addStretch()
 
         # Colormap
@@ -323,10 +366,6 @@ class ResultsPage(QWidget):
         self._frame = 0
         self._show_frame(0)
 
-    # ------------------------------------------------------------------
-    # Frame display — THE CRITICAL FIX
-    # ------------------------------------------------------------------
-
     def _show_frame(self, idx: int) -> None:
         """
         Load the actual deformed image for frame `idx` and display it as
@@ -342,11 +381,9 @@ class ResultsPage(QWidget):
             path = analysis.def_paths[idx]
             img = _load_gray(path)
             if img is not None:
-                # Darken the grayscale background so the colormap overlay pops.
-                # 0.28 keeps enough structural detail for context without
-                # competing with the vivid field colours.
-                self._canvas.set_image(img * 0.45)
-        # (If image can't be loaded, canvas keeps whatever was last shown)
+                # Keep view if we already have an image loaded so zoom/pan isn't lost
+                keep = self._canvas._image_arr is not None
+                self._canvas.set_image(img * 0.45, keep_view=keep)
 
         # 2. ── Render field overlay ──────────────────────────────────
         result = analysis.results[idx]
@@ -355,6 +392,15 @@ class ResultsPage(QWidget):
             self._apply_overlay(arr)
         else:
             self._canvas.set_result_overlay_rgba(None)
+
+        # --- NEW BLOCK ---
+        if self._streak_chk.isChecked():
+            step = self._streak_spin.value()
+            self._canvas.streakline_thickness = min(3.5, 1.0 + (step - 1) * 0.15)
+            self._canvas.set_streaklines(analysis.get_trajectories(idx, step=step))
+        else:
+            self._canvas.set_streaklines(None)
+        # -----------------
 
         # 3. ── Update sidebar ────────────────────────────────────────
         self._update_stats(result)

@@ -129,13 +129,13 @@ class DICAnalysis:
         for i, def_path in enumerate(self.def_paths):
             if self._cancel[0]:
                 break
-            off, scale = i / n, 0.95 / n
 
             def pair_cb(frac, msg, _i=i, _n=n):
                 if progress_cb:
-                    progress_cb(_i / n + frac * 0.95 / _n, f"[{_i + 1}/{_n}] {msg}")
+                    # Allocate 90% of total progress to DIC tracking
+                    progress_cb(0.90 * (_i / _n) + frac * (0.90 / _n), f"[{_i + 1}/{_n}] {msg}")
 
-            pair_cb(0, f"Loading {os.path.basename(def_path)}…")
+            pair_cb(0.0, f"Loading {os.path.basename(def_path)}…")
             cur = _load_image(def_path)
             if cur.shape != ref.shape:
                 raise ValueError(f"Shape mismatch: {def_path}")
@@ -168,14 +168,12 @@ class DICAnalysis:
             ))
 
         if not self._cancel[0] and self.results:
-            if progress_cb:
-                progress_cb(0.97, "Computing velocities & integrating strains…")
-            self._compute_velocities_and_rates()
+            self._compute_velocities_and_rates(progress_cb)  # <-- Pass progress_cb here
 
         if progress_cb:
             progress_cb(1.0, "Complete.")
 
-    def _compute_velocities_and_rates(self) -> None:
+    def _compute_velocities_and_rates(self, progress_cb: Optional[Callable[[float, str], None]] = None) -> None:
         N = len(self.results)
         dt = 1.0 / max(self.fps, 1e-9)
 
@@ -206,7 +204,12 @@ class DICAnalysis:
         from .strain import compute_velocity_strains
         mask = self._roi_mask if self._roi_mask is not None else np.ones_like(self.results[0].u, dtype=bool)
 
-        for res in self.results:
+        for i, res in enumerate(self.results):
+            if progress_cb:
+                # Map to 90% - 97% overall progress
+                p = 0.90 + 0.07 * (i / max(1, N))
+                progress_cb(p, f"[{i + 1}/{N}] Computing strain rates…")
+
             if N == 1:
                 nan = np.full_like(res.u, np.nan)
                 res.dVx_dx = res.dVx_dy = res.dVy_dx = res.dVy_dy = nan.copy()
@@ -234,12 +237,16 @@ class DICAnalysis:
             curr_Eyy = np.zeros_like(res0.u)
 
             for i in range(N):
+                if progress_cb:
+                    # Map to 97% - 100% overall progress
+                    p = 0.97 + 0.03 * (i / max(1, N))
+                    progress_cb(p, f"[{i + 1}/{N}] Integrating strains…")
+
                 curr = self.results[i]
                 valid = ~np.isnan(curr.u)
 
                 if i > 0:
                     prev = self.results[i - 1]
-                    # Safe fetch of rates (treat NaN as 0 so integration doesn't explode if a point briefly drops out)
                     rate_prev_xx = np.nan_to_num(prev.Exx_rate, nan=0.0)
                     rate_curr_xx = np.nan_to_num(curr.Exx_rate, nan=0.0)
                     curr_Exx += 0.5 * (rate_prev_xx + rate_curr_xx) * dt
@@ -252,16 +259,59 @@ class DICAnalysis:
                     rate_curr_yy = np.nan_to_num(curr.Eyy_rate, nan=0.0)
                     curr_Eyy += 0.5 * (rate_prev_yy + rate_curr_yy) * dt
 
-                # Apply integrated strains to current frame, masked by validity
                 curr.Exx = np.where(valid, curr_Exx, np.nan)
                 curr.Exy = np.where(valid, curr_Exy, np.nan)
                 curr.Eyy = np.where(valid, curr_Eyy, np.nan)
 
-                # Compute Effective Strain from integrated components
                 with np.errstate(invalid='ignore'):
                     curr.Eeff = np.sqrt(np.maximum(
                         (2.0 / 3.0) * (curr.Exx ** 2 + curr.Eyy ** 2 + 2.0 * curr.Exy ** 2 - curr.Exx * curr.Eyy), 0.0
                     ))
+
+    def get_trajectories(self, max_frame: int, step: int = 10) -> list[list[tuple[float, float]]]:
+        if not self.results or max_frame < 0:
+            return []
+
+        valid = np.isfinite(self.results[0].u) & np.isfinite(self.results[0].v)
+
+        # Extract unique valid grid lines used by the DIC solver
+        y_lines = np.unique(np.where(valid)[0])
+        x_lines = np.unique(np.where(valid)[1])
+
+        # Decimate purely in 2D space to guarantee an orthogonal grid
+        y_sampled = y_lines[::step]
+        x_sampled = x_lines[::step]
+
+        # Create perfect grid intersections
+        xx, yy = np.meshgrid(x_sampled, y_sampled)
+        xx = xx.ravel()
+        yy = yy.ravel()
+
+        # Filter out intersections that fall outside the active ROI
+        valid_intersections = valid[yy, xx]
+        x0 = xx[valid_intersections]
+        y0 = yy[valid_intersections]
+
+        N_particles = len(x0)
+        active = np.ones(N_particles, dtype=bool)
+
+        paths = [[(float(x), float(y))] for x, y in zip(x0, y0)]
+
+        # Start at 0 to explicitly include the first deformed frame
+        for i in range(0, max_frame + 1):
+            if i >= len(self.results):
+                break
+
+            u_i = self.results[i].u[y0, x0]
+            v_i = self.results[i].v[y0, x0]
+
+            lost = ~np.isfinite(u_i) | ~np.isfinite(v_i)
+            active[lost] = False
+
+            for p_idx in np.where(active)[0]:
+                paths[p_idx].append((float(x0[p_idx] + u_i[p_idx]), float(y0[p_idx] + v_i[p_idx])))
+
+        return [p for p in paths if len(p) > 1]
 
     def export_csv(self, result_index: int, directory: str) -> None:
         res = self.results[result_index]
