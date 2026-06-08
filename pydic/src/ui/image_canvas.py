@@ -207,6 +207,9 @@ class ImageCanvas(QWidget):
         self._seed_xy: Optional[Tuple[int, int]] = None
         self._subset_radius: Optional[int] = None
         self.seed_enabled: bool = True
+        self._streaklines: list[list[tuple[float, float]]] | None = None
+        self._streak_path: Optional[QPainterPath] = None
+        self.streakline_thickness: float = 1.0
         # ─────────────────────────────────────────────────────────────
 
         self._committed_poly: Optional[List[QPointF]] = None
@@ -239,18 +242,19 @@ class ImageCanvas(QWidget):
     # Safely Handled Pixmap Generation
     # ─────────────────────────────────────────────────────────────────────
 
-    def set_image(self, arr: np.ndarray) -> None:
+    def set_image(self, arr: np.ndarray, keep_view: bool = False) -> None:
         self._image_arr = arr
         self._image_u8 = np.ascontiguousarray(np.clip(arr * 255, 0, 255).astype(np.uint8))
         H, W = self._image_u8.shape
         self._image_qimg = QImage(self._image_u8.data, W, H, W, QImage.Format.Format_Grayscale8)
         self._image_px = QPixmap.fromImage(self._image_qimg)
-        
-        self.clear_result_overlay()
-        self.clear_roi()
-        self._fit_to_window()
-        self.update()
 
+        if not keep_view:
+            self.clear_result_overlay()
+            self.clear_roi()
+            self._fit_to_window()
+
+        self.update()
     def set_result_overlay_rgba(self, rgba) -> None:
         if rgba is None:
             self.clear_result_overlay(); return
@@ -605,7 +609,13 @@ class ImageCanvas(QWidget):
             painter.setBrush(QBrush(fill_color))
 
             painter.drawEllipse(QPointF(sx, sy), sr, sr)
-        # ────────────────────────────────────────
+
+        # ─── DRAW STREAKLINES ───
+        if getattr(self, '_streak_path', None) is not None:
+            thick = getattr(self, 'streakline_thickness', 1.0) / self._zoom
+            painter.setPen(QPen(QColor(255, 255, 255, 180), thick))
+            painter.drawPath(self._streak_path)
+        # ────────────────────────
 
         painter.restore()
 
@@ -810,6 +820,23 @@ class ImageCanvas(QWidget):
     def resizeEvent(self, event) -> None:
         if self._image_px is not None: self._fit_to_window()
         super().resizeEvent(event)
+
+    def set_streaklines(self, lines: list[list[tuple[float, float]]] | None) -> None:
+        self._streaklines = lines
+        self._streak_path = None
+
+        if lines:
+            from PyQt6.QtGui import QPainterPath
+            path = QPainterPath()
+            for pts in lines:
+                if len(pts) < 2:
+                    continue
+                path.moveTo(pts[0][0], pts[0][1])
+                for pt in pts[1:]:
+                    path.lineTo(pt[0], pt[1])
+            self._streak_path = path
+
+        self.update()
 
     def set_subset_radius(self, radius: Optional[int]) -> None:
         self._subset_radius = radius

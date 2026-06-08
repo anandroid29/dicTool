@@ -89,8 +89,10 @@ def run_rg_dic(
 
     def global_cb(frac, msg):
         if progress_cb:
-            try: progress_cb(min(0.05 + 0.93 * frac, 0.98), msg)
-            except Exception: pass
+            try:
+                progress_cb(0.05 + 0.95 * frac, msg)
+            except Exception:
+                pass
 
     args_list = [
         (ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,

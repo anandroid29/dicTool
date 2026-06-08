@@ -221,6 +221,7 @@ class AnalysisPage(QWidget):
             import numpy as np
 
             self._current_thumb_array = np.ascontiguousarray(rgb)
+            from PyQt6.QtGui import QImage, QPixmap
             qimg = QImage(self._current_thumb_array.data, w, h, w * 3, QImage.Format.Format_RGB888)
 
             self._preview_lbl.setPixmap(QPixmap.fromImage(qimg))
