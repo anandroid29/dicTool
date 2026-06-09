@@ -42,6 +42,7 @@ def run_rg_dic(
     cancel_flag: Optional[list] = None,
     guess_u: float = 0.0,
     guess_v: float = 0.0,
+    use_gpu = False
 ) -> DICResult:
     if cancel_flag is None:
         cancel_flag = [False]
@@ -90,7 +91,7 @@ def run_rg_dic(
     def global_cb(frac, msg):
         if progress_cb:
             try:
-                progress_cb(0.05 + 0.95 * frac, msg)
+                progress_cb(frac, msg)
             except Exception:
                 pass
 
@@ -201,9 +202,9 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
                 with lock:
                     shared_state["done"] += local_steps
                     curr_done = shared_state["done"]
+                    _report(progress_cb, curr_done / shared_state["total"],
+                            f"Analysing … {curr_done}/{shared_state['total']}")
                 local_steps = 0
-                _report(progress_cb, curr_done / shared_state["total"],
-                        f"Analysing … {curr_done}/{shared_state['total']}")
 
     if local_steps > 0:
         with lock:

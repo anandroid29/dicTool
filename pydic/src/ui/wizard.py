@@ -32,6 +32,7 @@ class Wizard(QMainWindow):
 
         self.analysis = DICAnalysis()
         self.seed_xy = None
+        self.use_gpu = False
 
         self.setStyleSheet(STYLESHEET)
         self._build_ui()

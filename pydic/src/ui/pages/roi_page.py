@@ -133,7 +133,7 @@ class ROIPage(QWidget):
         clr_btn = QPushButton("⟳")
         clr_btn.setToolTip("Clear ROI")
         clr_btn.setFixedSize(44, 36)
-        clr_btn.clicked.connect(self._clear_roi)  # <-- Changed here
+        clr_btn.clicked.connect(self._clear_roi)
         clr_btn.setStyleSheet(
             f"QPushButton {{ background:{_C_CARD}; color:{_C_TEXT2}; "
             f"border:1px solid {_C_BORDER}; border-radius:8px; font-size:16px; }} "
@@ -164,6 +164,13 @@ class ROIPage(QWidget):
         full_btn.setFixedWidth(130)
         full_btn.clicked.connect(self._use_full)
         foot_lay.addWidget(full_btn)
+
+        # ────────Reset Zoom Button ────────────────────────────────────
+        self._reset_view_btn = QPushButton("Reset Zoom")
+        self._reset_view_btn.setFixedWidth(110)
+        self._reset_view_btn.clicked.connect(self._canvas.fit_image)
+        foot_lay.addWidget(self._reset_view_btn)
+        # ──────────────────────────────────────────────────────────────
 
         load_btn = QPushButton("Load ROI from File")
         load_btn.setFixedWidth(180)

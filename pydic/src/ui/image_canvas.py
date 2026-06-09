@@ -23,7 +23,7 @@ from PyQt6.QtGui import (
     QPolygonF, QPainterPath, QImage, QCursor,
     QTransform, QIcon, QFont,
 )
-from PyQt6.QtWidgets import QWidget, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QSizePolicy, QPushButton
 
 
 # ─────────────────────────────────────────────────────────────────────────────

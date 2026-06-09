@@ -109,6 +109,7 @@ class DICAnalysis:
             self,
             progress_cb: Optional[Callable[[float, str], None]] = None,
             seed_xy: Optional[tuple] = None,
+            use_gpu: bool = False  # <-- 1. Add this
     ) -> None:
         self._cancel[0] = False
         self.results.clear()
@@ -132,7 +133,7 @@ class DICAnalysis:
 
             def pair_cb(frac, msg, _i=i, _n=n):
                 if progress_cb:
-                    # Allocate 90% of total progress to DIC tracking
+                    # Allocate strictly 0% to 90% for the DIC tracking phase
                     progress_cb(0.90 * (_i / _n) + frac * (0.90 / _n), f"[{_i + 1}/{_n}] {msg}")
 
             pair_cb(0.0, f"Loading {os.path.basename(def_path)}…")
@@ -144,7 +145,8 @@ class DICAnalysis:
             dic = run_rg_dic(
                 ref, cur, mask, self.params,
                 seed_xy=seed_xy, progress_cb=pair_cb, cancel_flag=self._cancel,
-                guess_u=guess_u, guess_v=guess_v
+                guess_u=guess_u, guess_v=guess_v,
+                use_gpu=use_gpu,
             )
             elapsed = time.perf_counter() - t0
 
@@ -154,8 +156,6 @@ class DICAnalysis:
                 guess_u = float(np.median(dic.u[valid]))
                 guess_v = float(np.median(dic.v[valid]))
 
-            # We no longer calculate strains from displacement here.
-            # Fill with NaNs temporarily; they will be computed via integration.
             nan_arr = np.full_like(dic.u, np.nan)
 
             self.results.append(PairResult(
@@ -168,37 +168,37 @@ class DICAnalysis:
             ))
 
         if not self._cancel[0] and self.results:
-            self._compute_velocities_and_rates(progress_cb)  # <-- Pass progress_cb here
+            # Pass the callback into the post-processor
+            self._compute_velocities_and_rates(progress_cb)
 
         if progress_cb:
             progress_cb(1.0, "Complete.")
 
     def _compute_velocities_and_rates(self, progress_cb: Optional[Callable[[float, str], None]] = None) -> None:
         N = len(self.results)
+        if N < 2: return
         dt = 1.0 / max(self.fps, 1e-9)
 
-        # 1. Compute Velocities via temporal finite difference
+        # 1. Compute Velocities (Vectorized for extreme speed)
+        u_stack = np.stack([r.u for r in self.results])
+        v_stack = np.stack([r.v for r in self.results])
+
+        v_u = np.zeros_like(u_stack)
+        v_v = np.zeros_like(v_stack)
+
+        # Central difference for internal frames
+        v_u[1:-1] = (u_stack[2:] - u_stack[:-2]) / (2 * dt)
+        v_v[1:-1] = (v_stack[2:] - v_stack[:-2]) / (2 * dt)
+
+        # Forward/Backward difference for boundaries
+        v_u[0] = (u_stack[1] - u_stack[0]) / dt
+        v_v[0] = (v_stack[1] - v_stack[0]) / dt
+        v_u[-1] = (u_stack[-1] - u_stack[-2]) / dt
+        v_v[-1] = (v_stack[-1] - v_stack[-2]) / dt
+
         for i, res in enumerate(self.results):
-            if N == 1:
-                nan = np.full_like(res.u, np.nan)
-                res.Vx = res.Vy = res.Veff = nan.copy()
-                continue
-
-            if i == 0:
-                prev, nxt, dt_tot = res, self.results[1], dt
-            elif i == N - 1:
-                prev, nxt, dt_tot = self.results[i - 1], res, dt
-            else:
-                prev, nxt, dt_tot = self.results[i - 1], self.results[i + 1], 2 * dt
-
-            def _fd(a, b):
-                with np.errstate(invalid="ignore"):
-                    return (b - a) / dt_tot
-
-            res.Vx = _fd(prev.u, nxt.u)
-            res.Vy = _fd(prev.v, nxt.v)
-            with np.errstate(invalid="ignore"):
-                res.Veff = np.sqrt(res.Vx ** 2 + res.Vy ** 2)
+            res.Vx, res.Vy = v_u[i], v_v[i]
+            res.Veff = np.sqrt(res.Vx ** 2 + res.Vy ** 2)
 
         # 2. Compute Strain Rates via spatial gradient of Velocity
         from .strain import compute_velocity_strains
@@ -209,12 +209,6 @@ class DICAnalysis:
                 # Map to 90% - 97% overall progress
                 p = 0.90 + 0.07 * (i / max(1, N))
                 progress_cb(p, f"[{i + 1}/{N}] Computing strain rates…")
-
-            if N == 1:
-                nan = np.full_like(res.u, np.nan)
-                res.dVx_dx = res.dVx_dy = res.dVy_dx = res.dVy_dy = nan.copy()
-                res.Exx_rate = res.Exy_rate = res.Eyy_rate = res.Eeff_rate = nan.copy()
-                continue
 
             valid = mask & ~np.isnan(res.Vx) & ~np.isnan(res.Vy)
             rates = compute_velocity_strains(res.Vx, res.Vy, valid, self.params.strain_window)
@@ -228,10 +222,9 @@ class DICAnalysis:
             res.Eyy_rate = rates["Eyy_rate"]
             res.Eeff_rate = rates["Eeff_rate"]
 
-        # 3. Integrate Strain Rates to compute Cumulative Strains (Trapezoidal Rule)
+        # 3. Integrate Strain Rates to compute Cumulative Strains
         if N > 0:
             res0 = self.results[0]
-            # Initialize accumulators at 0
             curr_Exx = np.zeros_like(res0.u)
             curr_Exy = np.zeros_like(res0.u)
             curr_Eyy = np.zeros_like(res0.u)
@@ -312,6 +305,17 @@ class DICAnalysis:
                 paths[p_idx].append((float(x0[p_idx] + u_i[p_idx]), float(y0[p_idx] + v_i[p_idx])))
 
         return [p for p in paths if len(p) > 1]
+
+    def get_global_range(self, field: str) -> tuple[float, float]:
+        vmin, vmax = float('inf'), float('-inf')
+        for res in self.results:
+            arr = getattr(res, field, None)
+            if arr is not None:
+                valid = arr[np.isfinite(arr)]
+                if valid.size > 0:
+                    vmin = min(vmin, float(valid.min()))
+                    vmax = max(vmax, float(valid.max()))
+        return (vmin, vmax) if vmin != float('inf') else (0.0, 1.0)
 
     def export_csv(self, result_index: int, directory: str) -> None:
         res = self.results[result_index]
