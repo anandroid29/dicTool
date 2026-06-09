@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSpinBox, QDoubleSpinBox,
-    QFrame, QGridLayout, QSizePolicy,
+    QFrame, QGridLayout, QSizePolicy, QCheckBox,
 )
 
 from src.ui.components import FooterButton
@@ -17,6 +17,14 @@ if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 
 from src.ui.image_canvas import ImageCanvas
+
+try:
+    import cupy as cp
+    # Optional: Quick test to ensure CUDA runtime is actually responding
+    cp.cuda.Device(0).compute_capability
+    _HAS_GPU = True
+except Exception:
+    _HAS_GPU = False
 
 _C_SURFACE = "#0e1c2e"
 _C_CARD    = "#132035"
@@ -207,11 +215,26 @@ class ParamsPage(QWidget):
         foot_lay.setContentsMargins(20, 0, 20, 0)
         foot_lay.addStretch()
 
+        # ── GPU Acceleration Toggle ───────────────────────────────────
+        self._gpu_chk = QCheckBox("Use GPU Acceleration (CuPy)")
+
+        if _HAS_GPU:
+            self._gpu_chk.setChecked(True)
+            self._gpu_chk.setStyleSheet(f"color:{_C_SUCCESS}; font-weight:bold;")
+            self._gpu_chk.setToolTip("GPU detected! Batched IC-GN will be used.")
+        else:
+            self._gpu_chk.setChecked(False)
+            self._gpu_chk.setEnabled(False)
+            self._gpu_chk.setStyleSheet(f"color:{_C_TEXT2};")
+            self._gpu_chk.setToolTip("No compatible NVIDIA GPU or CuPy installation detected.")
+
+        foot_lay.addWidget(self._gpu_chk)
+
         self._run_btn = FooterButton("▶  Run Analysis")
         self._run_btn.setProperty("class", "run")
         self._run_btn.setFixedHeight(38)
         self._run_btn.setMinimumWidth(160)
-        self._run_btn.clicked.connect(self._start_analysis)
+        self._run_btn.clicked.connect(self._on_run_clicked)
         foot_lay.addWidget(self._run_btn)
 
         root.addWidget(footer)
@@ -265,9 +288,6 @@ class ParamsPage(QWidget):
                 f"({W}×{H} image, {s} px spacing)"
             )
 
-    def _start_analysis(self) -> None:
-        self._wizard.go_analysis()
-
     def _separator(self) -> QFrame:
         f = QFrame()
         f.setFrameShape(QFrame.Shape.HLine)
@@ -306,3 +326,12 @@ class ParamsPage(QWidget):
             f"Spacing: {p.subset_spacing}\n"
             f"Strain Window: {p.strain_window}"
         )
+
+    def _on_run_clicked(self) -> None:
+        """Save the GPU preference to the wizard, then proceed to the analysis screen."""
+        if hasattr(self, '_gpu_chk'):
+            self._wizard.use_gpu = self._gpu_chk.isChecked()
+        else:
+            self._wizard.use_gpu = False
+
+        self._wizard.go_analysis()

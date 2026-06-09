@@ -35,10 +35,11 @@ class _Worker(QObject):
     finished = pyqtSignal()
     error    = pyqtSignal(str)
 
-    def __init__(self, analysis, seed_xy):
+    def __init__(self, analysis, seed_xy, use_gpu: bool = False):
         super().__init__()
         self._analysis = analysis
         self._seed_xy  = seed_xy
+        self._use_gpu = use_gpu  # <-- Save it
 
     @pyqtSlot()
     def run(self):
@@ -46,6 +47,7 @@ class _Worker(QObject):
             self._analysis.run(
                 progress_cb=lambda f, m: self.progress.emit(f, m),
                 seed_xy=self._seed_xy,
+                use_gpu=self._use_gpu,
             )
             self.finished.emit()
         except Exception as exc:
@@ -170,10 +172,11 @@ class AnalysisPage(QWidget):
         self._timer.start()
 
         analysis = self._wizard.analysis
-        seed_xy  = getattr(self._wizard, "seed_xy", None)
+        seed_xy = getattr(self._wizard, "seed_xy", None)
+        use_gpu = getattr(self._wizard, "use_gpu", False)
 
         self._thread = QThread()
-        self._worker = _Worker(analysis, seed_xy)
+        self._worker = _Worker(analysis, seed_xy, use_gpu)  # <-- Pass to Worker
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)

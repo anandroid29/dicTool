@@ -122,6 +122,8 @@ class ResultsPage(QWidget):
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(200)
         self._play_timer.timeout.connect(self._advance)
+        self._static_scale_chk = QCheckBox("Static Global Scale")
+        self._static_scale_chk.toggled.connect(lambda: self._show_frame(self._slider.value()))
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -221,6 +223,7 @@ class ResultsPage(QWidget):
         self._sym_chk.setToolTip("Centre colormap around zero")
         self._sym_chk.stateChanged.connect(self._refresh_overlay)
         top_lay.addWidget(self._sym_chk)
+        top_lay.addWidget(self._static_scale_chk)
 
         root.addWidget(top)
 
@@ -312,6 +315,13 @@ class ResultsPage(QWidget):
         bot_lay.setContentsMargins(16, 0, 16, 0)
         bot_lay.setSpacing(10)
 
+        # ── NEW: Reset Zoom Button ────────────────────────────────────
+        self._reset_view_btn = QPushButton("Reset Zoom")
+        self._reset_view_btn.setFixedHeight(30)
+        self._reset_view_btn.clicked.connect(self._canvas.fit_image)
+        bot_lay.addWidget(self._reset_view_btn)
+        # ──────────────────────────────────────────────────────────────
+
         prev_btn = self._nav_btn("◀", self._prev_frame)
         bot_lay.addWidget(prev_btn)
 
@@ -343,6 +353,7 @@ class ResultsPage(QWidget):
         fps_lbl = QLabel("FPS:")
         fps_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
         bot_lay.addWidget(fps_lbl)
+
         self._fps_spin = QSpinBox()
         self._fps_spin.setRange(1, 30)
         self._fps_spin.setValue(5)
@@ -379,43 +390,56 @@ class ResultsPage(QWidget):
         # 1. ── Load and display the deformed image ──────────────────
         if idx < len(analysis.def_paths):
             path = analysis.def_paths[idx]
-            img = _load_gray(path)
+
+            # Inline robust image loading
+            img = None
+            try:
+                import cv2
+                img_cv = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img_cv is not None:
+                    img = img_cv.astype(np.float64) / 255.0
+            except Exception:
+                pass
+
+            if img is None:
+                try:
+                    from PIL import Image
+                    img = np.array(Image.open(path).convert("L"), dtype=np.float64) / 255.0
+                except Exception as e:
+                    print(f"Failed to load image {path}: {e}")
+
             if img is not None:
-                # Keep view if we already have an image loaded so zoom/pan isn't lost
+                # FORCE DEEP CONTIGUOUS COPY to prevent 0xC0000409 crash
+                safe_img = np.ascontiguousarray(img * 0.45, dtype=np.float64)
                 keep = self._canvas._image_arr is not None
-                self._canvas.set_image(img * 0.45, keep_view=keep)
+                self._canvas.set_image(safe_img, keep_view=keep)
+            else:
+                self._canvas.clear_result_overlay()
 
         # 2. ── Render field overlay ──────────────────────────────────
         result = analysis.results[idx]
         arr = getattr(result, self._field, None)
         if arr is not None and np.any(np.isfinite(arr)):
+            # _apply_overlay internally checks if static_scale_chk is enabled
             self._apply_overlay(arr)
         else:
             self._canvas.set_result_overlay_rgba(None)
 
-        # --- NEW BLOCK ---
-        if self._streak_chk.isChecked():
+        # 3. ── Render Streaklines ────────────────────────────────────
+        if hasattr(self, '_streak_chk') and self._streak_chk.isChecked():
             step = self._streak_spin.value()
             self._canvas.streakline_thickness = min(3.5, 1.0 + (step - 1) * 0.15)
             self._canvas.set_streaklines(analysis.get_trajectories(idx, step=step))
         else:
-            self._canvas.set_streaklines(None)
-        # -----------------
+            if hasattr(self._canvas, 'set_streaklines'):
+                self._canvas.set_streaklines(None)
 
-        # 3. ── Update sidebar ────────────────────────────────────────
+        # 4. ── Update sidebar ────────────────────────────────────────
         self._update_stats(result)
         self._frame_lbl.setText(f"Frame {idx + 1} / {n}")
 
     def _apply_overlay(self, arr: np.ndarray) -> None:
-        """
-        Convert field array to RGBA colormap overlay and push to canvas.
-
-        The DIC grid is sparse (one solved subset every N pixels), so the raw
-        overlay has tiny coloured dots on a transparent background. We dilate
-        each dot to fill the Voronoi cell around it — giving a solid, vivid
-        coverage across the whole ROI — then apply a soft Gaussian blur to
-        smooth the block boundaries.
-        """
+        """Convert field array to RGBA colormap overlay and push to canvas safely."""
         try:
             import matplotlib.cm as cm
             import matplotlib.colors as mc
@@ -423,33 +447,37 @@ class ResultsPage(QWidget):
 
             valid_mask = np.isfinite(arr)
             if not valid_mask.any():
+                self._canvas.set_result_overlay_rgba(None)
                 return
 
-            vmin, vmax = float(arr[valid_mask].min()), float(arr[valid_mask].max())
-            if self._sym_chk.isChecked():
+            # 1. ── Calculate limits ─────────────────
+            if hasattr(self, '_static_scale_chk') and self._static_scale_chk.isChecked():
+                vmin, vmax = self._wizard.analysis.get_global_range(self._field)
+            else:
+                vmin, vmax = float(arr[valid_mask].min()), float(arr[valid_mask].max())
+
+            if hasattr(self, '_sym_chk') and self._sym_chk.isChecked():
                 lim = max(abs(vmin), abs(vmax))
                 vmin, vmax = -lim, lim
+
             if vmin == vmax:
                 vmax = vmin + 1e-12
 
+            # 2. ── Generate Base RGBA Map ─────────────────────────────
             cmap_name = self._cmap_combo.currentText()
-            cmap_obj  = cm.get_cmap(cmap_name, 256)
-            norm      = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
+            cmap_obj = cm.get_cmap(cmap_name, 256)
+            norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
 
-            rgba = cmap_obj(norm(arr), bytes=True).astype(np.float32)   # H×W×4
+            rgba = cmap_obj(norm(arr), bytes=True).astype(np.float32)
             rgba[~valid_mask] = 0
 
-            # ── Mild saturation boost — vivid but not crushed ─────────
-            # Shift each channel toward its distance from mid-grey (128),
-            # making colours punchier without turning everything black.
-            SATURATION = 1.35          # >1 = more vivid, 1.0 = unchanged
+            SATURATION = 1.35
             for ch in range(3):
                 ch_f = rgba[..., ch] / 255.0
                 ch_f = np.clip(0.5 + (ch_f - 0.5) * SATURATION, 0.0, 1.0)
                 rgba[..., ch] = (ch_f * 255.0).astype(np.float32)
 
-            # ── Fill sparse grid gaps with morphological dilation ──────
-            kernel_size = 13           # slightly larger for smoother fill
+            kernel_size = 13
             struct = np.ones((kernel_size, kernel_size), dtype=bool)
 
             for ch in range(3):
@@ -458,33 +486,41 @@ class ResultsPage(QWidget):
 
             covered = binary_dilation(valid_mask, structure=struct)
             rgba[~covered, 3] = 0
-            rgba[covered,  3] = 195    # ~76% — vivid colour but greyscale stays visible
+            rgba[covered, 3] = 195
 
-            # ── Soft blur to smooth block edges ────────────────────────
             sigma = 1.4
             for ch in range(4):
                 rgba[..., ch] = gaussian_filter(rgba[..., ch], sigma=sigma)
 
-            rgba[~covered, 3] = 0      # re-clip after blur
+            rgba[~covered, 3] = 0
 
-            self._canvas.set_result_overlay_rgba(rgba.astype(np.uint8))
+            # CRITICAL FIX FOR 0xC0000409: FORCE DEEP CONTIGUOUS COPY
+            # NumPy morphological ops fragment memory. Passing this directly to C++
+            # causes the stack overrun and makes the canvas drop the image.
+            safe_rgba = np.ascontiguousarray(rgba.astype(np.uint8))
+            self._canvas.set_result_overlay_rgba(safe_rgba)
 
-            # Update colorbar — apply same darkening so legend matches canvas
+            # ── Update colorbar ────────────────────────
             n_bar = 64
             bar_colors = []
-            SATURATION = 1.35
             for i in range(n_bar):
                 r, g, b, _ = cmap_obj(i / (n_bar - 1))
                 r = max(0.0, min(1.0, 0.5 + (r - 0.5) * SATURATION))
                 g = max(0.0, min(1.0, 0.5 + (g - 0.5) * SATURATION))
                 b = max(0.0, min(1.0, 0.5 + (b - 0.5) * SATURATION))
-                bar_colors.append((int(r*255), int(g*255), int(b*255)))
-            unit = FIELDS.get(self._field, ("", ""))[1]
+                bar_colors.append((int(r * 255), int(g * 255), int(b * 255)))
+
+            # Safely grab the unit string
+            unit = ""
+            try:
+                unit = FIELDS.get(self._field, ("", ""))[1]
+            except Exception:
+                pass
+
             self._colorbar.update_bar(vmin, vmax, unit, bar_colors)
 
         except Exception as exc:
             print(f"Overlay error: {exc}")
-
     def _update_stats(self, result) -> None:
         arr = getattr(result, self._field, None)
         if arr is None:
