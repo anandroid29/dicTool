@@ -1,5 +1,7 @@
+# src/core/analysis.py
 """
-analysis.py — DICAnalysis with strain rate computation and frame-sync support.
+analysis.py — DICAnalysis with strain rate computation, frame-sync support, and batched GPU execution.
+Fixed: Survival rate denominator uses valid ROI subset count to prevent false Auto-Fallback triggers.
 """
 from __future__ import annotations
 import os, time
@@ -15,6 +17,13 @@ try:
     import cv2; _HAVE_CV2 = True
 except ImportError:
     _HAVE_CV2 = False
+
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import map_coordinates, spline_filter
+    _HAS_CUPY = True
+except ImportError:
+    _HAS_CUPY = False
 
 from .rg_dic import DICParams, DICResult, run_rg_dic
 from .roi_loader import load_roi_mask
@@ -60,7 +69,6 @@ class DICAnalysis:
         self._cancel: list = [False]
         self.load_settings()
 
-    # -- configuration --
     def set_reference(self, path: str) -> None:
         self.ref_path = path
         self._ref_image = _load_image(path)
@@ -101,7 +109,6 @@ class DICAnalysis:
     def deformed_paths(self) -> List[str]:
         return self.def_paths
 
-    # -- analysis --
     def cancel(self) -> None:
         self._cancel[0] = True
 
@@ -109,8 +116,15 @@ class DICAnalysis:
             self,
             progress_cb: Optional[Callable[[float, str], None]] = None,
             seed_xy: Optional[tuple] = None,
-            use_gpu: bool = False  # <-- 1. Add this
+            use_gpu: bool = False
     ) -> None:
+
+        if use_gpu:
+            if not _HAS_CUPY:
+                raise RuntimeError("GPU acceleration requested but CuPy is not installed or NVIDIA drivers are missing.")
+            self._run_gpu(progress_cb, seed_xy)
+            return
+
         self._cancel[0] = False
         self.results.clear()
         if self._ref_image is None:
@@ -124,7 +138,6 @@ class DICAnalysis:
         mask = self._roi_mask
         n = len(self.def_paths)
 
-        # Track previous displacements to prevent losing fast-moving subsets
         guess_u, guess_v = 0.0, 0.0
 
         for i, def_path in enumerate(self.def_paths):
@@ -133,7 +146,6 @@ class DICAnalysis:
 
             def pair_cb(frac, msg, _i=i, _n=n):
                 if progress_cb:
-                    # Allocate strictly 0% to 90% for the DIC tracking phase
                     progress_cb(0.90 * (_i / _n) + frac * (0.90 / _n), f"[{_i + 1}/{_n}] {msg}")
 
             pair_cb(0.0, f"Loading {os.path.basename(def_path)}…")
@@ -150,7 +162,6 @@ class DICAnalysis:
             )
             elapsed = time.perf_counter() - t0
 
-            # Update guesses for the next frame using robust median displacement
             valid = dic.analyzed & ~np.isnan(dic.u)
             if valid.any():
                 guess_u = float(np.median(dic.u[valid]))
@@ -168,7 +179,130 @@ class DICAnalysis:
             ))
 
         if not self._cancel[0] and self.results:
-            # Pass the callback into the post-processor
+            self._compute_velocities_and_rates(progress_cb)
+
+        if progress_cb:
+            progress_cb(1.0, "Complete.")
+
+    def _run_gpu(
+            self,
+            progress_cb: Optional[Callable[[float, str], None]] = None,
+            seed_xy: Optional[tuple] = None
+    ) -> None:
+        """
+        Executes the Wavefront GPU pipeline with intelligent Global Seed Tracking and Auto-Fallback.
+        """
+        self._cancel[0] = False
+        self.results.clear()
+
+        if self._ref_image is None or not self.def_paths:
+            raise RuntimeError("Missing reference or deformed images.")
+        if self._roi_mask is None:
+            self.set_full_roi()
+
+        n_frames = len(self.def_paths)
+
+        if progress_cb:
+            progress_cb(0.0, "Initializing GPU solver and precomputing reference...")
+
+        try:
+            from .icgn_gpu import GPUWavefrontDIC
+            gpu_solver = GPUWavefrontDIC(self.params)
+            gpu_solver.precompute_reference(self._ref_image, self._roi_mask)
+        except Exception as e:
+            raise RuntimeError(f"GPU initialization failed: {e}")
+
+        if seed_xy is None:
+            ys_roi, xs_roi = np.where(self._roi_mask)
+            if len(xs_roi) == 0:
+                raise ValueError("ROI mask is empty.")
+            seed_xy = (int(xs_roi.mean()), int(ys_roi.mean()))
+
+        dist_sq = (gpu_solver.gx_flat - seed_xy[0])**2 + (gpu_solver.gy_flat - seed_xy[1])**2
+        seed_idx = int(np.argmin(dist_sq))
+        actual_seed_x = int(gpu_solver.gx_flat[seed_idx])
+        actual_seed_y = int(gpu_solver.gy_flat[seed_idx])
+
+        # CORRECTED EXPECTED SUBSETS: Count only subsets strictly inside the ROI
+        expected_subsets = int(gpu_solver.valid_mask.sum())
+
+        from .ncc import ncc_initial_guess
+
+        warm_start_active = False
+        guess_u, guess_v = 0.0, 0.0
+
+        for i, def_path in enumerate(self.def_paths):
+            if self._cancel[0]: break
+            t0 = time.perf_counter()
+
+            if progress_cb:
+                progress_cb(0.90 * (i / n_frames), f"[{i + 1}/{n_frames}] Loading {os.path.basename(def_path)}...")
+
+            cur_image = _load_image(def_path)
+
+            if not warm_start_active:
+                if progress_cb:
+                    progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.3, f"[{i + 1}/{n_frames}] Global NCC Search...")
+
+                guess_u, guess_v, _ = ncc_initial_guess(
+                    self._ref_image, cur_image, actual_seed_x, actual_seed_y,
+                    self.params.subset_radius, self.params.search_radius,
+                    guess_u, guess_v
+                )
+                seed_p = np.array([guess_u, guess_v, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+                if progress_cb:
+                    progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.6, f"[{i + 1}/{n_frames}] Growing Wavefront...")
+
+                u_f, v_f, du_dx, du_dy, dv_dx, dv_dy, corr_f = gpu_solver.solve_frame(
+                    cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False
+                )
+                warm_start_active = True
+
+            else:
+                if progress_cb:
+                    progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.5, f"[{i + 1}/{n_frames}] Batched temporal tracking...")
+
+                u_f, v_f, du_dx, du_dy, dv_dx, dv_dy, corr_f = gpu_solver.solve_frame(
+                    cur_image, warm_start=True
+                )
+
+                valid_count = np.count_nonzero(~np.isnan(u_f[self._roi_mask]))
+                survival_rate = valid_count / max(1, expected_subsets)
+
+                if survival_rate < 0.60:
+                    print(f"\n[AUTO-FALLBACK] Frame {i+1} collapsed (Survival: {survival_rate*100:.1f}%). Re-running with targeted NCC...")
+
+                    if progress_cb:
+                        progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.7, f"[{i + 1}/{n_frames}] Jolt detected. Repairing via NCC...")
+
+                    guess_u, guess_v, _ = ncc_initial_guess(
+                        self._ref_image, cur_image, actual_seed_x, actual_seed_y,
+                        self.params.subset_radius, self.params.search_radius,
+                        guess_u, guess_v
+                    )
+                    seed_p = np.array([guess_u, guess_v, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+                    u_f, v_f, du_dx, du_dy, dv_dx, dv_dy, corr_f = gpu_solver.solve_frame(
+                        cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False
+                    )
+
+            if not np.isnan(u_f[actual_seed_y, actual_seed_x]):
+                guess_u = float(u_f[actual_seed_y, actual_seed_x])
+                guess_v = float(v_f[actual_seed_y, actual_seed_x])
+
+            elapsed = time.perf_counter() - t0
+            nan_arr = np.full_like(u_f, np.nan)
+
+            self.results.append(PairResult(
+                image_path=def_path,
+                u=u_f, v=v_f,
+                Exx=nan_arr.copy(), Exy=nan_arr.copy(), Eyy=nan_arr.copy(), Eeff=nan_arr.copy(),
+                du_dx=du_dx, du_dy=du_dy, dv_dx=dv_dx, dv_dy=dv_dy,
+                corr=corr_f, elapsed=elapsed
+            ))
+
+        if not self._cancel[0] and self.results:
             self._compute_velocities_and_rates(progress_cb)
 
         if progress_cb:
@@ -179,18 +313,15 @@ class DICAnalysis:
         if N < 2: return
         dt = 1.0 / max(self.fps, 1e-9)
 
-        # 1. Compute Velocities (Vectorized for extreme speed)
         u_stack = np.stack([r.u for r in self.results])
         v_stack = np.stack([r.v for r in self.results])
 
         v_u = np.zeros_like(u_stack)
         v_v = np.zeros_like(v_stack)
 
-        # Central difference for internal frames
         v_u[1:-1] = (u_stack[2:] - u_stack[:-2]) / (2 * dt)
         v_v[1:-1] = (v_stack[2:] - v_stack[:-2]) / (2 * dt)
 
-        # Forward/Backward difference for boundaries
         v_u[0] = (u_stack[1] - u_stack[0]) / dt
         v_v[0] = (v_stack[1] - v_stack[0]) / dt
         v_u[-1] = (u_stack[-1] - u_stack[-2]) / dt
@@ -200,13 +331,11 @@ class DICAnalysis:
             res.Vx, res.Vy = v_u[i], v_v[i]
             res.Veff = np.sqrt(res.Vx ** 2 + res.Vy ** 2)
 
-        # 2. Compute Strain Rates via spatial gradient of Velocity
         from .strain import compute_velocity_strains
         mask = self._roi_mask if self._roi_mask is not None else np.ones_like(self.results[0].u, dtype=bool)
 
         for i, res in enumerate(self.results):
             if progress_cb:
-                # Map to 90% - 97% overall progress
                 p = 0.90 + 0.07 * (i / max(1, N))
                 progress_cb(p, f"[{i + 1}/{N}] Computing strain rates…")
 
@@ -222,7 +351,6 @@ class DICAnalysis:
             res.Eyy_rate = rates["Eyy_rate"]
             res.Eeff_rate = rates["Eeff_rate"]
 
-        # 3. Integrate Strain Rates to compute Cumulative Strains
         if N > 0:
             res0 = self.results[0]
             curr_Exx = np.zeros_like(res0.u)
@@ -231,7 +359,6 @@ class DICAnalysis:
 
             for i in range(N):
                 if progress_cb:
-                    # Map to 97% - 100% overall progress
                     p = 0.97 + 0.03 * (i / max(1, N))
                     progress_cb(p, f"[{i + 1}/{N}] Integrating strains…")
 
@@ -267,20 +394,16 @@ class DICAnalysis:
 
         valid = np.isfinite(self.results[0].u) & np.isfinite(self.results[0].v)
 
-        # Extract unique valid grid lines used by the DIC solver
         y_lines = np.unique(np.where(valid)[0])
         x_lines = np.unique(np.where(valid)[1])
 
-        # Decimate purely in 2D space to guarantee an orthogonal grid
         y_sampled = y_lines[::step]
         x_sampled = x_lines[::step]
 
-        # Create perfect grid intersections
         xx, yy = np.meshgrid(x_sampled, y_sampled)
         xx = xx.ravel()
         yy = yy.ravel()
 
-        # Filter out intersections that fall outside the active ROI
         valid_intersections = valid[yy, xx]
         x0 = xx[valid_intersections]
         y0 = yy[valid_intersections]
@@ -290,7 +413,6 @@ class DICAnalysis:
 
         paths = [[(float(x), float(y))] for x, y in zip(x0, y0)]
 
-        # Start at 0 to explicitly include the first deformed frame
         for i in range(0, max_frame + 1):
             if i >= len(self.results):
                 break
@@ -432,6 +554,7 @@ class DICAnalysis:
                 json.dump(data, f, indent=4)
         except Exception:
             pass
+
 
 def _load_image(path: str) -> np.ndarray:
     if _HAVE_CV2:
