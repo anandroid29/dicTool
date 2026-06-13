@@ -67,6 +67,11 @@ class DICAnalysis:
         self.results: List[PairResult] = []
         self.fps: float = 1.0
         self._cancel: list = [False]
+
+        self.last_video_directory: str = os.path.expanduser("~")
+        self.last_image_directory: str = os.path.expanduser("~")
+        self.last_hdf5_directory: str = os.path.expanduser("~")
+
         self.load_settings()
 
     def set_reference(self, path: str) -> None:
@@ -454,6 +459,7 @@ class DICAnalysis:
     def export_hdf5(self, path: str) -> None:
         import h5py
         with h5py.File(path, "w") as f:
+            # 1. Save Global Attributes
             f.attrs.update(dict(
                 reference_image=self.ref_path or "",
                 subset_radius=self.params.subset_radius,
@@ -461,6 +467,17 @@ class DICAnalysis:
                 strain_window=self.params.strain_window,
                 fps=self.fps,
             ))
+
+            # 2. Save the ROI Mask (CRITICAL FIX)
+            if self._roi_mask is not None:
+                f.create_dataset(
+                    "roi_mask",
+                    data=self._roi_mask.astype(bool),
+                    compression="gzip",
+                    compression_opts=4
+                )
+
+            # 3. Save Frame Data
             for i, res in enumerate(self.results):
                 g = f.create_group(f"frame_{i:04d}")
                 g.attrs["image_path"] = res.image_path
@@ -480,7 +497,9 @@ class DICAnalysis:
         import h5py
         self.results.clear()
         self.def_paths.clear()
+
         with h5py.File(path, "r") as f:
+            # 1. Restore Global Attributes
             self.ref_path = f.attrs.get("reference_image", "")
             try:
                 if self.ref_path and os.path.exists(self.ref_path):
@@ -493,6 +512,13 @@ class DICAnalysis:
             self.params.strain_window = int(f.attrs.get("strain_window", self.params.strain_window))
             self.fps = float(f.attrs.get("fps", 1.0))
 
+            # 2. Restore the ROI Mask (CRITICAL FIX)
+            if "roi_mask" in f:
+                self._roi_mask = f["roi_mask"][:].astype(bool)
+            else:
+                self._roi_mask = None
+
+            # 3. Restore Frame Data
             for k in sorted([key for key in f.keys() if key.startswith("frame_")]):
                 g = f[k]
                 ipath = g.attrs.get("image_path", "")
@@ -520,25 +546,37 @@ class DICAnalysis:
                         setattr(res, rate, g[rate][:])
                 self.results.append(res)
 
+    def _get_settings_path(self) -> str:
+        import os
+        return os.path.join(os.path.expanduser("~"), ".pydic_settings.json")
+
     def load_settings(self) -> None:
         import json, os
-        path = os.path.join(os.getcwd(), "pydic_settings.json")
+        path = self._get_settings_path()
 
         if os.path.exists(path):
             try:
                 with open(path, "r") as f:
                     data = json.load(f)
+
                 for k, v in data.items():
                     if hasattr(self.params, k):
                         setattr(self.params, k, v)
-            except Exception:
-                pass
+
+                # Load all specialized directories
+                dirs = ["last_video_directory", "last_image_directory", "last_hdf5_directory"]
+                for d in dirs:
+                    if d in data and os.path.exists(data[d]):
+                        setattr(self, d, data[d])
+
+            except Exception as e:
+                print(f"[Warning] Failed to load settings: {e}")
         else:
             self.save_settings()
 
     def save_settings(self) -> None:
         import json, os
-        path = os.path.join(os.getcwd(), "pydic_settings.json")
+        path = self._get_settings_path()
 
         try:
             data = {
@@ -548,13 +586,17 @@ class DICAnalysis:
                 "max_iter": self.params.max_iter,
                 "conv_tol": self.params.conv_tol,
                 "corr_cutoff": self.params.corr_cutoff,
-                "search_radius": self.params.search_radius
+                "search_radius": self.params.search_radius,
+
+                # Save all specialized directories
+                "last_video_directory": getattr(self, "last_video_directory", os.path.expanduser("~")),
+                "last_image_directory": getattr(self, "last_image_directory", os.path.expanduser("~")),
+                "last_hdf5_directory": getattr(self, "last_hdf5_directory", os.path.expanduser("~")),
             }
             with open(path, "w") as f:
                 json.dump(data, f, indent=4)
-        except Exception:
-            pass
-
+        except Exception as e:
+            print(f"[Error] Failed to save settings to {path}: {e}")
 
 def _load_image(path: str) -> np.ndarray:
     if _HAVE_CV2:

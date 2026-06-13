@@ -275,10 +275,10 @@ class GPUWavefrontDIC:
 
             accepted = ~failed & ~mask_failed_cls & ~mask_failed_jump
 
-            if batch_count <= 2:
-                print(f"\n[DEBUG] --- BATCH {batch_count} | Mode: {'Warm-Start' if warm_start else 'Wavefront'} ---")
-                print(f"[DEBUG] Processing {N_act} subsets. Rejections: {failed.sum().get()} IC-GN, {(final_eval_mask & mask_failed_jump).sum().get()} Jump, {(final_eval_mask & mask_failed_cls).sum().get()} ZNSSD.")
-                sys.stdout.flush()
+            # if batch_count <= 2:
+            print(f"\n[DEBUG] --- BATCH {batch_count} | Mode: {'Warm-Start' if warm_start else 'Wavefront'} ---")
+            print(f"[DEBUG] Processing {N_act} subsets. Rejections: {failed.sum().get()} IC-GN, {(final_eval_mask & mask_failed_jump).sum().get()} Jump, {(final_eval_mask & mask_failed_cls).sum().get()} ZNSSD.")
+            sys.stdout.flush()
 
             self.p_global[active_indices] = p_act
             self.cls_global[active_indices] = cls_act

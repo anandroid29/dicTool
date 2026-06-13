@@ -241,6 +241,13 @@ class WelcomePage(QWidget):
         self._wizard = wizard
         self._build_ui()
 
+    def _get_safe_start_dir(self, attr_name: str) -> str:
+        """Guarantees the file dialog never defaults to the project 'src' root."""
+        d = getattr(self._wizard.analysis, attr_name, "")
+        if not d or not os.path.isdir(d):
+            d = os.path.expanduser("~")
+        return d
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -351,12 +358,19 @@ class WelcomePage(QWidget):
 
     def _import_video(self) -> None:
         from src.ui.video_importer import VideoImporterDialog
-        dlg = VideoImporterDialog(self)
+
+        start_dir = self._get_safe_start_dir("last_video_directory")
+        dlg = VideoImporterDialog(self, start_dir=start_dir)
 
         if dlg.exec() == 0 or not dlg.extracted_paths:
             return
 
-        paths   = dlg.extracted_paths
+        # CRITICAL FIX: Save the source video folder, not the extracted frames folder!
+        if hasattr(dlg, 'video_path') and dlg.video_path:
+            self._wizard.analysis.last_video_directory = os.path.dirname(dlg.video_path)
+            self._wizard.analysis.save_settings()
+
+        paths = dlg.extracted_paths
         ref_idx = dlg.reference_index
         ref_path = paths[ref_idx]
 
@@ -385,16 +399,28 @@ class WelcomePage(QWidget):
         self._update_status(ref_path, def_paths, analysis.fps)
 
     def _load_images(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+        start_dir = self._get_safe_start_dir("last_image_directory")
+        folder = QFileDialog.getExistingDirectory(self, "Select Image Folder", start_dir)
         if not folder:
             return
 
+        self._wizard.analysis.last_image_directory = folder
+        self._wizard.analysis.save_settings()
+
         valid_exts = {".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"}
         img_files = []
+        roi_auto_path = None  # Track an auto-detected ROI
+
         try:
             for f in os.listdir(folder):
-                if os.path.splitext(f)[1].lower() in valid_exts:
-                    img_files.append(os.path.join(folder, f))
+                ext = os.path.splitext(f)[1].lower()
+                full_path = os.path.join(folder, f)
+
+                # Logic: If it contains 'roi' in name and is an image, auto-select it
+                if "roi" in f.lower() and ext in valid_exts:
+                    roi_auto_path = full_path
+                elif ext in valid_exts:
+                    img_files.append(full_path)
         except Exception as e:
             QMessageBox.critical(self, "Folder Error", f"Could not read folder:\n{e}")
             return
@@ -405,7 +431,7 @@ class WelcomePage(QWidget):
             QMessageBox.warning(self, "Not Enough Images", "The folder must contain at least 2 images.")
             return
 
-        # Attempt to read existing metadata before showing the dialog
+        # Attempt to read metadata
         original_fps = None
         meta_path = os.path.join(folder, "dic_metadata.json")
         if os.path.exists(meta_path):
@@ -418,7 +444,11 @@ class WelcomePage(QWidget):
                 pass
 
         try:
+            # We pass the auto-detected path to the dialog so it's pre-filled
             dlg = ImageLoadSettingsDialog(img_files, folder, original_fps, self)
+            if roi_auto_path:
+                dlg.roi_edit.setText(roi_auto_path)
+
             if dlg.exec() == 0:
                 return
             step, limit, roi_path, user_fps = dlg.get_settings()
@@ -446,7 +476,6 @@ class WelcomePage(QWidget):
             QMessageBox.warning(self, "Empty Selection", "Your sampling settings filtered out all deformed frames.")
             return
 
-        # Determine the final base FPS
         base_fps = original_fps if original_fps is not None else (user_fps if user_fps is not None else 1.0)
 
         analysis = self._wizard.analysis
@@ -466,9 +495,14 @@ class WelcomePage(QWidget):
         self._update_status(ref, defs, analysis.fps)
 
     def _load_hdf5(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load HDF5 Session", "", "HDF5 Files (*.h5 *.hdf5)")
+        start_dir = self._get_safe_start_dir("last_hdf5_directory")
+        path, _ = QFileDialog.getOpenFileName(self, "Load HDF5 Session", start_dir, "HDF5 Files (*.h5 *.hdf5)")
         if not path:
             return
+
+        self._wizard.analysis.last_hdf5_directory = os.path.dirname(path)
+        self._wizard.analysis.save_settings()
+
         try:
             self._wizard.analysis.load_hdf5(path)
             self._wizard.go_results()

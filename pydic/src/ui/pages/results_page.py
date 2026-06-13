@@ -593,17 +593,25 @@ class ResultsPage(QWidget):
             QMessageBox.warning(self, "Export Error", str(e))
 
     def _export_hdf5(self) -> None:
+        # Use shared memory directory
+        start_dir = getattr(self._wizard.analysis, "last_hdf5_directory", os.path.expanduser("~"))
+        default_path = os.path.join(start_dir, "dic_results.h5")
+
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save HDF5", "results.h5", "HDF5 files (*.h5 *.hdf5)"
+            self, "Save HDF5", default_path, "HDF5 files (*.h5 *.hdf5)"
         )
         if not path:
             return
+
+        # Save memory
+        self._wizard.analysis.last_hdf5_directory = os.path.dirname(path)
+        self._wizard.analysis.save_settings()
+
         try:
             self._wizard.analysis.export_hdf5(path)
             QMessageBox.information(self, "Exported", f"HDF5 saved to:\n{path}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

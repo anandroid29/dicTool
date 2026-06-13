@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
-import cv2
 import numpy as np
 from PyQt6.QtCore import (
     Qt, QObject, QThread, pyqtSignal, pyqtSlot, QTimer,
@@ -21,6 +20,10 @@ from PyQt6.QtWidgets import (
     QProgressBar, QFileDialog, QGroupBox, QSizePolicy,
     QMessageBox, QFrame, QCheckBox,
 )
+
+# Defer CV2 import to prevent UI freeze on startup
+if TYPE_CHECKING:
+    import cv2
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +58,8 @@ class ExtractionWorker(QObject):
 
     @pyqtSlot()
     def run(self) -> None:
+        import cv2 # IMPORT CV2 HERE IN THE BACKGROUND THREAD
+
         cap = cv2.VideoCapture(self._video_path)
         if not cap.isOpened():
             self.error.emit(f"Cannot open video:\n{self._video_path}")
@@ -122,6 +127,8 @@ class _PreviewLabel(QLabel):
         self.setFixedHeight(160)
 
     def show_frame(self, bgr: np.ndarray) -> None:
+        import cv2 # IMPORT CV2 LOCALLY
+
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if bgr.ndim == 3 else \
               cv2.cvtColor(bgr, cv2.COLOR_GRAY2RGB)
         h, w = rgb.shape[:2]
@@ -163,19 +170,13 @@ _LABEL_PRI = "color:#e6edf3; font-size:11px;"
 class VideoImporterDialog(QDialog):
     """
     Open a video, pick a frame range, and extract frames as PNG images.
-
-    Usage
-    -----
-    dlg = VideoImporterDialog(parent, video_path)   # pre-fill path (optional)
-    if dlg.exec() == QDialog.DialogCode.Accepted:
-        paths = dlg.extracted_paths   # list[str], sorted
-        ref   = dlg.reference_index   # int — which frame to use as reference
     """
 
     def __init__(
         self,
         parent=None,
         initial_video: Optional[str] = None,
+        start_dir: str = "", # ADDED START DIRECTORY TRACKING
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import Video Frames")
@@ -205,12 +206,13 @@ class VideoImporterDialog(QDialog):
         )
 
         # State
+        self.start_dir = start_dir if start_dir and os.path.isdir(start_dir) else os.path.expanduser("~")
         self._video_path: Optional[str] = None
-        self._cap:        Optional[cv2.VideoCapture] = None
+        self._cap:        Optional['cv2.VideoCapture'] = None
         self._total_frames: int = 0
         self._fps:          float = 25.0
         self.extracted_paths: List[str] = []
-        self.reference_index: int = 0   # index within extracted_paths
+        self.reference_index: int = 0
 
         self._worker: Optional[ExtractionWorker] = None
         self._thread: Optional[QThread] = None
@@ -313,11 +315,9 @@ class VideoImporterDialog(QDialog):
         self._count_lbl.setStyleSheet(_LABEL_DIM)
         rgrid.addWidget(self._count_lbl, 1, 2, 1, 2)
 
-        # Connect start/end to live update
         self._start_spin.valueChanged.connect(self._update_count_label)
         self._end_spin.valueChanged.connect(self._update_count_label)
 
-        # Labels for spin boxes
         for r, c, lbl in [(0,0,"Start frame:"),(0,2,"End frame:"),
                           (1,0,"Step:"),(1,2,"")]:
             w = rgrid.itemAtPosition(r, c)
@@ -410,14 +410,17 @@ class VideoImporterDialog(QDialog):
 
     def _browse_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Video File", "",
+            self, "Open Video File", self.start_dir,
             "Video files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm *.m4v);;"
             "All files (*)"
         )
         if path:
+            self.start_dir = os.path.dirname(path)
             self._load_video(path)
 
     def _load_video(self, path: str) -> None:
+        import cv2 # IMPORT CV2 LOCALLY
+
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             QMessageBox.warning(self, "PyDIC", f"Cannot open:\n{path}")
@@ -442,7 +445,6 @@ class VideoImporterDialog(QDialog):
             f"{duration:.1f} s"
         )
 
-        # Update range spinboxes
         for sp in (self._start_spin, self._end_spin,
                    self._ref_spin, self._preview_slider):
             sp.setMaximum(max(0, total - 1))
@@ -451,7 +453,6 @@ class VideoImporterDialog(QDialog):
         self._preview_slider.setEnabled(True)
         self._preview_slider.setValue(0)
 
-        # Default output dir
         if not self._out_edit.text():
             base = os.path.splitext(path)[0] + "_frames"
             self._out_edit.setText(base)
@@ -461,6 +462,8 @@ class VideoImporterDialog(QDialog):
         self._show_frame(0)
 
     def _show_frame(self, idx: int) -> None:
+        import cv2 # IMPORT CV2 LOCALLY
+
         if self._cap is None:
             return
         self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -483,15 +486,25 @@ class VideoImporterDialog(QDialog):
         s = self._start_spin.value()
         e = self._end_spin.value()
         step = self._step_spin.value()
+
         if e < s:
-            self._end_spin.setValue(s)
-            e = s
+            self._count_lbl.setText("Invalid range (End < Start)")
+            self._count_lbl.setStyleSheet("color:#ef4444; font-size:11px;")  # Red warning
+            self._ref_spin.setMaximum(0)
+            if hasattr(self, '_extract_btn'):
+                self._extract_btn.setEnabled(False)
+            return
+
         count = max(0, (e - s) // step + 1)
         self._count_lbl.setText(f"{count} frames will be extracted")
+        self._count_lbl.setStyleSheet(_LABEL_DIM)  # Reset to standard color
         self._ref_spin.setMaximum(max(0, count - 1))
 
+        if self._video_path and hasattr(self, '_extract_btn'):
+            self._extract_btn.setEnabled(True)
+
     def _browse_out(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        path = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.start_dir)
         if path:
             if self._video_path:
                 vid_name = os.path.splitext(os.path.basename(self._video_path))[0]
@@ -578,7 +591,6 @@ class VideoImporterDialog(QDialog):
             out_dir = os.path.dirname(paths[0])
             meta_path = os.path.join(out_dir, "dic_metadata.json")
 
-            # Calculate effective FPS based on extraction step ---
             extraction_step = self._step_spin.value()
             effective_fps = self._fps / extraction_step if extraction_step > 0 else self._fps
 
@@ -603,6 +615,10 @@ class VideoImporterDialog(QDialog):
             self._cap.release()
             self._cap = None
         self.reject()
+
+    @property
+    def video_path(self) -> str:
+        return self._video_path or ""
 
     # ------------------------------------------------------------------
     # Cleanup
