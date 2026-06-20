@@ -439,88 +439,91 @@ class ResultsPage(QWidget):
         self._frame_lbl.setText(f"Frame {idx + 1} / {n}")
 
     def _apply_overlay(self, arr: np.ndarray) -> None:
-        """Convert field array to RGBA colormap overlay and push to canvas safely."""
+        """
+        Professional Continuous Overlay using Delaunay Triangulation.
+        Removes all blockiness by interpolating across the measurement grid.
+        """
         try:
             import matplotlib.cm as cm
             import matplotlib.colors as mc
-            from scipy.ndimage import grey_dilation, binary_dilation, gaussian_filter
+            from scipy.interpolate import griddata
+            from scipy.ndimage import gaussian_filter
 
-            valid_mask = np.isfinite(arr)
+            # 1. Extract valid data points
+            valid_mask = np.isfinite(arr) & (arr != 0.0)
             if not valid_mask.any():
                 self._canvas.set_result_overlay_rgba(None)
                 return
 
-            # 1. ── Calculate limits ─────────────────
-            if hasattr(self, '_static_scale_chk') and self._static_scale_chk.isChecked():
+            ys, xs = np.where(valid_mask)
+            values = arr[valid_mask]
+
+            # 2. Define the interpolation grid
+            # We use the full image bounds to ensure coverage
+            grid_y, grid_x = np.mgrid[0:arr.shape[0], 0:arr.shape[1]]
+
+            # 3. Delaunay Triangulation (The secret to 'Ncorr-smooth' visuals)
+            # This mathematically fills the gaps between your 2px-spaced subsets
+            dense_field = griddata(
+                (ys, xs),
+                values,
+                (grid_y, grid_x),
+                method='linear'  # 'linear' is fast and creates the smooth mesh
+            )
+
+            # Fill remaining NaNs at edges with nearest value
+            dense_field = griddata((ys, xs), values, (grid_y, grid_x), method='nearest')
+
+            # 4. Calculate display limits (Static vs Dynamic)
+            if getattr(self, '_static_scale_chk', False) and self._static_scale_chk.isChecked():
                 vmin, vmax = self._wizard.analysis.get_global_range(self._field)
             else:
-                vmin, vmax = float(arr[valid_mask].min()), float(arr[valid_mask].max())
+                vmin, vmax = float(values.min()), float(values.max())
 
-            if hasattr(self, '_sym_chk') and self._sym_chk.isChecked():
+            if getattr(self, '_sym_chk', False) and self._sym_chk.isChecked():
                 lim = max(abs(vmin), abs(vmax))
                 vmin, vmax = -lim, lim
 
-            if vmin == vmax:
-                vmax = vmin + 1e-12
+            if vmin == vmax: vmax = vmin + 1e-12
 
-            # 2. ── Generate Base RGBA Map ─────────────────────────────
-            cmap_name = self._cmap_combo.currentText()
-            cmap_obj = cm.get_cmap(cmap_name, 256)
+            # 5. Color Mapping
             norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
+            cmap_obj = cm.get_cmap(self._cmap_combo.currentText(), 256)
 
-            rgba = cmap_obj(norm(arr), bytes=True).astype(np.float32)
-            rgba[~valid_mask] = 0
+            # Generate RGBA
+            rgba = cmap_obj(norm(dense_field), bytes=True).astype(np.float32)
 
-            SATURATION = 1.35
-            for ch in range(3):
-                ch_f = rgba[..., ch] / 255.0
-                ch_f = np.clip(0.5 + (ch_f - 0.5) * SATURATION, 0.0, 1.0)
-                rgba[..., ch] = (ch_f * 255.0).astype(np.float32)
+            # Boost saturation for 'professional' look
+            rgba[..., :3] = np.clip(0.5 + (rgba[..., :3] / 255.0 - 0.5) * 1.35, 0.0, 1.0) * 255.0
 
-            kernel_size = 13
-            struct = np.ones((kernel_size, kernel_size), dtype=bool)
+            # Apply ROI Masking (So colors don't bleed outside the specimen)
+            rgba[..., 3] = 195.0
+            roi_mask = self._wizard.analysis.roi_mask
+            if roi_mask is not None:
+                rgba[~roi_mask, 3] = 0.0
 
-            for ch in range(3):
-                rgba[..., ch] = grey_dilation(rgba[..., ch].astype(np.uint8),
-                                              structure=struct).astype(np.float32)
+            # 6. Final Smoothing for anti-aliasing (removes jagged edges)
+            rgba[..., 3] = gaussian_filter(rgba[..., 3], sigma=0.5)
 
-            covered = binary_dilation(valid_mask, structure=struct)
-            rgba[~covered, 3] = 0
-            rgba[covered, 3] = 195
-
-            sigma = 1.4
-            for ch in range(4):
-                rgba[..., ch] = gaussian_filter(rgba[..., ch], sigma=sigma)
-
-            rgba[~covered, 3] = 0
-
-            # CRITICAL FIX FOR 0xC0000409: FORCE DEEP CONTIGUOUS COPY
-            # NumPy morphological ops fragment memory. Passing this directly to C++
-            # causes the stack overrun and makes the canvas drop the image.
+            # Final check: Force contiguous memory for Qt canvas
             safe_rgba = np.ascontiguousarray(rgba.astype(np.uint8))
             self._canvas.set_result_overlay_rgba(safe_rgba)
 
-            # ── Update colorbar ────────────────────────
-            n_bar = 64
-            bar_colors = []
-            for i in range(n_bar):
-                r, g, b, _ = cmap_obj(i / (n_bar - 1))
-                r = max(0.0, min(1.0, 0.5 + (r - 0.5) * SATURATION))
-                g = max(0.0, min(1.0, 0.5 + (g - 0.5) * SATURATION))
-                b = max(0.0, min(1.0, 0.5 + (b - 0.5) * SATURATION))
-                bar_colors.append((int(r * 255), int(g * 255), int(b * 255)))
-
-            # Safely grab the unit string
-            unit = ""
-            try:
-                unit = FIELDS.get(self._field, ("", ""))[1]
-            except Exception:
-                pass
-
-            self._colorbar.update_bar(vmin, vmax, unit, bar_colors)
+            # Update colorbar
+            self._update_colorbar(cmap_obj, vmin, vmax)
 
         except Exception as exc:
             print(f"Overlay error: {exc}")
+
+    def _update_colorbar(self, cmap, vmin, vmax):
+        n_bar = 64
+        bar_colors = []
+        for i in range(n_bar):
+            r, g, b, _ = cmap(i / (n_bar - 1))
+            bar_colors.append((int(r * 255), int(g * 255), int(b * 255)))
+        unit = FIELDS.get(self._field, ("", ""))[1]
+        self._colorbar.update_bar(vmin, vmax, unit, bar_colors)
+
     def _update_stats(self, result) -> None:
         arr = getattr(result, self._field, None)
         if arr is None:
