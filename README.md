@@ -1,8 +1,8 @@
-# PyDIC — Python Digital Image Correlation
+# StrainX — Python Digital Image Correlation
 
-PyDIC is a 2D Digital Image Correlation tool written in Python. We built it as part of our work at IIT Kanpur to replicate the algorithmic core of Ncorr (Blaber, Adair & Antoniou, 2015) in a freely available, fully automated package and to add one capability Ncorr doesn't have: direct full-field strain rate computation.
+StrainX is a 2D Digital Image Correlation tool written in Python. We built it as part of our work at IIT Kanpur to replicate the algorithmic core of Ncorr (Blaber, Adair & Antoniou, 2015) in a freely available, fully automated package and to add one capability Ncorr doesn't have: direct full-field strain rate computation.
 
-The algorithms follow the Ncorr paper closely enough that we validated PyDIC against Ncorr on a real CFRP tensile dataset and got R² = 0.991 on vertical displacement across ten loading frames, with Bland–Altman agreement within ±1.34 px. The strain rates are a new addition and are described at the bottom of this file.
+The algorithms follow the Ncorr paper closely enough that we validated StrainX against Ncorr on a real CFRP tensile dataset and got R² = 0.991 on vertical displacement across ten loading frames, with Bland–Altman agreement within ±1.34 px. The strain rates are a new addition and are described at the bottom of this file.
 
 ---
 
@@ -18,11 +18,11 @@ The algorithms follow the Ncorr paper closely enough that we validated PyDIC aga
 ## Installation
 
 ```bash
-git clone https://github.com/anandroid29/pydic.git
+git clone https://github.com/anandroid29/StrainX.git
 python -m venv venv
 source venv/bin/activate        # on Windows: venv\Scripts\activate.bat
 pip install -r requirements.txt
-cd pydic
+cd StrainX
 python main.py
 ```
 
@@ -141,7 +141,7 @@ These are the full Green–Lagrangian (finite-strain) expressions, not the linea
 
 ### Strain rates
 
-This is the main thing PyDIC does that Ncorr does not. Once strain fields are computed for all N frames, we differentiate them in time using a finite-difference scheme. For an image sequence acquired at frame rate f_ps (frames per second), Δt = 1/f_ps, and:
+This is the main thing StrainX does that Ncorr does not. Once strain fields are computed for all N frames, we differentiate them in time using a finite-difference scheme. For an image sequence acquired at frame rate f_ps (frames per second), Δt = 1/f_ps, and:
 
 ```
 dE_ij/dt at frame 0:       (E_ij,1 − E_ij,0) / Δt
@@ -158,7 +158,7 @@ We validated this against rates derived by applying the same scheme to Ncorr's p
 ## File structure
 
 ```
-pydic/
+StrainX/
 ├── main.py
 ├── requirements.txt
 ├── README.md
