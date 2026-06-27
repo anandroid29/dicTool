@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSpinBox, QDoubleSpinBox,
-    QFrame, QGridLayout, QSizePolicy, QCheckBox,
+    QFrame, QGridLayout, QSizePolicy, QCheckBox, QComboBox
 )
 
 from src.ui.components import FooterButton
@@ -150,6 +150,17 @@ class ParamsPage(QWidget):
             "Smaller = denser result grid, longer analysis time.",
             self._sp_spacing, "px"))
 
+        self._cb_dynamic_roi = QComboBox()
+        self._cb_dynamic_roi.addItems(["None", "Contrast", "Edge Detection", "Hybrid"])
+        self._cb_dynamic_roi.setCurrentText(params.dynamic_roi)
+        self._cb_dynamic_roi.setFixedWidth(110)
+        self._cb_dynamic_roi.currentTextChanged.connect(self._on_param_changed)
+        right_lay.addLayout(_param_row(
+            "Dynamic ROI", "Dynamically updates the valid ROI for each frame based on the deformed image.\n"
+            "Useful for cutting experiments where material is removed.\n"
+            "Pixels excluded by this method are set to NaN and ignored in stress/strain calculations.",
+            self._cb_dynamic_roi, ""))
+
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Strain"))
 
@@ -216,16 +227,24 @@ class ParamsPage(QWidget):
         foot_lay.addStretch()
 
         # ── GPU Acceleration Toggle ───────────────────────────────────
-        self._gpu_chk = QCheckBox("Use GPU Acceleration (CuPy)")
+        self._gpu_chk = QPushButton("Use GPU Acceleration (CuPy)")
+        self._gpu_chk.setCheckable(True)
+        self._gpu_chk.setFixedHeight(32)
+        self._gpu_chk.setCursor(Qt.CursorShape.PointingHandCursor)
 
         if _HAS_GPU:
             self._gpu_chk.setChecked(True)
-            self._gpu_chk.setStyleSheet(f"color:{_C_SUCCESS}; font-weight:bold;")
+            self._gpu_chk.setStyleSheet(
+                f"QPushButton:checked {{ background: {_C_ACCENT}; color: white; border: 1px solid {_C_ACCENT}; border-radius: 6px; padding: 0 12px; }}"
+                f"QPushButton:!checked {{ background: transparent; color: {_C_TEXT2}; border: 1px solid {_C_BORDER}; border-radius: 6px; padding: 0 12px; }}"
+            )
             self._gpu_chk.setToolTip("GPU detected! Batched IC-GN will be used.")
         else:
             self._gpu_chk.setChecked(False)
             self._gpu_chk.setEnabled(False)
-            self._gpu_chk.setStyleSheet(f"color:{_C_TEXT2};")
+            self._gpu_chk.setStyleSheet(
+                f"background: transparent; color: {_C_BORDER}; border: 1px solid {_C_BORDER}; border-radius: 6px; padding: 0 12px;"
+            )
             self._gpu_chk.setToolTip("No compatible NVIDIA GPU or CuPy installation detected.")
 
         foot_lay.addWidget(self._gpu_chk)
@@ -269,6 +288,7 @@ class ParamsPage(QWidget):
         p.conv_tol       = self._sp_tol.value()
         p.corr_cutoff    = self._sp_cutoff.value()
         p.search_radius  = self._sp_search.value()
+        p.dynamic_roi    = self._cb_dynamic_roi.currentText()
 
         if hasattr(self._canvas, "set_subset_radius"):
             self._canvas.set_subset_radius(p.subset_radius)
@@ -317,6 +337,10 @@ class ParamsPage(QWidget):
             sb.setValue(val)
             sb.blockSignals(False)
 
+        self._cb_dynamic_roi.blockSignals(True)
+        self._cb_dynamic_roi.setCurrentText(p.dynamic_roi)
+        self._cb_dynamic_roi.blockSignals(False)
+
         self._on_param_changed()  # Update the subset counter text
 
         QMessageBox.information(
@@ -334,4 +358,5 @@ class ParamsPage(QWidget):
         else:
             self._wizard.use_gpu = False
 
+        self._wizard.analysis.save_settings()
         self._wizard.go_analysis()
