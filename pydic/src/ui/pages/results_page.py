@@ -13,12 +13,12 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Optional
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QColor, QPainter, QLinearGradient, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
-    QFileDialog, QMessageBox, QSpinBox, QToolButton,
+    QFileDialog, QMessageBox, QSpinBox, QToolButton, QProgressDialog, QProgressBar,
 )
 
 if TYPE_CHECKING:
@@ -68,6 +68,26 @@ FIELDS = {
 CMAPS = ["inferno","magma","plasma","cividis","hot","afmhot",
          "gist_heat","copper","RdBu_r","seismic","bwr","coolwarm",
          "viridis","turbo","jet","gray"]
+
+
+class ExportWorker(QThread):
+    finished_export = pyqtSignal(bool, str)
+    progress_export = pyqtSignal(int)
+
+    def __init__(self, analysis, path, parent=None):
+        super().__init__(parent)
+        self.analysis = analysis
+        self.path = path
+
+    def run(self):
+        try:
+            def prog_cb(frac):
+                self.progress_export.emit(int(frac * 100))
+            self.analysis.export_hdf5(self.path, progress_cb=prog_cb)
+            self.finished_export.emit(True, self.path)
+        except Exception as e:
+            self.finished_export.emit(False, str(e))
+
 
 class _ColorBar(QWidget):
     """A thin horizontal gradient bar with vmin/vmax labels."""
@@ -301,6 +321,16 @@ class ResultsPage(QWidget):
             btn.clicked.connect(slot)
             sb_lay.addWidget(btn)
 
+        self._export_progress = QProgressBar()
+        self._export_progress.setFixedHeight(24)
+        self._export_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._export_progress.setStyleSheet(
+            f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: {_C_TEXT}; }}"
+            f"QProgressBar::chunk {{ background: {_C_ACCENT}; border-radius: 3px; }}"
+        )
+        self._export_progress.hide()
+        sb_lay.addWidget(self._export_progress)
+
         sb_lay.addStretch()
         body_lay.addWidget(sidebar)
         root.addWidget(body, 1)
@@ -440,80 +470,79 @@ class ResultsPage(QWidget):
 
     def _apply_overlay(self, arr: np.ndarray) -> None:
         """
-        Professional Continuous Overlay using Delaunay Triangulation.
-        Removes all blockiness by interpolating across the measurement grid.
+        Professional Continuous Overlay using Fast Grid Resampling.
+        Synchronous execution (takes < 5ms).
         """
-        try:
-            import matplotlib.cm as cm
-            import matplotlib.colors as mc
-            from scipy.interpolate import griddata
-            from scipy.ndimage import gaussian_filter
-
-            # 1. Extract valid data points
+        if getattr(self, '_static_scale_chk', False) and self._static_scale_chk.isChecked():
+            vmin, vmax = self._wizard.analysis.get_global_range(self._field)
+        else:
             valid_mask = np.isfinite(arr) & (arr != 0.0)
             if not valid_mask.any():
                 self._canvas.set_result_overlay_rgba(None)
                 return
+            values = arr[valid_mask]
+            vmin, vmax = float(values.min()), float(values.max())
+
+        use_sym = getattr(self, '_sym_chk', False) and self._sym_chk.isChecked()
+        cmap_name = self._cmap_combo.currentText()
+        roi_mask = self._wizard.analysis.roi_mask
+        spacing = self._wizard.analysis.params.subset_spacing
+
+        try:
+            import cv2
+            import matplotlib.cm as cm
+            import matplotlib.colors as mc
+            from scipy.ndimage import gaussian_filter
+            from scipy.interpolate import griddata
 
             ys, xs = np.where(valid_mask)
-            values = arr[valid_mask]
+            ymin, ymax = ys.min(), ys.max()
+            xmin, xmax = xs.min(), xs.max()
 
-            # 2. Define the interpolation grid
-            # We use the full image bounds to ensure coverage
-            grid_y, grid_x = np.mgrid[0:arr.shape[0], 0:arr.shape[1]]
+            cropped_arr = arr[ymin:ymax+1, xmin:xmax+1].copy()
+            cropped_mask = valid_mask[ymin:ymax+1, xmin:xmax+1]
 
-            # 3. Delaunay Triangulation (The secret to 'Ncorr-smooth' visuals)
-            # This mathematically fills the gaps between your 2px-spaced subsets
-            dense_field = griddata(
-                (ys, xs),
-                values,
-                (grid_y, grid_x),
-                method='linear'  # 'linear' is fast and creates the smooth mesh
-            )
+            s = max(1, spacing)
+            small_arr = cropped_arr[0::s, 0::s]
+            small_mask = cropped_mask[0::s, 0::s]
 
-            # Fill remaining NaNs at edges with nearest value
-            dense_field = griddata((ys, xs), values, (grid_y, grid_x), method='nearest')
+            if not small_mask.all():
+                sys, sxs = np.where(small_mask)
+                svals = small_arr[small_mask]
+                grid_y, grid_x = np.mgrid[0:small_arr.shape[0], 0:small_arr.shape[1]]
+                small_arr = griddata((sys, sxs), svals, (grid_y, grid_x), method='nearest')
+                small_arr = np.nan_to_num(small_arr)
 
-            # 4. Calculate display limits (Static vs Dynamic)
-            if getattr(self, '_static_scale_chk', False) and self._static_scale_chk.isChecked():
-                vmin, vmax = self._wizard.analysis.get_global_range(self._field)
-            else:
-                vmin, vmax = float(values.min()), float(values.max())
-
-            if getattr(self, '_sym_chk', False) and self._sym_chk.isChecked():
+            if vmin == vmax: vmax = vmin + 1e-12
+            if use_sym:
                 lim = max(abs(vmin), abs(vmax))
                 vmin, vmax = -lim, lim
 
-            if vmin == vmax: vmax = vmin + 1e-12
-
-            # 5. Color Mapping
             norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
-            cmap_obj = cm.get_cmap(self._cmap_combo.currentText(), 256)
+            cmap_obj = cm.get_cmap(cmap_name, 256)
 
-            # Generate RGBA
-            rgba = cmap_obj(norm(dense_field), bytes=True).astype(np.float32)
+            rgba_small = cmap_obj(norm(small_arr), bytes=True).astype(np.float32)
+            rgba_small[..., :3] = np.clip(0.5 + (rgba_small[..., :3] / 255.0 - 0.5) * 1.35, 0.0, 1.0) * 255.0
+            rgba_small[..., 3] = 195.0
 
-            # Boost saturation for 'professional' look
-            rgba[..., :3] = np.clip(0.5 + (rgba[..., :3] / 255.0 - 0.5) * 1.35, 0.0, 1.0) * 255.0
+            target_h, target_w = ymax - ymin + 1, xmax - xmin + 1
+            rgba_crop_large = cv2.resize(rgba_small, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
-            # Apply ROI Masking (So colors don't bleed outside the specimen)
-            rgba[..., 3] = 195.0
-            roi_mask = self._wizard.analysis.roi_mask
+            rgba_full = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.float32)
+            rgba_full[ymin:ymax+1, xmin:xmax+1] = rgba_crop_large
+
             if roi_mask is not None:
-                rgba[~roi_mask, 3] = 0.0
+                rgba_full[~roi_mask, 3] = 0.0
 
-            # 6. Final Smoothing for anti-aliasing (removes jagged edges)
-            rgba[..., 3] = gaussian_filter(rgba[..., 3], sigma=0.5)
+            rgba_full[..., 3] = gaussian_filter(rgba_full[..., 3], sigma=0.5)
+            safe_rgba = np.ascontiguousarray(rgba_full.astype(np.uint8))
 
-            # Final check: Force contiguous memory for Qt canvas
-            safe_rgba = np.ascontiguousarray(rgba.astype(np.uint8))
             self._canvas.set_result_overlay_rgba(safe_rgba)
-
-            # Update colorbar
             self._update_colorbar(cmap_obj, vmin, vmax)
 
         except Exception as exc:
             print(f"Overlay error: {exc}")
+            self._canvas.set_result_overlay_rgba(None)
 
     def _update_colorbar(self, cmap, vmin, vmax):
         n_bar = 64
@@ -610,11 +639,37 @@ class ResultsPage(QWidget):
         self._wizard.analysis.last_hdf5_directory = os.path.dirname(path)
         self._wizard.analysis.save_settings()
 
-        try:
-            self._wizard.analysis.export_hdf5(path)
-            QMessageBox.information(self, "Exported", f"HDF5 saved to:\n{path}")
-        except Exception as e:
-            QMessageBox.warning(self, "Export Error", str(e))
+        self._export_progress.show()
+        self._export_progress.setValue(0)
+        self._export_progress.setFormat("Exporting HDF5... %p%")
+        self._export_progress.setStyleSheet(
+            f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: {_C_TEXT}; }}"
+            f"QProgressBar::chunk {{ background: {_C_ACCENT}; border-radius: 3px; }}"
+        )
+
+        self._export_worker = ExportWorker(self._wizard.analysis, path, self)
+        self._export_worker.progress_export.connect(self._on_export_progress)
+        self._export_worker.finished_export.connect(self._on_export_finished)
+        self._export_worker.start()
+
+    def _on_export_progress(self, val):
+        self._export_progress.setValue(val)
+
+    def _on_export_finished(self, success, result_str):
+        if success:
+            self._export_progress.setValue(100)
+            self._export_progress.setFormat("Export Complete")
+            self._export_progress.setStyleSheet(
+                f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: {_C_TEXT}; }}"
+                f"QProgressBar::chunk {{ background: {_C_SUCCESS}; border-radius: 3px; }}"
+            )
+        else:
+            self._export_progress.setFormat("Export Failed ✗")
+            self._export_progress.setStyleSheet(
+                f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: red; }}"
+                f"QProgressBar::chunk {{ background: {_C_CARD}; }}"
+            )
+            QMessageBox.warning(self, "Export Error", result_str)
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

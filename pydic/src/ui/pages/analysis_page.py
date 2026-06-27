@@ -239,7 +239,7 @@ class AnalysisPage(QWidget):
         self._cancel_btn.setEnabled(False)
         n = len(self._wizard.analysis.results)
         self._status_lbl.setText(
-            f"✓  Analysis complete — {n} frame{'s' if n != 1 else ''} processed."
+            f"Analysis complete - {n} frame{'s' if n != 1 else ''} processed."
         )
         self._status_lbl.setStyleSheet(f"color:{_C_SUCCESS}; font-size:13px; font-weight:600;")
         self._wizard.go_results()
