@@ -456,7 +456,7 @@ class DICAnalysis:
             if arr is not None:
                 np.savetxt(os.path.join(directory, f"{base}_{name}.csv"), arr, delimiter=",")
 
-    def export_hdf5(self, path: str) -> None:
+    def export_hdf5(self, path: str, progress_cb: Optional[Callable[[float], None]] = None) -> None:
         import h5py
         with h5py.File(path, "w") as f:
             # 1. Save Global Attributes
@@ -479,6 +479,8 @@ class DICAnalysis:
 
             # 3. Save Frame Data
             for i, res in enumerate(self.results):
+                if progress_cb:
+                    progress_cb(i / len(self.results))
                 g = f.create_group(f"frame_{i:04d}")
                 g.attrs["image_path"] = res.image_path
                 g.attrs["elapsed_s"] = res.elapsed

@@ -510,9 +510,9 @@ class WelcomePage(QWidget):
             QMessageBox.critical(self, "Load Error", f"Failed to load session:\n{e}")
 
     def _update_status(self, ref: str, defs: list, fps: float) -> None:
-        self._status_ref.setText(f"✓  Reference: {os.path.basename(ref)}")
+        self._status_ref.setText(f"Reference: {os.path.basename(ref)}")
         self._status_ref.setStyleSheet(f"color:{_C_SUCCESS}; font-size:12px; border:none;")
-        self._status_def.setText(f"✓  {len(defs)} deformed frame{'s' if len(defs)!=1 else ''} loaded")
+        self._status_def.setText(f"{len(defs)} deformed frame{'s' if len(defs)!=1 else ''} loaded")
         self._status_def.setStyleSheet(f"color:{_C_SUCCESS}; font-size:12px; border:none;")
         if fps > 1.0:
             self._status_fps.setText(f"   Effective sample rate: {fps:.2f} fps  ·  Δt = {1000/fps:.1f} ms per frame")
