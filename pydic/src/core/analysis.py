@@ -168,6 +168,31 @@ class DICAnalysis:
             elapsed = time.perf_counter() - t0
 
             valid = dic.analyzed & ~np.isnan(dic.u)
+            
+            d_mask = _compute_dynamic_mask(cur, self.params.dynamic_roi)
+            if d_mask is not None and valid.any():
+                y_ref, x_ref = np.where(valid)
+                x_cur = np.round(x_ref + dic.u[valid]).astype(int)
+                y_cur = np.round(y_ref + dic.v[valid]).astype(int)
+                H_i, W_i = cur.shape
+                
+                kept = (x_cur >= 0) & (x_cur < W_i) & (y_cur >= 0) & (y_cur < H_i)
+                in_bnd_idx = np.where(kept)[0]
+                kept[in_bnd_idx] = d_mask[y_cur[in_bnd_idx], x_cur[in_bnd_idx]]
+                
+                lost = ~kept
+                y_lost, x_lost = y_ref[lost], x_ref[lost]
+                
+                dic.u[y_lost, x_lost] = np.nan
+                dic.v[y_lost, x_lost] = np.nan
+                dic.du_dx[y_lost, x_lost] = np.nan
+                dic.du_dy[y_lost, x_lost] = np.nan
+                dic.dv_dx[y_lost, x_lost] = np.nan
+                dic.dv_dy[y_lost, x_lost] = np.nan
+                dic.corr[y_lost, x_lost] = np.nan
+                
+                valid[y_lost, x_lost] = False
+
             if valid.any():
                 guess_u = float(np.median(dic.u[valid]))
                 guess_v = float(np.median(dic.v[valid]))
@@ -295,6 +320,30 @@ class DICAnalysis:
             if not np.isnan(u_f[actual_seed_y, actual_seed_x]):
                 guess_u = float(u_f[actual_seed_y, actual_seed_x])
                 guess_v = float(v_f[actual_seed_y, actual_seed_x])
+
+            d_mask = _compute_dynamic_mask(cur_image, self.params.dynamic_roi)
+            if d_mask is not None:
+                valid = ~np.isnan(u_f)
+                if valid.any():
+                    y_ref, x_ref = np.where(valid)
+                    x_cur = np.round(x_ref + u_f[valid]).astype(int)
+                    y_cur = np.round(y_ref + v_f[valid]).astype(int)
+                    H_i, W_i = cur_image.shape
+                    
+                    kept = (x_cur >= 0) & (x_cur < W_i) & (y_cur >= 0) & (y_cur < H_i)
+                    in_bnd_idx = np.where(kept)[0]
+                    kept[in_bnd_idx] = d_mask[y_cur[in_bnd_idx], x_cur[in_bnd_idx]]
+                    
+                    lost = ~kept
+                    y_lost, x_lost = y_ref[lost], x_ref[lost]
+                    
+                    u_f[y_lost, x_lost] = np.nan
+                    v_f[y_lost, x_lost] = np.nan
+                    du_dx[y_lost, x_lost] = np.nan
+                    du_dy[y_lost, x_lost] = np.nan
+                    dv_dx[y_lost, x_lost] = np.nan
+                    dv_dy[y_lost, x_lost] = np.nan
+                    corr_f[y_lost, x_lost] = np.nan
 
             elapsed = time.perf_counter() - t0
             nan_arr = np.full_like(u_f, np.nan)
@@ -589,6 +638,7 @@ class DICAnalysis:
                 "conv_tol": self.params.conv_tol,
                 "corr_cutoff": self.params.corr_cutoff,
                 "search_radius": self.params.search_radius,
+                "dynamic_roi": getattr(self.params, "dynamic_roi", "None"),
 
                 # Save all specialized directories
                 "last_video_directory": getattr(self, "last_video_directory", os.path.expanduser("~")),
@@ -611,3 +661,82 @@ def _load_image(path: str) -> np.ndarray:
         return np.asarray(PILImage.open(path).convert("L"), np.float64) / 255.0
     else:
         raise ImportError("Install opencv-python or Pillow.")
+
+def _compute_dynamic_mask(cur_image: np.ndarray, method: str) -> Optional[np.ndarray]:
+    if method == "None":
+        return None
+    
+    if not _HAVE_CV2:
+        print("[Warning] cv2 not available for dynamic ROI. Ignoring.")
+        return None
+        
+    img_u8 = (cur_image * 255).astype(np.uint8)
+    
+    # We use a larger kernel and contour finding to extract a single solid workpiece ROI.
+    
+    if method == "Contrast":
+        # Local standard deviation (texture strength)
+        mean = cv2.blur(cur_image, (9, 9))
+        sq_mean = cv2.blur(cur_image**2, (9, 9))
+        var = sq_mean - mean**2
+        std = np.sqrt(np.maximum(var, 0))
+        
+        std_max = std.max()
+        if std_max == 0: return np.zeros_like(img_u8, dtype=bool)
+            
+        metric_u8 = (std / std_max * 255).astype(np.uint8)
+        metric_u8 = cv2.GaussianBlur(metric_u8, (5, 5), 0)
+        
+    elif method == "Edge Detection":
+        # Sobel edge magnitude
+        grad_x = cv2.Sobel(cur_image, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(cur_image, cv2.CV_64F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        
+        grad_max = grad_mag.max()
+        if grad_max == 0: return np.zeros_like(img_u8, dtype=bool)
+            
+        metric_u8 = (grad_mag / grad_max * 255).astype(np.uint8)
+        metric_u8 = cv2.blur(metric_u8, (5, 5))
+        
+    elif method == "Hybrid":
+        # Combine local variance and edge magnitude
+        mean = cv2.blur(cur_image, (9, 9))
+        sq_mean = cv2.blur(cur_image**2, (9, 9))
+        var = sq_mean - mean**2
+        std = np.sqrt(np.maximum(var, 0))
+        
+        grad_x = cv2.Sobel(cur_image, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(cur_image, cv2.CV_64F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        
+        metric = std + grad_mag
+        metric_max = metric.max()
+        if metric_max == 0: return np.zeros_like(img_u8, dtype=bool)
+            
+        metric_u8 = (metric / metric_max * 255).astype(np.uint8)
+        metric_u8 = cv2.GaussianBlur(metric_u8, (5, 5), 0)
+        
+    else:
+        return None
+
+    # Common extraction logic for all methods:
+    # 1. Threshold
+    _, mask = cv2.threshold(metric_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 2. Morphological close to connect nearby speckle blobs
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    # 3. Find contours and keep only the largest one (the main workpiece)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask > 0
+        
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # 4. Draw solidly filled contour
+    final_mask = np.zeros_like(mask)
+    cv2.drawContours(final_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+    
+    return final_mask > 0

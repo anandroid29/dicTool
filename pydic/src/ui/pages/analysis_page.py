@@ -70,7 +70,8 @@ class AnalysisPage(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._tick_elapsed)
-        self._last_thumb_idx = -1  # NEW: Track frame to stop I/O spam
+        self._last_thumb_idx = -1   # tracks len(results) to redraw on new result
+        self._last_shown_frame = -1  # tracks frame number from progress msg
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -111,11 +112,8 @@ class AnalysisPage(QWidget):
         self._preview_lbl.setText("Preparing…")
         body_lay.addWidget(self._preview_lbl, 1)
 
-        # Frame label
-        self._frame_lbl = QLabel("")
-        self._frame_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:12px;")
-        self._frame_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        body_lay.addWidget(self._frame_lbl)
+        # (Frame label removed as per request)
+        self._frame_lbl = None
 
         # Progress bar
         self._pbar = QProgressBar()
@@ -166,8 +164,9 @@ class AnalysisPage(QWidget):
         """Start the DIC analysis thread."""
         self._pbar.setValue(0)
         self._status_lbl.setText("Starting…")
-        self._frame_lbl.setText("")
         self._cancel_btn.setEnabled(True)
+        self._last_thumb_idx = -1
+        self._last_shown_frame = -1
         self._t_start = time.perf_counter()
         self._timer.start()
 
@@ -197,40 +196,117 @@ class AnalysisPage(QWidget):
         if m:
             cur_f, tot_f = int(m.group(1)), int(m.group(2))
             self._frames_lbl.findChild(QLabel, "value").setText(f"{cur_f} / {tot_f}")
+            frame_idx = cur_f - 1  # 0-based
+        else:
+            frame_idx = self._last_shown_frame
 
-            # NEW: Only execute disk I/O if the frame actually changed
-            if self._last_thumb_idx != cur_f:
-                self._show_frame_thumbnail(cur_f - 1)
-                self._last_thumb_idx = cur_f
+        n_results = len(self._wizard.analysis.results)
+        
+        # We always want to show the LATEST frame that has a computed ROI.
+        # This means while Frame 2 is tracking, we show Frame 1 (with its ROI).
+        if n_results > 0:
+            show_idx = n_results - 1
+        else:
+            show_idx = frame_idx
+
+        # Only redraw if the frame we want to show changed, OR if a new result became available for it
+        if show_idx != self._last_shown_frame or n_results != self._last_thumb_idx:
+            self._last_shown_frame = show_idx
+            self._last_thumb_idx = n_results
+            
+            if show_idx >= 0:
+                self._show_frame_thumbnail(show_idx)
 
     def _show_frame_thumbnail(self, idx: int) -> None:
-        paths = self._wizard.analysis.def_paths
+        """Draw the deformed-image thumbnail with a cyan ROI overlay."""
+        import cv2
+        import os
+
+        analysis = self._wizard.analysis
+        paths = analysis.def_paths
+
         if idx < 0 or idx >= len(paths):
             return
+
         try:
-            import cv2
             img = cv2.imread(paths[idx], cv2.IMREAD_GRAYSCALE)
             if img is None:
                 return
             H, W = img.shape
+
+            # --- compute thumbnail dimensions ---
             thumb_w = min(W, self._preview_lbl.width() - 20)
             thumb_h = int(thumb_w * H / W)
             if thumb_h > self._preview_lbl.height() - 20:
                 thumb_h = self._preview_lbl.height() - 20
                 thumb_w = int(thumb_h * W / H)
-            img_small = cv2.resize(img, (max(1, thumb_w), max(1, thumb_h)))
+            thumb_w = max(1, thumb_w)
+            thumb_h = max(1, thumb_h)
+
+            img_small = cv2.resize(img, (thumb_w, thumb_h))
             rgb = cv2.cvtColor(img_small, cv2.COLOR_GRAY2RGB)
+
+            # --- Draw live ROI overlay ---
+            try:
+                if idx < len(analysis.results):
+                    result = analysis.results[idx]
+                    if result is not None and hasattr(result, 'u'):
+                        valid_mask = np.isfinite(result.u)
+                        if valid_mask.any():
+                            s = max(1, analysis.params.subset_spacing)
+
+                            # Dilate the sparse subset grid into a solid mask
+                            kernel = np.ones((s + 1, s + 1), np.uint8)
+                            dense_mask = cv2.dilate(
+                                valid_mask.astype(np.uint8), kernel
+                            )
+
+                            # Fill enclosed holes using flood-fill from borders:
+                            # 1. Pad with a 1px border of zeros
+                            # 2. Flood-fill from (0,0) to find exterior background
+                            # 3. Everything NOT exterior is ROI (fills interior holes)
+                            padded = np.zeros(
+                                (dense_mask.shape[0] + 2, dense_mask.shape[1] + 2),
+                                dtype=np.uint8,
+                            )
+                            padded[1:-1, 1:-1] = dense_mask
+                            flood = padded.copy()
+                            cv2.floodFill(flood, None, (0, 0), 255)
+                            # Invert: exterior=0, interior holes=255
+                            interior_holes = 255 - flood[1:-1, 1:-1]
+                            # Merge: original ROI + filled holes
+                            filled_mask = np.maximum(dense_mask * 255, interior_holes)
+
+                            # Resize to thumbnail dimensions
+                            thumb_mask = cv2.resize(
+                                filled_mask, (thumb_w, thumb_h),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+
+                            # Blend cyan tint onto valid pixels
+                            roi_pixels = thumb_mask > 0
+                            if roi_pixels.any():
+                                # Direct alpha blend (no cv2.addWeighted needed)
+                                cyan = np.array([0, 150, 255], dtype=np.float32)
+                                rgb[roi_pixels] = (
+                                    rgb[roi_pixels].astype(np.float32) * 0.55
+                                    + cyan * 0.45
+                                ).astype(np.uint8)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+            # --- Push to screen ---
             h, w = rgb.shape[:2]
-            import numpy as np
-
             self._current_thumb_array = np.ascontiguousarray(rgb)
-            from PyQt6.QtGui import QImage, QPixmap
-            qimg = QImage(self._current_thumb_array.data, w, h, w * 3, QImage.Format.Format_RGB888)
-
+            qimg = QImage(
+                self._current_thumb_array.data, w, h, w * 3,
+                QImage.Format.Format_RGB888,
+            )
             self._preview_lbl.setPixmap(QPixmap.fromImage(qimg))
-            self._frame_lbl.setText(f"Frame {idx + 1}: {paths[idx].split('/')[-1]}")
         except Exception:
-            pass
+            import traceback
+            traceback.print_exc()
 
     @pyqtSlot()
     def _on_finished(self) -> None:

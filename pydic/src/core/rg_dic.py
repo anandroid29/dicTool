@@ -21,6 +21,7 @@ class DICParams:
     conv_tol:       float = 1e-6
     corr_cutoff:    float = 2.0
     search_radius:  int   = 50
+    dynamic_roi:    str   = "Hybrid"
 
 
 @dataclass

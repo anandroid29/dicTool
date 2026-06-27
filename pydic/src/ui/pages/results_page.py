@@ -476,7 +476,7 @@ class ResultsPage(QWidget):
         if getattr(self, '_static_scale_chk', False) and self._static_scale_chk.isChecked():
             vmin, vmax = self._wizard.analysis.get_global_range(self._field)
         else:
-            valid_mask = np.isfinite(arr) & (arr != 0.0)
+            valid_mask = np.isfinite(arr)
             if not valid_mask.any():
                 self._canvas.set_result_overlay_rgba(None)
                 return
@@ -495,6 +495,7 @@ class ResultsPage(QWidget):
             from scipy.ndimage import gaussian_filter
             from scipy.interpolate import griddata
 
+            valid_mask = np.isfinite(arr)
             ys, xs = np.where(valid_mask)
             ymin, ymax = ys.min(), ys.max()
             xmin, xmax = xs.min(), xs.max()
@@ -525,12 +526,16 @@ class ResultsPage(QWidget):
             rgba_small[..., :3] = np.clip(0.5 + (rgba_small[..., :3] / 255.0 - 0.5) * 1.35, 0.0, 1.0) * 255.0
             rgba_small[..., 3] = 195.0
 
+            # Mask out the dynamic ROI holes on the dense small grid BEFORE interpolation
+            rgba_small[~small_mask, 3] = 0.0
+
             target_h, target_w = ymax - ymin + 1, xmax - xmin + 1
             rgba_crop_large = cv2.resize(rgba_small, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
             rgba_full = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.float32)
             rgba_full[ymin:ymax+1, xmin:xmax+1] = rgba_crop_large
 
+            # Apply the static ROI mask to the alpha channel
             if roi_mask is not None:
                 rgba_full[~roi_mask, 3] = 0.0
 
