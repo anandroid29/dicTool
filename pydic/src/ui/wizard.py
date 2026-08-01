@@ -62,10 +62,50 @@ class Wizard(QMainWindow):
         root.addWidget(self._stack, 1)
 
     def _go(self, idx: int, page_with_enter=None) -> None:
+        # Clear the incoming page's stale visuals BEFORE it becomes visible.
+        #
+        # on_enter() is deferred by a timer because some of its work needs final
+        # widget geometry (fit-to-window, colourbar sizing). But setCurrentIndex
+        # shows the page immediately, so between the two the user gets at least
+        # one painted frame of the PREVIOUS run's contents -- the remnant flash.
+        # on_before_show() is the cheap, synchronous half: blank the canvas and
+        # any stale labels now, then let on_enter() repopulate.
+        if page_with_enter is not None and hasattr(page_with_enter, "on_before_show"):
+            page_with_enter.on_before_show()
+
         self._stack.setCurrentIndex(idx)
         self._step_bar.set_step(idx)
+
+        # Paint the cleared state before on_enter's heavier work runs.
+        page = self._stack.widget(idx)
+        if page is not None:
+            page.repaint()
+
         if page_with_enter is not None and hasattr(page_with_enter, "on_enter"):
             QTimer.singleShot(50, page_with_enter.on_enter)
+
+    def new_session(self) -> None:
+        """
+        Full reset. "New Session" previously only navigated back to the welcome
+        page, leaving the finished DICAnalysis and every page's rendered state
+        in place -- which is the other half of the remnant problem.
+        """
+        try:
+            self.analysis.cancel()
+        except Exception:
+            pass
+        self.analysis = DICAnalysis()
+        self.seed_xy = None
+        for page in (self._welcome, self._roi, self._params,
+                     self._analysis, self._results):
+            for hook in ("reset_markers", "on_before_show", "reset_page"):
+                fn = getattr(page, hook, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+        self._go(0, self._welcome)
 
     def go_welcome(self) -> None:
         self._go(0, self._welcome)

@@ -54,7 +54,11 @@ def ncc_initial_guess(
 
     # ---- Correlation ----
     if _HAVE_CV2:
-        result = cv2.matchTemplate(search, template, cv2.TM_CCORR_NORMED)
+        # TM_CCOEFF_NORMED (zero-mean NCC), NOT TM_CCORR_NORMED. The latter does
+        # not subtract the local mean, so under any illumination gradient it peaks
+        # on the brightest region rather than the best-matching one. This also makes
+        # the cv2 path agree with the _fft_ncc fallback, which is a true ZNCC.
+        result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
         _, score, _, max_loc = cv2.minMaxLoc(result)
         col0, row0 = max_loc
     else:
