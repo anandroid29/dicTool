@@ -26,6 +26,7 @@ except ImportError:
     _HAS_CUPY = False
 
 from .rg_dic import DICParams, DICResult, run_rg_dic
+from .strain_accum import StrainAccumulator, total_strain
 from .roi_loader import load_roi_mask
 
 
@@ -54,6 +55,13 @@ class PairResult:
     Exy_rate:  Optional[np.ndarray] = None
     Eyy_rate:  Optional[np.ndarray] = None
     Eeff_rate: Optional[np.ndarray] = None
+    # True where u/v/strain are live, trustworthy accumulated values for THIS
+    # frame. A point whose history broke (occlusion, dropout, ROI loss) is
+    # False here even though its arrays may still hold a frozen last-known
+    # number -- kept for backward compatibility with anything indexing the
+    # raw arrays, but display/export code should mask by this field, not by
+    # isnan(u) alone, since a frozen value is not NaN.
+    valid: Optional[np.ndarray] = None
     elapsed: float = 0.0
 
 
@@ -145,6 +153,14 @@ class DICAnalysis:
 
         guess_u, guess_v = 0.0, 0.0
 
+        # Calibrate the texture threshold ONCE on the reference frame. The old
+        # per-frame _compute_dynamic_mask recalibrated its scale and Otsu
+        # threshold on every image, so "enough texture to correlate" drifted
+        # frame to frame and the mask edge flickered -- see DynamicROI's
+        # docstring, which the GPU path already follows.
+        dyn_roi = DynamicROI(self.params.dynamic_roi)
+        dyn_roi.calibrate(ref)
+
         for i, def_path in enumerate(self.def_paths):
             if self._cancel[0]:
                 break
@@ -168,8 +184,8 @@ class DICAnalysis:
             elapsed = time.perf_counter() - t0
 
             valid = dic.analyzed & ~np.isnan(dic.u)
-            
-            d_mask = _compute_dynamic_mask(cur, self.params.dynamic_roi)
+
+            d_mask = dyn_roi.mask(cur)
             if d_mask is not None and valid.any():
                 y_ref, x_ref = np.where(valid)
                 x_cur = np.round(x_ref + dic.u[valid]).astype(int)
@@ -197,15 +213,28 @@ class DICAnalysis:
                 guess_u = float(np.median(dic.u[valid]))
                 guess_v = float(np.median(dic.v[valid]))
 
-            nan_arr = np.full_like(dic.u, np.nan)
+            # Strain was previously never computed on this path -- every strain
+            # field was handed out as an all-NaN placeholder, so selecting Exx /
+            # Eyy / Exy / Eeff in the results view showed nothing at all. This
+            # path correlates every frame directly against the fixed reference,
+            # so the displacement field IS the total field and finite strain
+            # follows from it directly.
+            st = total_strain(dic.u, dic.v, valid, self.params.effective_strain_window())
 
             self.results.append(PairResult(
                 image_path=def_path,
                 u=dic.u, v=dic.v,
-                Exx=nan_arr.copy(), Exy=nan_arr.copy(), Eyy=nan_arr.copy(), Eeff=nan_arr.copy(),
-                du_dx=nan_arr.copy(), du_dy=nan_arr.copy(),
-                dv_dx=nan_arr.copy(), dv_dy=nan_arr.copy(),
-                corr=dic.corr, elapsed=elapsed,
+                Exx=np.where(valid, st["Exx"], np.nan),
+                Exy=np.where(valid, st["Exy"], np.nan),
+                Eyy=np.where(valid, st["Eyy"], np.nan),
+                # Hencky equivalent strain. Green-Lagrange overstates badly past
+                # ~20%, which is routine here.
+                Eeff=np.where(valid, st["Eeff_log"], np.nan),
+                du_dx=np.where(valid, dic.du_dx, np.nan),
+                du_dy=np.where(valid, dic.du_dy, np.nan),
+                dv_dx=np.where(valid, dic.dv_dx, np.nan),
+                dv_dy=np.where(valid, dic.dv_dy, np.nan),
+                corr=dic.corr, valid=valid.copy(), elapsed=elapsed,
             ))
 
         if not self._cancel[0] and self.results:
@@ -261,6 +290,28 @@ class DICAnalysis:
         warm_start_active = False
         guess_u, guess_v = 0.0, 0.0
 
+        # --- Updated Lagrangian: accumulate total displacement from incremental ---
+        # Always start from None. Keying this off hasattr(self, 'H_ref') meant a
+        # SECOND run on the same DICAnalysis began with a stale all-NaN array
+        # instead, so the first frame took a different code path than it did on
+        # the first run.
+        total_u = None
+        total_v = None
+        # Position hints handed to the solver: last-known offsets for every
+        # started point, including ones that dropped out. Distinct from
+        # total_u/total_v, which are masked to valid points for reporting.
+        hint_u = None
+        hint_v = None
+        total_du_dx = None; total_du_dy = None
+        total_dv_dx = None; total_dv_dy = None
+        prev_image = self._ref_image  # first reference is frame 0
+        accum = None
+        dyn_roi = DynamicROI(self.params.dynamic_roi)
+        dyn_roi.calibrate(self._ref_image)
+
+        H_img, W_img = self._ref_image.shape
+        self.H_ref, self.W_ref = H_img, W_img
+
         for i, def_path in enumerate(self.def_paths):
             if self._cancel[0]: break
             t0 = time.perf_counter()
@@ -270,12 +321,26 @@ class DICAnalysis:
 
             cur_image = _load_image(def_path)
 
+            if hint_u is not None and np.isfinite(hint_u[actual_seed_y, actual_seed_x]):
+                current_seed_x = int(round(actual_seed_x + hint_u[actual_seed_y, actual_seed_x]))
+                current_seed_y = int(round(actual_seed_y + hint_v[actual_seed_y, actual_seed_x]))
+            else:
+                current_seed_x = actual_seed_x
+                current_seed_y = actual_seed_y
+
+            # The seed can be carried outside the frame by accumulated motion;
+            # ncc_initial_guess would then build an empty search window and
+            # silently return the previous guess forever.
+            r_pad = int(self.params.subset_radius)
+            current_seed_x = int(np.clip(current_seed_x, r_pad, W_img - r_pad - 1))
+            current_seed_y = int(np.clip(current_seed_y, r_pad, H_img - r_pad - 1))
+
             if not warm_start_active:
                 if progress_cb:
                     progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.3, f"[{i + 1}/{n_frames}] Global NCC Search...")
 
                 guess_u, guess_v, _ = ncc_initial_guess(
-                    self._ref_image, cur_image, actual_seed_x, actual_seed_y,
+                    prev_image, cur_image, current_seed_x, current_seed_y,
                     self.params.subset_radius, self.params.search_radius,
                     guess_u, guess_v
                 )
@@ -284,8 +349,8 @@ class DICAnalysis:
                 if progress_cb:
                     progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.6, f"[{i + 1}/{n_frames}] Growing Wavefront...")
 
-                u_f, v_f, du_dx, du_dy, dv_dx, dv_dy, corr_f = gpu_solver.solve_frame(
-                    cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False
+                inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f = gpu_solver.solve_frame(
+                    cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False, total_u=hint_u, total_v=hint_v
                 )
                 warm_start_active = True
 
@@ -293,11 +358,11 @@ class DICAnalysis:
                 if progress_cb:
                     progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.5, f"[{i + 1}/{n_frames}] Batched temporal tracking...")
 
-                u_f, v_f, du_dx, du_dy, dv_dx, dv_dy, corr_f = gpu_solver.solve_frame(
-                    cur_image, warm_start=True
+                inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f = gpu_solver.solve_frame(
+                    cur_image, warm_start=True, total_u=hint_u, total_v=hint_v
                 )
 
-                valid_count = np.count_nonzero(~np.isnan(u_f[self._roi_mask]))
+                valid_count = np.count_nonzero(~np.isnan(inc_u[self._roi_mask]))
                 survival_rate = valid_count / max(1, expected_subsets)
 
                 if survival_rate < 0.60:
@@ -307,53 +372,90 @@ class DICAnalysis:
                         progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.7, f"[{i + 1}/{n_frames}] Jolt detected. Repairing via NCC...")
 
                     guess_u, guess_v, _ = ncc_initial_guess(
-                        self._ref_image, cur_image, actual_seed_x, actual_seed_y,
+                        prev_image, cur_image, current_seed_x, current_seed_y,
                         self.params.subset_radius, self.params.search_radius,
                         guess_u, guess_v
                     )
                     seed_p = np.array([guess_u, guess_v, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
-                    u_f, v_f, du_dx, du_dy, dv_dx, dv_dy, corr_f = gpu_solver.solve_frame(
-                        cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False
+                    inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f = gpu_solver.solve_frame(
+                        cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False, total_u=hint_u, total_v=hint_v
                     )
 
-            if not np.isnan(u_f[actual_seed_y, actual_seed_x]):
-                guess_u = float(u_f[actual_seed_y, actual_seed_x])
-                guess_v = float(v_f[actual_seed_y, actual_seed_x])
+            # --- Accumulate incremental -> total displacement and strain ---
+            # Delegated to StrainAccumulator, which (a) never replaces an
+            # existing accumulated total with a bare increment, and (b) re-bases
+            # a point that returns after a gap from its live neighbours instead
+            # of retiring it permanently.
+            if accum is None:
+                accum = StrainAccumulator((H_img, W_img), self.params.effective_strain_window())
+            accum.add_frame(inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy)
 
-            d_mask = _compute_dynamic_mask(cur_image, self.params.dynamic_roi)
+            # Dynamic ROI uses TOTAL displacement for coordinate mapping. Applied
+            # BEFORE the frame's outputs are snapshotted -- doing it afterwards
+            # left PairResult.valid disagreeing with the strain arrays computed
+            # from accum.results() in the same iteration.
+            d_mask = dyn_roi.mask(cur_image)
             if d_mask is not None:
-                valid = ~np.isnan(u_f)
-                if valid.any():
-                    y_ref, x_ref = np.where(valid)
-                    x_cur = np.round(x_ref + u_f[valid]).astype(int)
-                    y_cur = np.round(y_ref + v_f[valid]).astype(int)
+                vmask = accum.valid
+                if vmask.any():
+                    y_ref, x_ref = np.where(vmask)
+                    x_cur = np.round(x_ref + accum.u[vmask]).astype(int)
+                    y_cur = np.round(y_ref + accum.v[vmask]).astype(int)
                     H_i, W_i = cur_image.shape
-                    
                     kept = (x_cur >= 0) & (x_cur < W_i) & (y_cur >= 0) & (y_cur < H_i)
-                    in_bnd_idx = np.where(kept)[0]
-                    kept[in_bnd_idx] = d_mask[y_cur[in_bnd_idx], x_cur[in_bnd_idx]]
-                    
-                    lost = ~kept
-                    y_lost, x_lost = y_ref[lost], x_ref[lost]
-                    
-                    u_f[y_lost, x_lost] = np.nan
-                    v_f[y_lost, x_lost] = np.nan
-                    du_dx[y_lost, x_lost] = np.nan
-                    du_dy[y_lost, x_lost] = np.nan
-                    dv_dx[y_lost, x_lost] = np.nan
-                    dv_dy[y_lost, x_lost] = np.nan
-                    corr_f[y_lost, x_lost] = np.nan
+                    ib = np.where(kept)[0]
+                    kept[ib] = d_mask[y_cur[ib], x_cur[ib]]
+                    lost_mask = np.zeros((H_i, W_i), bool)
+                    lost_mask[y_ref[~kept], x_ref[~kept]] = True
+                    # Drops the point for THIS frame only. Its accumulated total
+                    # is retained so that if the mask picks it up again the
+                    # accumulator can resume it rather than start it over.
+                    accum.mark_lost(lost_mask)
+
+            # accum.u/v deliberately retain the last known total for points that
+            # dropped out this frame, so they are unsafe to publish as-is: a
+            # consumer (notably the frame-to-frame difference in
+            # _compute_velocities_and_rates) would see an ordinary-looking
+            # number that had quietly stopped updating. Mask on the way out.
+            frame_valid = accum.valid
+            total_u = np.where(frame_valid, accum.u, np.nan)
+            total_v = np.where(frame_valid, accum.v, np.nan)
+            total_du_dx = np.where(frame_valid, inc_du_dx, np.nan)
+            total_du_dy = np.where(frame_valid, inc_du_dy, np.nan)
+            total_dv_dx = np.where(frame_valid, inc_dv_dx, np.nan)
+            total_dv_dy = np.where(frame_valid, inc_dv_dy, np.nan)
+
+            # Unmasked last-known positions, for the next frame's search. Keep
+            # these separate from the reported totals: feeding the masked (NaN)
+            # version back made the solver look for a dropped point at its
+            # frame-0 position, which is why a dropout never recovered.
+            hint_u, hint_v = accum.position_hint()
+
+            # Track seed displacement for NCC initial guess (incremental, small)
+            if np.isfinite(inc_u[actual_seed_y, actual_seed_x]):
+                guess_u = float(inc_u[actual_seed_y, actual_seed_x])
+                guess_v = float(inc_v[actual_seed_y, actual_seed_x])
+
+            # --- Updated Lagrangian: swap reference to current frame for next iteration ---
+            gpu_solver.update_reference_image(cur_image)
+            prev_image = cur_image
 
             elapsed = time.perf_counter() - t0
-            nan_arr = np.full_like(u_f, np.nan)
 
+            st = accum.results()
             self.results.append(PairResult(
                 image_path=def_path,
-                u=u_f, v=v_f,
-                Exx=nan_arr.copy(), Exy=nan_arr.copy(), Eyy=nan_arr.copy(), Eeff=nan_arr.copy(),
-                du_dx=du_dx, du_dy=du_dy, dv_dx=dv_dx, dv_dy=dv_dy,
-                corr=corr_f, elapsed=elapsed
+                u=total_u.copy(), v=total_v.copy(),
+                # Accumulated finite strain. Eeff is the PATH-INTEGRATED
+                # equivalent strain -- the correct measure through a shear zone
+                # with large rotation, and the one comparable to the
+                # gamma/sqrt(3) figures quoted in the machining literature.
+                Exx=st["Exx"].copy(), Exy=st["Exy"].copy(),
+                Eyy=st["Eyy"].copy(), Eeff=st["Eeff_path"].copy(),
+                du_dx=total_du_dx.copy(), du_dy=total_du_dy.copy(),
+                dv_dx=total_dv_dx.copy(), dv_dy=total_dv_dy.copy(),
+                corr=corr_f, valid=frame_valid.copy(), elapsed=elapsed
             ))
 
         if not self._cancel[0] and self.results:
@@ -367,23 +469,61 @@ class DICAnalysis:
         if N < 2: return
         dt = 1.0 / max(self.fps, 1e-9)
 
-        u_stack = np.stack([r.u for r in self.results])
-        v_stack = np.stack([r.v for r in self.results])
+        # A point can be valid at frames i-1 and i+1 but NaN at i (a single
+        # dropped frame that healed), or vice-versa. Differencing blindly
+        # propagates one bad/missing frame into its TWO neighbours' velocity.
+        # Use the same central/forward/backward difference as before, but pick
+        # it per-point from whichever neighbours are actually finite.
+        #
+        # Only a 3-frame sliding window is held. Stacking all N frames needed
+        # 2 * N * H * W * 8 bytes -- at 1280x720 that is ~15 MB per frame per
+        # component, so a 1700-frame sequence asked for ~50 GB up front and
+        # simply raised MemoryError before any velocity was produced.
+        def _val(k):
+            r = self.results[k]
+            m = np.isfinite(r.u) & np.isfinite(r.v)
+            return (m & r.valid) if r.valid is not None else m
 
-        v_u = np.zeros_like(u_stack)
-        v_v = np.zeros_like(v_stack)
+        prev_val = None
+        here_val = _val(0)
+        for i in range(N):
+            next_val = _val(i + 1) if i < N - 1 else None
 
-        v_u[1:-1] = (u_stack[2:] - u_stack[:-2]) / (2 * dt)
-        v_v[1:-1] = (v_stack[2:] - v_stack[:-2]) / (2 * dt)
+            u_here, v_here = self.results[i].u, self.results[i].v
+            Vx = np.full(u_here.shape, np.nan)
+            Vy = np.full(u_here.shape, np.nan)
 
-        v_u[0] = (u_stack[1] - u_stack[0]) / dt
-        v_v[0] = (v_stack[1] - v_stack[0]) / dt
-        v_u[-1] = (u_stack[-1] - u_stack[-2]) / dt
-        v_v[-1] = (v_stack[-1] - v_stack[-2]) / dt
+            zero = np.zeros_like(here_val)
+            has_prev = prev_val if prev_val is not None else zero
+            has_next = next_val if next_val is not None else zero
 
-        for i, res in enumerate(self.results):
-            res.Vx, res.Vy = v_u[i], v_v[i]
-            res.Veff = np.sqrt(res.Vx ** 2 + res.Vy ** 2)
+            central = here_val & has_prev & has_next
+            fwd_only = here_val & ~central & has_next
+            bwd_only = here_val & ~central & ~fwd_only & has_prev
+
+            if central.any():
+                u_p, v_p = self.results[i - 1].u, self.results[i - 1].v
+                u_n, v_n = self.results[i + 1].u, self.results[i + 1].v
+                Vx[central] = (u_n[central] - u_p[central]) / (2 * dt)
+                Vy[central] = (v_n[central] - v_p[central]) / (2 * dt)
+            if fwd_only.any():
+                u_n, v_n = self.results[i + 1].u, self.results[i + 1].v
+                Vx[fwd_only] = (u_n[fwd_only] - u_here[fwd_only]) / dt
+                Vy[fwd_only] = (v_n[fwd_only] - v_here[fwd_only]) / dt
+            if bwd_only.any():
+                u_p, v_p = self.results[i - 1].u, self.results[i - 1].v
+                Vx[bwd_only] = (u_here[bwd_only] - u_p[bwd_only]) / dt
+                Vy[bwd_only] = (v_here[bwd_only] - v_p[bwd_only]) / dt
+            # A point valid only at frame i, with neither neighbour usable, has
+            # no basis for a velocity estimate -- left as NaN rather than 0.0,
+            # which previously looked like "material genuinely at rest".
+
+            res = self.results[i]
+            res.Vx, res.Vy = Vx, Vy
+            with np.errstate(invalid="ignore"):
+                res.Veff = np.sqrt(Vx ** 2 + Vy ** 2)
+
+            prev_val, here_val = here_val, next_val
 
         from .strain import compute_velocity_strains
         mask = self._roi_mask if self._roi_mask is not None else np.ones_like(self.results[0].u, dtype=bool)
@@ -394,7 +534,7 @@ class DICAnalysis:
                 progress_cb(p, f"[{i + 1}/{N}] Computing strain rates…")
 
             valid = mask & ~np.isnan(res.Vx) & ~np.isnan(res.Vy)
-            rates = compute_velocity_strains(res.Vx, res.Vy, valid, self.params.strain_window)
+            rates = compute_velocity_strains(res.Vx, res.Vy, valid, self.params.effective_strain_window())
 
             res.dVx_dx = rates["dVx_dx"]
             res.dVx_dy = rates["dVx_dy"]
@@ -404,43 +544,6 @@ class DICAnalysis:
             res.Exy_rate = rates["Exy_rate"]
             res.Eyy_rate = rates["Eyy_rate"]
             res.Eeff_rate = rates["Eeff_rate"]
-
-        if N > 0:
-            res0 = self.results[0]
-            curr_Exx = np.zeros_like(res0.u)
-            curr_Exy = np.zeros_like(res0.u)
-            curr_Eyy = np.zeros_like(res0.u)
-
-            for i in range(N):
-                if progress_cb:
-                    p = 0.97 + 0.03 * (i / max(1, N))
-                    progress_cb(p, f"[{i + 1}/{N}] Integrating strains…")
-
-                curr = self.results[i]
-                valid = ~np.isnan(curr.u)
-
-                if i > 0:
-                    prev = self.results[i - 1]
-                    rate_prev_xx = np.nan_to_num(prev.Exx_rate, nan=0.0)
-                    rate_curr_xx = np.nan_to_num(curr.Exx_rate, nan=0.0)
-                    curr_Exx += 0.5 * (rate_prev_xx + rate_curr_xx) * dt
-
-                    rate_prev_xy = np.nan_to_num(prev.Exy_rate, nan=0.0)
-                    rate_curr_xy = np.nan_to_num(curr.Exy_rate, nan=0.0)
-                    curr_Exy += 0.5 * (rate_prev_xy + rate_curr_xy) * dt
-
-                    rate_prev_yy = np.nan_to_num(prev.Eyy_rate, nan=0.0)
-                    rate_curr_yy = np.nan_to_num(curr.Eyy_rate, nan=0.0)
-                    curr_Eyy += 0.5 * (rate_prev_yy + rate_curr_yy) * dt
-
-                curr.Exx = np.where(valid, curr_Exx, np.nan)
-                curr.Exy = np.where(valid, curr_Exy, np.nan)
-                curr.Eyy = np.where(valid, curr_Eyy, np.nan)
-
-                with np.errstate(invalid='ignore'):
-                    curr.Eeff = np.sqrt(np.maximum(
-                        (2.0 / 3.0) * (curr.Exx ** 2 + curr.Eyy ** 2 + 2.0 * curr.Exy ** 2 - curr.Exx * curr.Eyy), 0.0
-                    ))
 
     def get_trajectories(self, max_frame: int, step: int = 10) -> list[list[tuple[float, float]]]:
         if not self.results or max_frame < 0:
@@ -481,6 +584,115 @@ class DICAnalysis:
                 paths[p_idx].append((float(x0[p_idx] + u_i[p_idx]), float(y0[p_idx] + v_i[p_idx])))
 
         return [p for p in paths if len(p) > 1]
+
+    # ------------------------------------------------------------------
+    # Marker-seeded trajectories
+    # ------------------------------------------------------------------
+    # Displacement fields are only populated at correlation grid points, so a
+    # marker dropped at an arbitrary pixel needs local interpolation rather than
+    # a direct lookup.
+
+    def _sample_sparse(self, arr: np.ndarray, x: float, y: float,
+                       search: Optional[int] = None) -> float:
+        """Inverse-distance sample of a sparse (NaN-filled) field at a float position."""
+        if arr is None:
+            return float("nan")
+        H, W = arr.shape
+        if search is None:
+            search = max(4, int(getattr(self.params, "subset_spacing", 3)) * 3)
+        xi, yi = int(round(x)), int(round(y))
+        x0, x1 = max(0, xi - search), min(W, xi + search + 1)
+        y0, y1 = max(0, yi - search), min(H, yi + search + 1)
+        if x1 <= x0 or y1 <= y0:
+            return float("nan")
+        win = arr[y0:y1, x0:x1]
+        fin = np.isfinite(win)
+        if not fin.any():
+            return float("nan")
+        ys, xs = np.nonzero(fin)
+        vals = win[fin]
+        d2 = (xs + x0 - x) ** 2 + (ys + y0 - y) ** 2
+        k = min(4, len(d2))
+        idx = np.argpartition(d2, k - 1)[:k]
+        d2k, vk = d2[idx], vals[idx]
+        if d2k.min() < 1e-9:
+            return float(vk[int(np.argmin(d2k))])
+        w = 1.0 / d2k
+        return float((vk * w).sum() / w.sum())
+
+    def reference_from_current(self, x: float, y: float, frame_idx: int
+                              ) -> Optional[tuple[tuple[float, float], float]]:
+        """
+        Map a click on the DISPLAYED (deformed) frame back to reference coordinates.
+
+        Markers are stored in reference coordinates so that a marker follows the
+        same material point for the whole sequence. Without this, a marker placed
+        while scrubbed to frame 200 would be interpreted as a reference-frame
+        position and would track the wrong material.
+
+        Returns ((x_ref, y_ref), residual_px) or None.
+        """
+        if not self.results:
+            return None
+        idx = max(0, min(int(frame_idx), len(self.results) - 1))
+        res = self.results[idx]
+        v = np.isfinite(res.u) & np.isfinite(res.v)
+        if not v.any():
+            return None
+        ys, xs = np.nonzero(v)
+        cx = xs + res.u[ys, xs]
+        cy = ys + res.v[ys, xs]
+        d2 = (cx - x) ** 2 + (cy - y) ** 2
+        i = int(np.argmin(d2))
+        return (float(xs[i]), float(ys[i])), float(np.sqrt(d2[i]))
+
+    def marker_positions(self, seeds, frame_idx: int) -> list[Optional[tuple[float, float]]]:
+        """Where each reference-frame marker sits on the displayed frame."""
+        if not self.results or not seeds:
+            return [None] * len(seeds)
+        idx = max(0, min(int(frame_idx), len(self.results) - 1))
+        res = self.results[idx]
+        out = []
+        for (sx, sy) in seeds:
+            u = self._sample_sparse(res.u, sx, sy)
+            v = self._sample_sparse(res.v, sx, sy)
+            out.append(None if not (np.isfinite(u) and np.isfinite(v))
+                       else (float(sx + u), float(sy + v)))
+        return out
+
+    def get_trajectories_from_seeds(self, seeds, max_frame: int, trail: int = 0
+                                   ) -> list[dict]:
+        """
+        Trace one trajectory per user-placed marker.
+
+        seeds      : list of (x, y) in REFERENCE-frame coordinates
+        max_frame  : trace up to and including this displayed frame
+        trail      : 0 = full history, else keep only the last `trail` segments
+
+        Each entry: {"points": [(x,y), ...], "lost_at": int|None, "seed": (x,y)}
+        Strictly speaking these are pathlines (trajectories of individual
+        material points). They coincide with streaklines only in steady flow --
+        worth keeping in mind for segmented-chip conditions.
+        """
+        if not self.results or not seeds:
+            return []
+        last = min(int(max_frame), len(self.results) - 1)
+        out: list[dict] = []
+        for (sx, sy) in seeds:
+            pts: list[tuple[float, float]] = [(float(sx), float(sy))]
+            lost_at = None
+            for i in range(0, last + 1):
+                u = self._sample_sparse(self.results[i].u, sx, sy)
+                v = self._sample_sparse(self.results[i].v, sx, sy)
+                if not (np.isfinite(u) and np.isfinite(v)):
+                    lost_at = i
+                    break
+                pts.append((float(sx + u), float(sy + v)))
+            if trail and trail > 0 and len(pts) > trail + 1:
+                pts = pts[-(trail + 1):]
+            out.append({"points": pts, "lost_at": lost_at,
+                        "seed": (float(sx), float(sy))})
+        return out
 
     def get_global_range(self, field: str) -> tuple[float, float]:
         vmin, vmax = float('inf'), float('-inf')
@@ -610,9 +822,43 @@ class DICAnalysis:
                 with open(path, "r") as f:
                     data = json.load(f)
 
+                # Settings written before the tolerance/cutoff semantics changed
+                # must not be replayed: conv_tol is now in pixels of subset-edge
+                # motion (1e-6 px is unreachable) and corr_cutoff=2.0 means
+                # "accept everything" on the [0,4] ZNSSD scale. Drop those keys
+                # and let the current defaults stand.
+                SCHEMA = 2
+                stale = int(data.get("schema_version", 1)) < SCHEMA
+                DROP_ON_MIGRATE = {"conv_tol", "corr_cutoff"}
+                migrated = []
                 for k, v in data.items():
+                    if k == "schema_version":
+                        continue
+                    if stale and k in DROP_ON_MIGRATE:
+                        migrated.append(k)
+                        continue
                     if hasattr(self.params, k):
                         setattr(self.params, k, v)
+                # The schema gate above only fires once, so a value that is
+                # unreachable under the CURRENT semantics can survive in a file
+                # already stamped with the current schema. conv_tol is the one
+                # that matters: it is a subset-edge motion in pixels, so
+                # anything below ~1e-4 px can never be met and every subset
+                # burns all max_iter iterations before giving up -- several
+                # times slower for no gain in accuracy. Clamp on load.
+                CONV_TOL_MIN, CONV_TOL_MAX = 1e-4, 1e-1
+                ct = float(self.params.conv_tol)
+                if not (CONV_TOL_MIN <= ct <= CONV_TOL_MAX):
+                    clamped = min(max(ct, CONV_TOL_MIN), CONV_TOL_MAX)
+                    print(f"[Settings] conv_tol={ct:g} px is outside the usable "
+                          f"range [{CONV_TOL_MIN:g}, {CONV_TOL_MAX:g}]; using {clamped:g}.")
+                    self.params.conv_tol = clamped
+                    migrated.append("conv_tol")
+
+                if migrated:
+                    print(f"[Settings] Migrated to schema {SCHEMA}; reset to new "
+                          f"defaults: {', '.join(sorted(set(migrated)))}")
+                    self.save_settings()
 
                 # Load all specialized directories
                 dirs = ["last_video_directory", "last_image_directory", "last_hdf5_directory"]
@@ -631,6 +877,7 @@ class DICAnalysis:
 
         try:
             data = {
+                "schema_version": 2,
                 "subset_radius": self.params.subset_radius,
                 "subset_spacing": self.params.subset_spacing,
                 "strain_window": self.params.strain_window,
@@ -639,6 +886,8 @@ class DICAnalysis:
                 "corr_cutoff": self.params.corr_cutoff,
                 "search_radius": self.params.search_radius,
                 "dynamic_roi": getattr(self.params, "dynamic_roi", "None"),
+                "shape_order": getattr(self.params, "shape_order", 1),
+                "mask_subsets_to_roi": getattr(self.params, "mask_subsets_to_roi", True),
 
                 # Save all specialized directories
                 "last_video_directory": getattr(self, "last_video_directory", os.path.expanduser("~")),
@@ -662,81 +911,102 @@ def _load_image(path: str) -> np.ndarray:
     else:
         raise ImportError("Install opencv-python or Pillow.")
 
-def _compute_dynamic_mask(cur_image: np.ndarray, method: str) -> Optional[np.ndarray]:
-    if method == "None":
-        return None
-    
-    if not _HAVE_CV2:
-        print("[Warning] cv2 not available for dynamic ROI. Ignoring.")
-        return None
-        
-    img_u8 = (cur_image * 255).astype(np.uint8)
-    
-    # We use a larger kernel and contour finding to extract a single solid workpiece ROI.
-    
-    if method == "Contrast":
-        # Local standard deviation (texture strength)
-        mean = cv2.blur(cur_image, (9, 9))
-        sq_mean = cv2.blur(cur_image**2, (9, 9))
-        var = sq_mean - mean**2
-        std = np.sqrt(np.maximum(var, 0))
-        
-        std_max = std.max()
-        if std_max == 0: return np.zeros_like(img_u8, dtype=bool)
-            
-        metric_u8 = (std / std_max * 255).astype(np.uint8)
-        metric_u8 = cv2.GaussianBlur(metric_u8, (5, 5), 0)
-        
-    elif method == "Edge Detection":
-        # Sobel edge magnitude
-        grad_x = cv2.Sobel(cur_image, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(cur_image, cv2.CV_64F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-        
-        grad_max = grad_mag.max()
-        if grad_max == 0: return np.zeros_like(img_u8, dtype=bool)
-            
-        metric_u8 = (grad_mag / grad_max * 255).astype(np.uint8)
-        metric_u8 = cv2.blur(metric_u8, (5, 5))
-        
-    elif method == "Hybrid":
-        # Combine local variance and edge magnitude
-        mean = cv2.blur(cur_image, (9, 9))
-        sq_mean = cv2.blur(cur_image**2, (9, 9))
-        var = sq_mean - mean**2
-        std = np.sqrt(np.maximum(var, 0))
-        
-        grad_x = cv2.Sobel(cur_image, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(cur_image, cv2.CV_64F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-        
-        metric = std + grad_mag
-        metric_max = metric.max()
-        if metric_max == 0: return np.zeros_like(img_u8, dtype=bool)
-            
-        metric_u8 = (metric / metric_max * 255).astype(np.uint8)
-        metric_u8 = cv2.GaussianBlur(metric_u8, (5, 5), 0)
-        
-    else:
+class DynamicROI:
+    """
+    Texture-based dynamic ROI with a STATIONARY decision rule.
+
+    The previous implementation recomputed both the normalisation and an Otsu
+    threshold from every individual frame. Two consequences:
+
+      * per-frame max normalisation meant one specular flash or the tool edge
+        rescaled the whole metric, moving every pixel relative to the threshold;
+      * per-frame Otsu moved the threshold itself as the scene evolved.
+
+    Together they make the ROI boundary jitter frame to frame, which is what
+    produces a ragged, frame-varying mask edge -- and because a masked-out point
+    loses its accumulated history, that jitter compounds over a sequence.
+
+    Here the scale and threshold are calibrated ONCE from the reference frame and
+    then held fixed, so "enough texture to correlate" means the same thing in
+    frame 500 as in frame 1.
+    """
+
+    def __init__(self, method: str, keep_min_area_frac: float = 0.02):
+        self.method = method
+        self.keep_min_area_frac = keep_min_area_frac
+        self.scale = None
+        self.thresh = None
+        self.enabled = method not in ("None", None) and _HAVE_CV2
+        if method not in ("None", None) and not _HAVE_CV2:
+            print("[Warning] cv2 not available for dynamic ROI. Ignoring.")
+
+    def _metric(self, img: np.ndarray) -> Optional[np.ndarray]:
+        if self.method == "Contrast":
+            mean = cv2.blur(img, (9, 9))
+            var = cv2.blur(img ** 2, (9, 9)) - mean ** 2
+            return np.sqrt(np.maximum(var, 0))
+        if self.method == "Edge Detection":
+            gxx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+            gyy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+            return np.sqrt(gxx ** 2 + gyy ** 2)
+        if self.method == "Hybrid":
+            mean = cv2.blur(img, (9, 9))
+            var = cv2.blur(img ** 2, (9, 9)) - mean ** 2
+            std = np.sqrt(np.maximum(var, 0))
+            gxx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+            gyy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+            grad = np.sqrt(gxx ** 2 + gyy ** 2)
+            # Put both terms on a comparable footing before adding them; the raw
+            # sum was dominated by the unnormalised Sobel response.
+            sd = std / max(std.std(), 1e-12)
+            gd = grad / max(grad.std(), 1e-12)
+            return sd + gd
         return None
 
-    # Common extraction logic for all methods:
-    # 1. Threshold
-    _, mask = cv2.threshold(metric_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # 2. Morphological close to connect nearby speckle blobs
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    
-    # 3. Find contours and keep only the largest one (the main workpiece)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return mask > 0
-        
-    largest_contour = max(contours, key=cv2.contourArea)
-    
-    # 4. Draw solidly filled contour
-    final_mask = np.zeros_like(mask)
-    cv2.drawContours(final_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
-    
-    return final_mask > 0
+    def calibrate(self, ref_image: np.ndarray) -> None:
+        if not self.enabled:
+            return
+        m = self._metric(ref_image)
+        if m is None:
+            self.enabled = False
+            return
+        self.scale = float(np.percentile(m, 99.0)) or 1.0
+        m8 = np.clip(m / self.scale * 255.0, 0, 255).astype(np.uint8)
+        m8 = cv2.GaussianBlur(m8, (5, 5), 0)
+        thr, _ = cv2.threshold(m8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        self.thresh = float(thr)
+
+    def mask(self, cur_image: np.ndarray) -> Optional[np.ndarray]:
+        if not self.enabled:
+            return None
+        if self.thresh is None:
+            self.calibrate(cur_image)
+        m = self._metric(cur_image)
+        if m is None:
+            return None
+        m8 = np.clip(m / self.scale * 255.0, 0, 255).astype(np.uint8)
+        m8 = cv2.GaussianBlur(m8, (5, 5), 0)
+        mask = (m8 >= self.thresh).astype(np.uint8) * 255
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # Keep every sufficiently large connected region, not just the largest.
+        # In machining the chip and the workpiece are separate bodies (and the
+        # tool splits the field); keeping only the largest contour discards one
+        # of them outright, and which one is "largest" can flip between frames.
+        n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        if n_lab <= 1:
+            return mask > 0
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        min_area = self.keep_min_area_frac * float(areas.max())
+        keep = np.zeros(n_lab, bool)
+        keep[1:] = areas >= min_area
+        return keep[labels]
+
+
+def _compute_dynamic_mask(cur_image: np.ndarray, method: str) -> Optional[np.ndarray]:
+    """Backward-compatible single-shot wrapper (calibrates on the frame given)."""
+    roi = DynamicROI(method)
+    roi.calibrate(cur_image)
+    return roi.mask(cur_image)

@@ -164,11 +164,18 @@ class ParamsPage(QWidget):
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Strain"))
 
-        self._sp_strain = spin(3, 100, params.strain_window, 1)
+        # Units are PIXELS, not subsets -- the label used to say "subsets",
+        # which invites values far too small to work. The plane fit only sees
+        # correlation grid points, spaced `subset spacing` apart, so a window of
+        # w px contains just (2w/spacing + 1)^2 of them; below ~6 the fit is
+        # rank-deficient and every strain field comes out empty with no error.
+        self._sp_strain = spin(3, 200, params.strain_window, 1)
         right_lay.addLayout(_param_row(
-            "Strain window", "Neighbourhood (in subset units) used for\n"
-            "the least-squares plane fit when computing strains.",
-            self._sp_strain, "subsets"))
+            "Strain window", "Half-width in PIXELS of the neighbourhood used for\n"
+            "the least-squares plane fit when computing strains.\n"
+            "Must cover at least ~5 grid points across, i.e. keep it\n"
+            "at least 2x the subset spacing, or strains come out empty.",
+            self._sp_strain, "px"))
 
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Optimizer"))
@@ -188,16 +195,55 @@ class ParamsPage(QWidget):
             "Max iterations", "Maximum IC-GN iterations per subset.",
             self._sp_maxiter, ""))
 
-        self._sp_tol = dspin(1e-8, 0.01, params.conv_tol, 1e-7, 8)
+        # Lower bound is 1e-4, not 1e-8: this is subset-edge motion in PIXELS,
+        # so anything smaller can never be reached and every subset just burns
+        # all max_iter iterations before being given up on.
+        self._sp_tol = dspin(1e-4, 0.1, params.conv_tol, 1e-4, 5)
         right_lay.addLayout(_param_row(
-            "Convergence tol", "Weighted-norm convergence threshold.",
-            self._sp_tol, ""))
+            "Convergence tol", "Stop IC-GN once an iteration moves the subset\n"
+            "edge by less than this many pixels.",
+            self._sp_tol, "px"))
 
         self._sp_cutoff = dspin(0.0, 4.0, params.corr_cutoff, 0.05, 2)
         right_lay.addLayout(_param_row(
             "Correlation cutoff", "Discard subsets with ZNSSD above this\n"
             "(lower = stricter; 0.8 is a good starting value).",
             self._sp_cutoff, ""))
+
+        right_lay.addWidget(self._separator())
+        right_lay.addWidget(_section_label("Shape function"))
+
+        self._cb_order = QComboBox()
+        self._cb_order.addItem("1st order — affine (6 param)", 1)
+        self._cb_order.addItem("2nd order — quadratic (12 param)", 2)
+        self._cb_order.setCurrentIndex(
+            1 if int(getattr(params, "shape_order", 1)) >= 2 else 0)
+        self._cb_order.setFixedWidth(220)
+        self._cb_order.currentIndexChanged.connect(self._on_order_changed)
+        right_lay.addLayout(_param_row(
+            "Shape order",
+            "1st order models uniform stretch/shear inside the subset.\n"
+            "2nd order also models curvature, reducing systematic error where\n"
+            "the strain gradient is high -- but the six extra parameters\n"
+            "amplify noise. Only worth it on a well-textured pattern.",
+            self._cb_order, ""))
+
+        self._order_note = QLabel("")
+        self._order_note.setWordWrap(True)
+        self._order_note.setStyleSheet(
+            f"color:{_C_TEXT2}; font-size:10px; background:{_C_CARD};"
+            f" border:1px solid {_C_BORDER}; border-radius:4px; padding:6px;")
+        self._order_note.setVisible(False)
+        right_lay.addWidget(self._order_note)
+
+        self._order_probe_btn = QPushButton("Measure cost on my images")
+        self._order_probe_btn.setFixedHeight(26)
+        self._order_probe_btn.setToolTip(
+            "Estimate the extra random error 2nd order would cost on the actual\n"
+            "reference image, and the strain curvature needed to be worth it.")
+        self._order_probe_btn.clicked.connect(self._probe_shape_order)
+        self._order_probe_btn.setVisible(False)
+        right_lay.addWidget(self._order_probe_btn)
 
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Search"))
@@ -229,6 +275,7 @@ class ParamsPage(QWidget):
         # ── GPU Acceleration Toggle ───────────────────────────────────
         self._gpu_chk = QPushButton("Use GPU Acceleration (CuPy)")
         self._gpu_chk.setCheckable(True)
+        self._gpu_chk.toggled.connect(lambda *_: self._update_order_note())
         self._gpu_chk.setFixedHeight(32)
         self._gpu_chk.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -259,6 +306,9 @@ class ParamsPage(QWidget):
         root.addWidget(footer)
 
     # ------------------------------------------------------------------
+        # Initial sync now that every widget exists (the note references _gpu_chk).
+        self._update_order_note()
+
     def on_enter(self) -> None:
         img = self._wizard.analysis.reference_image
         if img is not None:
@@ -289,6 +339,7 @@ class ParamsPage(QWidget):
         p.corr_cutoff    = self._sp_cutoff.value()
         p.search_radius  = self._sp_search.value()
         p.dynamic_roi    = self._cb_dynamic_roi.currentText()
+        p.shape_order    = int(self._cb_order.currentData() or 1)
 
         if hasattr(self._canvas, "set_subset_radius"):
             self._canvas.set_subset_radius(p.subset_radius)
@@ -314,6 +365,57 @@ class ParamsPage(QWidget):
         f.setStyleSheet(f"background:{_C_BORDER}; max-height:1px;")
         return f
 
+    def _on_order_changed(self) -> None:
+        self._update_order_note()
+        self._on_param_changed()
+
+    def _update_order_note(self) -> None:
+        second = int(self._cb_order.currentData() or 1) >= 2
+        self._order_note.setVisible(second)
+        self._order_probe_btn.setVisible(second)
+        if not second:
+            return
+        msgs = []
+        # The GPU wavefront solver has no 12-parameter path; it would silently
+        # keep running first order, so say so rather than let it look applied.
+        if self._gpu_chk.isChecked():
+            msgs.append("<b style='color:#f59e0b;'>GPU solver does not support "
+                        "2nd order</b> — it will run 1st order. Turn off GPU "
+                        "acceleration to use it.")
+        msgs.append("2nd order lowers systematic error where strain curves "
+                    "inside a subset, but roughly doubles random error on a "
+                    "weak pattern. Measure before committing.")
+        self._order_note.setText("<br><br>".join(msgs))
+
+    def _probe_shape_order(self) -> None:
+        from PyQt6.QtWidgets import QMessageBox
+        img = self._wizard.analysis.reference_image
+        if img is None:
+            QMessageBox.information(self, "No reference image",
+                                    "Load a reference image first.")
+            return
+        try:
+            from src.core.shape_order import shape_order_report
+            r = shape_order_report(img, self._wizard.analysis.roi_mask,
+                                   radius=self._sp_radius.value(), verbose=False)
+        except Exception as e:
+            QMessageBox.warning(self, "Could not measure", str(e))
+            return
+        rad = r["radius"]
+        pen = r["penalty_px"]
+        need = (2.0 * pen / (rad ** 2)) if (pen and pen > 0) else float("nan")
+        QMessageBox.information(
+            self, "2nd order — measured cost",
+            f"Image noise:            {r['noise_sigma']:.2f} grey levels\n"
+            f"Mean gradient in ROI:   {r['mean_gradient']:.2f} grey/px\n\n"
+            f"Predicted random error\n"
+            f"   1st order:           {r['sigma_u_order1']:.4f} px\n"
+            f"   2nd order:           {r['sigma_u_order2']:.4f} px\n"
+            f"   extra cost:          {pen:+.4f} px\n\n"
+            f"2nd order pays off only where the in-subset curvature exceeds\n"
+            f"about uxx = {need:.2e} /px at this subset radius ({rad} px).\n\n"
+            f"If your shear zone curvature is below that, stay on 1st order.")
+
     def _reset_defaults(self) -> None:
         from src.core.rg_dic import DICParams
         from PyQt6.QtWidgets import QMessageBox
@@ -336,6 +438,11 @@ class ParamsPage(QWidget):
             sb.blockSignals(True)
             sb.setValue(val)
             sb.blockSignals(False)
+
+        self._cb_order.blockSignals(True)
+        self._cb_order.setCurrentIndex(1 if int(getattr(p, 'shape_order', 1)) >= 2 else 0)
+        self._cb_order.blockSignals(False)
+        self._update_order_note()
 
         self._cb_dynamic_roi.blockSignals(True)
         self._cb_dynamic_roi.setCurrentText(p.dynamic_roi)

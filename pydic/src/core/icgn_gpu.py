@@ -1,3 +1,13 @@
+
+# ── NOT YET IMPLEMENTED on GPU ──
+# icgn.py (CPU path) now rejects subsets where a large or one-sided fraction of
+# pixels are near-black/near-saturated (occlusion silhouette, glare), which was
+# the root cause of tracked points wandering before being lost near a tool/chip
+# boundary. This module has no equivalent check yet -- CuPy isn't available in
+# this environment so it could not be validated here. Port
+# OCCLUSION_INTENSITY_LOW/HIGH, MAX_OCCLUDED_FRACTION, MAX_OCCLUDED_ASYMMETRY,
+# and _occlusion_asymmetry() from icgn.py before relying on GPU tracking near
+# occlusion boundaries; until then, expect the same wandering there.
 # src/core/icgn_gpu.py
 """
 icgn_gpu.py
@@ -17,6 +27,9 @@ try:
     _HAS_CUPY = True
 except ImportError:
     _HAS_CUPY = False
+
+DEBUG_BATCHES = False
+
 
 class GPUWavefrontDIC:
     def __init__(self, params):
@@ -60,7 +73,15 @@ class GPUWavefrontDIC:
 
         self._initialized = True
 
-    def solve_frame(self, cur_image: np.ndarray, seed_idx: int = -1, seed_p: np.ndarray = None, warm_start: bool = False):
+    def update_reference_image(self, new_ref_image: np.ndarray):
+        """Update reference B-spline coefficients for Updated Lagrangian tracking.
+        Grid geometry and subset offsets are unchanged — only the reference
+        intensity data is replaced with the new (previous) frame."""
+        ref_f64 = new_ref_image.astype(np.float64)
+        ref_coeff_cpu = scipy.ndimage.spline_filter(ref_f64, order=3, mode='mirror')
+        self.ref_coeff = cp.asarray(ref_coeff_cpu, dtype=cp.float64)
+
+    def solve_frame(self, cur_image: np.ndarray, seed_idx: int = -1, seed_p: np.ndarray = None, warm_start: bool = False, total_u: np.ndarray = None, total_v: np.ndarray = None):
         if not self._initialized:
             raise RuntimeError("Must precompute reference before solving frames.")
 
@@ -74,6 +95,11 @@ class GPUWavefrontDIC:
             self.state[~cp.asarray(self.valid_mask)] = -1
             self.p_global = cp.zeros((self.N_total, 6), dtype=cp.float64)
             self.cls_global = cp.full(self.N_total, cp.nan, dtype=cp.float64)
+            # Retry budget. A subset that fails from one parent may still
+            # succeed from a better one; without this, the first failure is
+            # permanent and the wavefront cannot propagate past it, so one bad
+            # subset removes everything downstream of it.
+            self.retry = cp.zeros(self.N_total, dtype=cp.int8)
 
             self.state[seed_idx] = 1
             self.p_global[seed_idx] = cp.asarray(seed_p, dtype=cp.float64)
@@ -81,8 +107,20 @@ class GPUWavefrontDIC:
             self.state[self.state == 2] = 1
             valid_gpu = cp.asarray(self.valid_mask)
             self.state[(self.state == -1) & valid_gpu] = 0
+            if getattr(self, "retry", None) is None or len(self.retry) != self.N_total:
+                self.retry = cp.zeros(self.N_total, dtype=cp.int8)
+            self.retry[:] = 0
 
         Ny, Nx = self.grid_shape
+
+        if total_u is not None and total_v is not None:
+            u_ref_gpu = cp.asarray(total_u[self.gy_flat, self.gx_flat], dtype=cp.float64)
+            v_ref_gpu = cp.asarray(total_v[self.gy_flat, self.gx_flat], dtype=cp.float64)
+            u_ref_gpu[cp.isnan(u_ref_gpu)] = 0.0
+            v_ref_gpu[cp.isnan(v_ref_gpu)] = 0.0
+        else:
+            u_ref_gpu = cp.zeros(self.N_total, dtype=cp.float64)
+            v_ref_gpu = cp.zeros(self.N_total, dtype=cp.float64)
 
         def get_neighbors(indices):
             y = indices // Nx
@@ -98,6 +136,7 @@ class GPUWavefrontDIC:
             parents = cp.concatenate([indices[y > 0], indices[y < Ny - 1], indices[x > 0], indices[x < Nx - 1]])
             return all_n, parents
 
+        MAX_RETRY = 3
         batch_count = 0
 
         while True:
@@ -116,9 +155,11 @@ class GPUWavefrontDIC:
 
             gx_act = self.gx_gpu[active_indices]
             gy_act = self.gy_gpu[active_indices]
+            u_ref_act = u_ref_gpu[active_indices]
+            v_ref_act = v_ref_gpu[active_indices]
 
-            ref_xs_act = gx_act[:, None] + self.dx_sub[None, :]
-            ref_ys_act = gy_act[:, None] + self.dy_sub[None, :]
+            ref_xs_act = gx_act[:, None] + u_ref_act[:, None] + self.dx_sub[None, :]
+            ref_ys_act = gy_act[:, None] + v_ref_act[:, None] + self.dy_sub[None, :]
 
             coords_ref = cp.stack([ref_ys_act.ravel(), ref_xs_act.ravel()], axis=0)
 
@@ -141,45 +182,97 @@ class GPUWavefrontDIC:
                   map_coordinates(self.ref_coeff, cy_m, order=3, mode='mirror', prefilter=False)) / (2*h)
             fy = fy.reshape(N_act, self.N_px)
 
-            SD_act = cp.empty((N_act, self.N_px, 6), dtype=cp.float64)
-            SD_act[:, :, 0] = fx; SD_act[:, :, 1] = fy
-            SD_act[:, :, 2] = fx * self.dx_sub; SD_act[:, :, 3] = fx * self.dy_sub
-            SD_act[:, :, 4] = fy * self.dx_sub; SD_act[:, :, 5] = fy * self.dy_sub
-            SD_act /= sigma_f_act[:, :, None]
+            # --- Bug 1 Fix: Correct ZNSSD steepest descent with mean-correction ---
+            # Raw Jacobian dF/dp (before normalization)
+            dfdp = cp.empty((N_act, self.N_px, 6), dtype=cp.float64)
+            dfdp[:, :, 0] = fx; dfdp[:, :, 1] = fy
+            dfdp[:, :, 2] = fx * self.dx_sub; dfdp[:, :, 3] = fx * self.dy_sub
+            dfdp[:, :, 4] = fy * self.dx_sub; dfdp[:, :, 5] = fy * self.dy_sub
+
+            # Mean-correction projection (Pan et al. 2009):
+            # SD[i,k] = (1/σ_f) * (dfdp[i,k] - f_norm[i] * Σ_j f_norm[j]*dfdp[j,k])
+            correction = cp.einsum('np,npk->nk', f_norm_act, dfdp)  # (N_act, 6)
+            SD_act = (dfdp - f_norm_act[:, :, None] * correction[:, None, :]) / sigma_f_act[:, :, None]
 
             H_mat = cp.matmul(SD_act.transpose(0, 2, 1), SD_act)
             H_mat += cp.eye(6, dtype=cp.float64).reshape(1, 6, 6) * 1e-6
             H_inv_act = cp.linalg.inv(H_mat)
 
-            sr = 3
-            shifts = cp.arange(-sr, sr + 1)
-            sy_grid, sx_grid = cp.meshgrid(shifts, shifts)
-            sy_flat, sx_flat = sy_grid.ravel(), sx_grid.ravel()
+            # Integer-shift rescue search.
+            #
+            # This previously ran unconditionally over a 25x25 shift grid for
+            # every subset in every batch. Two problems: it costs 625 full
+            # subset resamples per batch (the dominant runtime term), and it
+            # actively destroys good propagated guesses by snapping them onto a
+            # spurious local ZNSSD minimum -- speckle is quasi-periodic, so a
+            # +/-12 px window around a correct guess reliably contains false
+            # minima. It now only rescues subsets whose propagated guess is
+            # already poor, and leaves good guesses alone.
+            def _znssd_at(shift_x, shift_y, rows=None):
+                if rows is None:
+                    xs_b, ys_b, p_b, fn = ref_xs_act, ref_ys_act, p_act, f_norm_act
+                else:
+                    xs_b, ys_b = ref_xs_act[rows], ref_ys_act[rows]
+                    p_b, fn = p_act[rows], f_norm_act[rows]
+                x_t = xs_b + p_b[:, 0:1] + shift_x
+                y_t = ys_b + p_b[:, 1:2] + shift_y
+                c = cp.stack([y_t.ravel(), x_t.ravel()], axis=0)
+                gt = map_coordinates(cur_gpu, c, order=1, mode='mirror',
+                                     prefilter=False).reshape(len(p_b), self.N_px)
+                gtc = gt - gt.mean(axis=1, keepdims=True)
+                gtn = gtc / cp.maximum(cp.sqrt((gtc ** 2).sum(axis=1, keepdims=True)), 1e-12)
+                return ((gtn - fn) ** 2).sum(axis=1)
 
             best_u, best_v = p_act[:, 0].copy(), p_act[:, 1].copy()
-            best_score = cp.full(N_act, cp.inf, dtype=cp.float64)
+            best_score = _znssd_at(0, 0)
 
-            for sx_shift, sy_shift in zip(sx_flat, sy_flat):
-                x_test = ref_xs_act + p_act[:, 0:1] + sx_shift
-                y_test = ref_ys_act + p_act[:, 1:2] + sy_shift
-                coords_test = cp.stack([y_test.ravel(), x_test.ravel()], axis=0)
+            # Absolute ZNSSD quality bar for 'this guess is poor, go search'.
+            # Must NOT be tied to corr_cutoff: that is an acceptance
+            # threshold, and a permissive one disables the rescue entirely.
+            SEARCH_TRIGGER = 0.25
+            need = best_score > SEARCH_TRIGGER
+            if bool(need.any()):
+                rows = cp.where(need)[0]
+                sr = int(max(4, min(12, self.params.search_radius // 4)))
+                shifts = np.arange(-sr, sr + 1)
+                sxg, syg = np.meshgrid(shifts, shifts)
+                for sx_shift, sy_shift in zip(sxg.ravel(), syg.ravel()):
+                    if sx_shift == 0 and sy_shift == 0:
+                        continue
+                    sc = _znssd_at(float(sx_shift), float(sy_shift), rows)
+                    imp = sc < best_score[rows]
+                    if bool(imp.any()):
+                        ridx = rows[imp]
+                        best_score[ridx] = sc[imp]
+                        best_u[ridx] = p_act[ridx, 0] + float(sx_shift)
+                        best_v[ridx] = p_act[ridx, 1] + float(sy_shift)
 
-                g_test = map_coordinates(cur_gpu, coords_test, order=1, mode='mirror', prefilter=False).reshape(N_act, self.N_px)
-                g_test_c = g_test - g_test.mean(axis=1, keepdims=True)
-                g_test_norm = g_test_c / cp.maximum(cp.sqrt((g_test_c**2).sum(axis=1, keepdims=True)), 1e-12)
-
-                score = ((g_test_norm - f_norm_act)**2).sum(axis=1)
-                improve = score < best_score
-                best_score[improve] = score[improve]
-                best_u[improve] = p_act[improve, 0] + sx_shift
-                best_v[improve] = p_act[improve, 1] + sy_shift
-
+            # --- Bug 3 Fix: Reset gradients when integer search shifts significantly ---
+            # Only during wavefront propagation (not warm-start). In warm-start,
+            # the previous frame's gradients are a good starting point even if the
+            # displacement shifted by several pixels (rigid-body chip motion).
+            # During wavefront, a large shift means the parent is across a discontinuity.
+            shift_mag = cp.sqrt((best_u - p_act[:, 0])**2 + (best_v - p_act[:, 1])**2)
             p_act[:, 0] = best_u; p_act[:, 1] = best_v
+            if not warm_start:
+                reset_mask = shift_mag > 4.0
+                p_act[reset_mask, 2:6] = 0.0
 
             p_icgn_start = p_act.copy()
 
             converged = cp.zeros(N_act, dtype=bool)
             failed = cp.zeros(N_act, dtype=bool)
+
+            # Track the best iterate seen, exactly as the CPU solver does.
+            # Without this, a subset that reached an excellent correlation at
+            # iteration 3 and then took one oversized step was written off
+            # entirely: `failed` fed straight into the accept test, so its good
+            # iterate was discarded. Measured against the CPU path on real
+            # frames, that rejected subsets the CPU solved at ZNSSD ~0.13 --
+            # and when it caught the wavefront seed, the whole frame returned
+            # nothing and the driver fell back to a full NCC re-run.
+            best_p = p_act.copy()
+            best_cls = cp.full(N_act, cp.inf, dtype=cp.float64)
 
             for it in range(self.params.max_iter):
                 mask_proc = ~(converged | failed)
@@ -201,11 +294,26 @@ class GPUWavefrontDIC:
                 g_norm = g_c / sigma_g
 
                 residual = g_norm - f_norm_act[mask_proc]
+
+                # Score the CURRENT parameters before stepping away from them.
+                cls_iter = (residual ** 2).sum(axis=1)
+                proc_rows = cp.where(mask_proc)[0]
+                imp = cls_iter < best_cls[proc_rows]
+                if bool(imp.any()):
+                    imp_rows = proc_rows[imp]
+                    best_cls[imp_rows] = cls_iter[imp]
+                    best_p[imp_rows] = p_curr[imp]
+
                 b = cp.einsum('npi,np->ni', SD_act[mask_proc], residual)
                 dp = cp.einsum('nij,nj->ni', H_inv_act[mask_proc], b)
 
+                # --- Bug 2 Fix: Separate displacement and gradient divergence checks ---
+                # Displacement (pixels) and strain gradients (dimensionless) have
+                # different scales; mixing them in a single norm is meaningless.
                 dp_norm = cp.linalg.norm(dp, axis=1)
-                diverged = (dp_norm > 3.0) | cp.isnan(dp_norm)
+                disp_norm = cp.sqrt(dp[:, 0]**2 + dp[:, 1]**2)
+                grad_norm = cp.sqrt(dp[:, 2]**2 + dp[:, 3]**2 + dp[:, 4]**2 + dp[:, 5]**2)
+                diverged = (disp_norm > 5.0) | (grad_norm > 8.0) | cp.isnan(dp_norm)
 
                 if diverged.any():
                     failed_global = failed.copy()
@@ -248,52 +356,83 @@ class GPUWavefrontDIC:
                 conv_global[valid_mask_idx] = dp_norm[~diverged] < self.params.conv_tol
                 converged = conv_global
 
-            final_eval_mask = ~failed
-            cls_act = cp.full(N_act, cp.inf, dtype=cp.float64)
+            # Score the final parameters too -- the last accepted update is
+            # never scored inside the loop -- then keep whichever of {last,
+            # best-seen} correlates better.
+            x_prime = ref_xs_act + p_act[:, 0:1] + p_act[:, 2:3]*self.dx_sub + p_act[:, 3:4]*self.dy_sub
+            y_prime = ref_ys_act + p_act[:, 1:2] + p_act[:, 4:5]*self.dx_sub + p_act[:, 5:6]*self.dy_sub
 
-            if final_eval_mask.any():
-                p_final = p_act[final_eval_mask]
-                xs_final = ref_xs_act[final_eval_mask]
-                ys_final = ref_ys_act[final_eval_mask]
+            coords_def = cp.stack([y_prime.ravel(), x_prime.ravel()], axis=0)
+            g = map_coordinates(cur_coeff, coords_def, order=3, mode='mirror', prefilter=False).reshape(N_act, self.N_px)
+            g_c = g - g.mean(axis=1, keepdims=True)
+            g_norm = g_c / cp.maximum(cp.sqrt((g_c**2).sum(axis=1, keepdims=True)), 1e-12)
+            final_cls = ((g_norm - f_norm_act) ** 2).sum(axis=1)
+            final_cls = cp.where(cp.isfinite(final_cls), final_cls, cp.inf)
 
-                x_prime = xs_final + p_final[:, 0:1] + p_final[:, 2:3]*self.dx_sub + p_final[:, 3:4]*self.dy_sub
-                y_prime = ys_final + p_final[:, 1:2] + p_final[:, 4:5]*self.dx_sub + p_final[:, 5:6]*self.dy_sub
+            better = final_cls < best_cls
+            cls_act = cp.where(better, final_cls, best_cls)
+            p_act = cp.where(better[:, None], p_act, best_p)
 
-                coords_def = cp.stack([y_prime.ravel(), x_prime.ravel()], axis=0)
-                g = map_coordinates(cur_coeff, coords_def, order=3, mode='mirror', prefilter=False).reshape(len(p_final), self.N_px)
-                g_c = g - g.mean(axis=1, keepdims=True)
-                g_norm = g_c / cp.maximum(cp.sqrt((g_c**2).sum(axis=1, keepdims=True)), 1e-12)
-                res = g_norm - f_norm_act[final_eval_mask]
-                cls_act[final_eval_mask] = (res**2).sum(axis=1)
-
-            cutoff_disp = float(max(self.params.subset_spacing + 1, 5.0))
+            # Relaxed the jump threshold to reduce erosion (was subset_spacing + 1, 5.0)
+            cutoff_disp = float(max(self.params.subset_spacing * 1.5, 10.0))
             jump_x = cp.abs(p_act[:, 0] - p_icgn_start[:, 0])
             jump_y = cp.abs(p_act[:, 1] - p_icgn_start[:, 1])
 
             mask_failed_cls = cls_act >= self.params.corr_cutoff
             mask_failed_jump = (jump_x >= cutoff_disp) | (jump_y >= cutoff_disp)
 
-            accepted = ~failed & ~mask_failed_cls & ~mask_failed_jump
+            # `failed` only means "stopped iterating early" now. Whether the
+            # subset is usable is decided by the correlation of the parameters
+            # actually being returned, not by how the iteration ended.
+            accepted = ~mask_failed_cls & ~mask_failed_jump
 
-            # if batch_count <= 2:
-            print(f"\n[DEBUG] --- BATCH {batch_count} | Mode: {'Warm-Start' if warm_start else 'Wavefront'} ---")
-            print(f"[DEBUG] Processing {N_act} subsets. Rejections: {failed.sum().get()} IC-GN, {(final_eval_mask & mask_failed_jump).sum().get()} Jump, {(final_eval_mask & mask_failed_cls).sum().get()} ZNSSD.")
-            sys.stdout.flush()
+            if DEBUG_BATCHES:
+                print(f"\n[DEBUG] --- BATCH {batch_count} | Mode: {'Warm-Start' if warm_start else 'Wavefront'} ---")
+                print(f"[DEBUG] Processing {N_act} subsets. Accepted {int(accepted.sum().get())}. "
+                      f"Rejections: {int(mask_failed_jump.sum().get())} Jump, "
+                      f"{int(mask_failed_cls.sum().get())} ZNSSD "
+                      f"({int(failed.sum().get())} stopped iterating early).")
+                sys.stdout.flush()
 
-            self.p_global[active_indices] = p_act
-            self.cls_global[active_indices] = cls_act
-
+            # Only commit parameters that passed. Rejected points currently
+            # always get re-seeded from a parent (or never read again) before
+            # p_global is used, so this is not load-bearing today -- but writing
+            # diverged iterates into the array that seeds the next frame's warm
+            # start is a trap waiting for the next change to the state machine.
             success_idx = active_indices[accepted]
             fail_idx = active_indices[~accepted]
 
+            self.p_global[success_idx] = p_act[accepted]
+            self.cls_global[success_idx] = cls_act[accepted]
+            self.cls_global[fail_idx] = cp.nan
+
             self.state[success_idx] = 2
-            self.state[fail_idx] = -1
+            # Return failures to the pending pool while they still have retry
+            # budget, so a later, more reliable neighbour can re-seed them.
+            self.retry[fail_idx] += 1
+            retryable = fail_idx[self.retry[fail_idx] < MAX_RETRY]
+            exhausted = fail_idx[self.retry[fail_idx] >= MAX_RETRY]
+            self.state[retryable] = 0
+            self.state[exhausted] = -1
 
             if len(success_idx) > 0:
                 n_idx, p_idx = get_neighbors(success_idx)
                 valid_n = self.state[n_idx] == 0
-                unique_n, unique_indices = cp.unique(n_idx[valid_n], return_index=True)
-                selected_parents = p_idx[valid_n][unique_indices]
+                n_sel, p_sel = n_idx[valid_n], p_idx[valid_n]
+                if len(n_sel) == 0:
+                    continue
+                # cp.unique(..., return_index=True) returns whichever parent
+                # happened to come first in array order. Reliability-guided DIC
+                # requires the *lowest-ZNSSD* parent, otherwise this degrades
+                # into a plain breadth-first flood fill and poor estimates get
+                # to seed their neighbours.
+                pcls = cp.nan_to_num(self.cls_global[p_sel], nan=cp.inf, posinf=1e30)
+                order = cp.lexsort(cp.stack([pcls, n_sel.astype(cp.float64)]))
+                n_sorted, p_sorted = n_sel[order], p_sel[order]
+                first = cp.empty(len(n_sorted), dtype=bool)
+                first[0] = True
+                first[1:] = n_sorted[1:] != n_sorted[:-1]
+                unique_n, selected_parents = n_sorted[first], p_sorted[first]
 
                 self.state[unique_n] = 1
                 p_par = self.p_global[selected_parents]

@@ -42,6 +42,18 @@ VERTEX_HIT_PX:          int = 14
 EDGE_HIT_PX:            int = 10   
 HANDLE_HIT_PX:          int = 10   
 HANDLE_HALF:            int = 5    
+MARKER_HIT_PX:          int = 13   
+
+# Distinguishable, colour-blind-friendly-ish palette for trajectory markers.
+MARKER_PALETTE = [
+    "#ff5c5c", "#ffd93d", "#4ade80", "#38bdf8", "#c084fc",
+    "#fb923c", "#2dd4bf", "#f472b6", "#a3e635", "#818cf8",
+]
+
+
+def marker_color(i: int) -> QColor:
+    return QColor(MARKER_PALETTE[i % len(MARKER_PALETTE)])
+
 
 TOOL_TOOLTIPS: dict = {
     ROITool.NONE:
@@ -171,6 +183,9 @@ class ImageCanvas(QWidget):
     roi_changed  = pyqtSignal(object)
     seed_placed  = pyqtSignal(int, int)
     cursor_moved = pyqtSignal(int, int, float)
+    markers_changed  = pyqtSignal(object)   # list[(x, y)] in image coords
+    marker_selected  = pyqtSignal(int)      # index, or -1
+    marker_requested = pyqtSignal(float, float)  # raw click, page maps to reference
 
     _ROI_FILL_COLOR   = QColor(47, 129, 247,  55)
     _ROI_BORDER_COLOR = QColor(47, 129, 247, 200)
@@ -209,7 +224,19 @@ class ImageCanvas(QWidget):
         self.seed_enabled: bool = True
         self._streaklines: list[list[tuple[float, float]]] | None = None
         self._streak_path: Optional[QPainterPath] = None
-        self.streakline_thickness: float = 1.0
+        self._streak_paths: list[tuple[QPainterPath, QColor, bool]] = []
+        self.streakline_thickness: float = 1.8
+
+        # ── Trajectory markers ──
+        # Stored positions are whatever the page hands us (reference-frame
+        # coords); _marker_draw_pts is where to render them on the CURRENT frame,
+        # so a marker visually sticks to its material point while scrubbing.
+        self._markers: List[QPointF] = []
+        self._marker_draw_pts: List[Optional[QPointF]] = []
+        self._marker_mode: bool = False
+        self._marker_sel: int = -1
+        self._marker_drag: bool = False
+        self.show_marker_labels: bool = True
         # ─────────────────────────────────────────────────────────────
 
         self._committed_poly: Optional[List[QPointF]] = None
@@ -376,6 +403,28 @@ class ImageCanvas(QWidget):
             self.setCursor(Qt.CursorShape.ClosedHandCursor);
             return
 
+        # ── Marker mode takes precedence over all ROI interaction ──
+        if self._marker_mode and self._image_arr is not None:
+            hit = self._hit_marker(wx, wy)
+            if event.button() == Qt.MouseButton.LeftButton:
+                if hit is not None:
+                    self.select_marker(hit)
+                    self._marker_drag = True
+                else:
+                    ip = self._widget_to_image(pos)
+                    if ip is not None:
+                        H, W = self._image_arr.shape
+                        if 0 <= ip.x() < W and 0 <= ip.y() < H:
+                            # The page decides how to interpret the click (it may
+                            # need to map a deformed-frame position back to
+                            # reference coords), then calls add_marker().
+                            self.marker_requested.emit(ip.x(), ip.y())
+                return
+            if event.button() == Qt.MouseButton.RightButton:
+                if hit is not None:
+                    self.remove_marker(hit)
+                return
+
         if self._poly_edit is not None:
             pe = self._poly_edit
             if event.button() == Qt.MouseButton.LeftButton:
@@ -469,6 +518,24 @@ class ImageCanvas(QWidget):
                 self._commit_polygon()
 
     def mouseMoveEvent(self, event) -> None:
+        if (self._marker_mode and self._marker_drag and 0 <= self._marker_sel < len(self._markers)):
+            ip = self._widget_to_image(event.position())
+            if ip is not None and self._image_arr is not None:
+                H, W = self._image_arr.shape
+                self._markers[self._marker_sel] = QPointF(
+                    min(max(ip.x(), 0.0), W - 1.0), min(max(ip.y(), 0.0), H - 1.0))
+                self._marker_draw_pts = []
+                self.markers_changed.emit(self.markers())
+                self.update()
+            return
+        if self._marker_mode:
+            self._mouse_widget = event.position()
+            self._mouse_img = self._widget_to_image(event.position())
+            hit = self._hit_marker(event.position().x(), event.position().y())
+            self.setCursor(Qt.CursorShape.OpenHandCursor if hit is not None
+                           else Qt.CursorShape.CrossCursor)
+            self.update()
+            return
         pos, wx, wy = event.position(), event.position().x(), event.position().y()
         img_pt = self._widget_to_image(pos)
         self._mouse_img, self._mouse_widget = img_pt, pos
@@ -535,6 +602,10 @@ class ImageCanvas(QWidget):
             self.cursor_moved.emit(px, py, val)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._marker_drag:
+            self._marker_drag = False
+            self.markers_changed.emit(self.markers())
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             self._dragging = False
             self.setCursor(Qt.CursorShape.CrossCursor if self._tool != ROITool.NONE else Qt.CursorShape.ArrowCursor)
@@ -558,6 +629,14 @@ class ImageCanvas(QWidget):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
+        if self._marker_mode:
+            if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                if self._marker_sel >= 0:
+                    self.remove_marker(self._marker_sel)
+                return
+            if key == Qt.Key.Key_Escape:
+                self.select_marker(-1)
+                return
         if key == Qt.Key.Key_Escape:
             if self._poly_edit: self._commit_poly_edit()
             elif self._rect_edit: self._commit_rect_edit()
@@ -610,17 +689,87 @@ class ImageCanvas(QWidget):
 
             painter.drawEllipse(QPointF(sx, sy), sr, sr)
 
-        # ─── DRAW STREAKLINES ───
-        if getattr(self, '_streak_path', None) is not None:
-            thick = getattr(self, 'streakline_thickness', 1.0) / self._zoom
-            painter.setPen(QPen(QColor(255, 255, 255, 180), thick))
-            painter.drawPath(self._streak_path)
+        # ─── DRAW TRAJECTORIES (one colour per marker) ───
+        if self._streak_paths:
+            thick = max(0.6, getattr(self, 'streakline_thickness', 1.8)) / self._zoom
+            for path, col, lost in self._streak_paths:
+                # Halo first so paths stay legible over a bright field overlay.
+                halo = QColor(0, 0, 0, 150)
+                painter.setPen(QPen(halo, thick * 2.2, Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(path)
+                pen = QPen(col, thick, Qt.PenStyle.DashLine if lost else Qt.PenStyle.SolidLine,
+                           Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                painter.drawPath(path)
+
+        # ─── DRAW MARKERS ───
+        if self._markers:
+            r_out = 6.5 / self._zoom
+            r_in = 2.4 / self._zoom
+            for i in range(len(self._markers)):
+                p = self._marker_render_pt(i)
+                if p is None:
+                    continue
+                col = marker_color(i)
+                sel = (i == self._marker_sel)
+                lost = (i < len(self._marker_draw_pts) and self._marker_draw_pts[i] is None)
+
+                painter.setPen(QPen(QColor(0, 0, 0, 190), 3.0 / self._zoom))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(p, r_out, r_out)
+
+                painter.setPen(QPen(col, (2.4 if sel else 1.6) / self._zoom,
+                                    Qt.PenStyle.DotLine if lost else Qt.PenStyle.SolidLine))
+                painter.drawEllipse(p, r_out, r_out)
+
+                fill = QColor(col)
+                fill.setAlpha(90 if lost else 255)
+                painter.setBrush(QBrush(fill))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(p, r_in, r_in)
+
+                if sel:
+                    ring = QColor(255, 255, 255, 210)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.setPen(QPen(ring, 1.2 / self._zoom, Qt.PenStyle.DashLine))
+                    painter.drawEllipse(p, r_out * 1.7, r_out * 1.7)
         # ────────────────────────
 
         painter.restore()
 
         if self._poly_edit is not None: self._paint_poly_edit(painter)
         if self._rect_edit is not None: self._paint_rect_edit(painter)
+
+        # Marker numbers are drawn unscaled so they stay readable at any zoom.
+        if self._markers and self.show_marker_labels:
+            f = QFont(); f.setPointSize(8); f.setBold(True)
+            painter.setFont(f)
+            for i in range(len(self._markers)):
+                p = self._marker_render_pt(i)
+                if p is None:
+                    continue
+                sx = p.x() * self._zoom + self._pan_x + 9
+                sy = p.y() * self._zoom + self._pan_y - 8
+                label = str(i + 1)
+                painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
+                painter.drawText(QPointF(sx + 0.7, sy + 0.7), label)
+                painter.setPen(marker_color(i))
+                painter.drawText(QPointF(sx, sy), label)
+
+        if self._marker_mode:
+            hint = ("MARKER MODE — click to place · drag to move · "
+                    "right-click or Del to remove")
+            f2 = QFont(); f2.setPointSize(8); f2.setBold(True)
+            painter.setFont(f2)
+            tw = painter.fontMetrics().horizontalAdvance(hint) + 16
+            bar = QRectF(8, 8, tw, 22)
+            painter.setBrush(QBrush(QColor(11, 22, 38, 225)))
+            painter.setPen(QPen(QColor(59, 130, 246, 200), 1))
+            painter.drawRoundedRect(bar, 4, 4)
+            painter.setPen(QColor("#9dc4ff"))
+            painter.drawText(bar, Qt.AlignmentFlag.AlignCenter, hint)
 
         if self._mouse_img and self._image_arr is not None:
             x, y = self._mouse_img.x(), self._mouse_img.y()
@@ -821,20 +970,123 @@ class ImageCanvas(QWidget):
         if self._image_px is not None: self._fit_to_window()
         super().resizeEvent(event)
 
-    def set_streaklines(self, lines: list[list[tuple[float, float]]] | None) -> None:
+    # ─────────────────────────────────────────────────────────────────────
+    # Trajectory markers
+    # ─────────────────────────────────────────────────────────────────────
+
+    def set_marker_mode(self, on: bool) -> None:
+        self._marker_mode = bool(on)
+        if not on:
+            self._marker_drag = False
+        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    @property
+    def marker_mode(self) -> bool:
+        return self._marker_mode
+
+    def markers(self) -> list[tuple[float, float]]:
+        return [(p.x(), p.y()) for p in self._markers]
+
+    def set_markers(self, pts) -> None:
+        self._markers = [QPointF(float(x), float(y)) for x, y in (pts or [])]
+        if self._marker_sel >= len(self._markers):
+            self._marker_sel = -1
+        self._marker_draw_pts = []
+        self.update()
+
+    def set_marker_draw_positions(self, pts) -> None:
+        """Advected on-screen positions for the current frame (None = lost)."""
+        self._marker_draw_pts = [
+            None if p is None else QPointF(float(p[0]), float(p[1])) for p in (pts or [])
+        ]
+        self.update()
+
+    def add_marker(self, x: float, y: float) -> int:
+        self._markers.append(QPointF(float(x), float(y)))
+        self._marker_sel = len(self._markers) - 1
+        self._marker_draw_pts = []
+        self.markers_changed.emit(self.markers())
+        self.marker_selected.emit(self._marker_sel)
+        self.update()
+        return self._marker_sel
+
+    def remove_marker(self, i: int) -> None:
+        if 0 <= i < len(self._markers):
+            self._markers.pop(i)
+            if i < len(self._marker_draw_pts):
+                self._marker_draw_pts.pop(i)
+            self._marker_sel = min(self._marker_sel, len(self._markers) - 1)
+            self.markers_changed.emit(self.markers())
+            self.marker_selected.emit(self._marker_sel)
+            self.update()
+
+    def clear_markers(self) -> None:
+        self._markers = []
+        self._marker_draw_pts = []
+        self._marker_sel = -1
+        self._streak_paths = []
+        self._streak_path = None
+        self.markers_changed.emit([])
+        self.marker_selected.emit(-1)
+        self.update()
+
+    def select_marker(self, i: int) -> None:
+        self._marker_sel = i if 0 <= i < len(self._markers) else -1
+        self.marker_selected.emit(self._marker_sel)
+        self.update()
+
+    @property
+    def selected_marker(self) -> int:
+        return self._marker_sel
+
+    def _marker_render_pt(self, i: int) -> Optional[QPointF]:
+        if i < len(self._marker_draw_pts):
+            return self._marker_draw_pts[i]
+        return self._markers[i] if i < len(self._markers) else None
+
+    def _hit_marker(self, wx: float, wy: float) -> Optional[int]:
+        """Topmost marker under the widget-space point, or None."""
+        best, best_d = None, MARKER_HIT_PX
+        for i in range(len(self._markers) - 1, -1, -1):
+            p = self._marker_render_pt(i)
+            if p is None:
+                continue
+            sx = p.x() * self._zoom + self._pan_x
+            sy = p.y() * self._zoom + self._pan_y
+            d = _dist(wx, wy, sx, sy)
+            if d <= best_d:
+                best, best_d = i, d
+        return best
+
+    # ─────────────────────────────────────────────────────────────────────
+
+    def set_streaklines(self, lines, colors=None, lost_flags=None) -> None:
+        """
+        lines      : list of point-lists in image coords
+        colors     : optional per-line QColor / colour string
+        lost_flags : optional per-line bool -- track was lost before the frame
+        """
         self._streaklines = lines
         self._streak_path = None
-
-        if lines:
-            from PyQt6.QtGui import QPainterPath
+        self._streak_paths = []
+        if not lines:
+            self.update()
+            return
+        for i, pts in enumerate(lines):
+            if not pts or len(pts) < 2:
+                continue
             path = QPainterPath()
-            for pts in lines:
-                if len(pts) < 2:
-                    continue
-                path.moveTo(pts[0][0], pts[0][1])
-                for pt in pts[1:]:
-                    path.lineTo(pt[0], pt[1])
-            self._streak_path = path
+            path.moveTo(QPointF(pts[0][0], pts[0][1]))
+            for (x, y) in pts[1:]:
+                path.lineTo(QPointF(x, y))
+            if colors is not None and i < len(colors) and colors[i] is not None:
+                c = QColor(colors[i])
+            else:
+                c = marker_color(i)
+            lost = bool(lost_flags[i]) if (lost_flags is not None and i < len(lost_flags)) else False
+            self._streak_paths.append((path, c, lost))
+        self.update()
 
         self.update()
 

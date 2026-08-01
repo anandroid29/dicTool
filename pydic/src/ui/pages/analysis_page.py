@@ -160,6 +160,25 @@ class AnalysisPage(QWidget):
         root.addWidget(footer)
 
     # ------------------------------------------------------------------
+    def on_before_show(self) -> None:
+        """Blank the previous run's log, thumbnail and progress before showing."""
+        try:
+            self._pbar.setValue(0)
+            self._status_lbl.setText("")
+            self._last_thumb_idx = -1
+            self._last_shown_frame = -1
+            if hasattr(self, "_log") and hasattr(self._log, "clear"):
+                self._log.clear()
+            if hasattr(self, "_canvas"):
+                self._canvas.clear_result_overlay()
+                self._canvas.set_streaklines(None)
+            for attr in ("_thumb", "_preview"):
+                w = getattr(self, attr, None)
+                if w is not None and hasattr(w, "clear"):
+                    w.clear()
+        except Exception:
+            pass
+
     def on_enter(self) -> None:
         """Start the DIC analysis thread."""
         self._pbar.setValue(0)

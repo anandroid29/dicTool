@@ -19,12 +19,13 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QSpinBox, QToolButton, QProgressDialog, QProgressBar,
+    QListWidget, QListWidgetItem, QGroupBox, QGridLayout,
 )
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 
-from src.ui.image_canvas import ImageCanvas
+from src.ui.image_canvas import ImageCanvas, marker_color
 
 try:
     import cv2; _CV2 = True
@@ -164,7 +165,7 @@ class ResultsPage(QWidget):
 
         new_btn = QPushButton("← New Session")
         new_btn.setFixedWidth(120)
-        new_btn.clicked.connect(self._wizard.go_welcome)
+        new_btn.clicked.connect(self._wizard.new_session)
         top_lay.addWidget(new_btn)
 
         top_lay.addSpacing(12)
@@ -193,29 +194,54 @@ class ResultsPage(QWidget):
         top_lay.addSpacing(12)
 
         self._streak_chk = QCheckBox("Streaklines")
-        self._streak_chk.setToolTip("Show particle trajectories up to the current frame")
+        self._streak_chk.setToolTip(
+            "Trace trajectories from markers you place on the image")
         self._streak_chk.setStyleSheet(f"color:{_C_ACCENT}; font-size: 12px; font-weight: 800;")
-        self._streak_chk.stateChanged.connect(self._refresh_overlay)
+        self._streak_chk.toggled.connect(self._on_streak_toggled)
         top_lay.addWidget(self._streak_chk)
 
-        self._streak_lbl = QLabel("Spacing:")
-        self._streak_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
-        top_lay.addWidget(self._streak_lbl)
+        self._place_btn = QPushButton("＋ Place markers")
+        self._place_btn.setCheckable(True)
+        self._place_btn.setFixedHeight(28)
+        self._place_btn.setToolTip(
+            "Click the image to drop a marker · drag to move · right-click or Del to remove")
+        self._place_btn.setStyleSheet(
+            f"QPushButton{{background:{_C_CARD}; color:{_C_TEXT}; border:1px solid {_C_BORDER};"
+            f" padding:3px 10px; border-radius:4px; font-size:11px;}}"
+            f"QPushButton:checked{{background:{_C_ACCENT}; color:#ffffff; border:1px solid {_C_ACCENT};"
+            f" font-weight:700;}}")
+        self._place_btn.toggled.connect(self._on_place_toggled)
+        top_lay.addWidget(self._place_btn)
 
-        self._streak_spin = QSpinBox()
-        self._streak_spin.setRange(1, 100)
-        self._streak_spin.setValue(10)
-        self._streak_spin.setToolTip("Higher spacing = fewer streaklines but thicker paths")
-        self._streak_spin.setStyleSheet(
-            f"background:{_C_CARD}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:2px 6px; border-radius:4px;"
-        )
-        self._streak_spin.valueChanged.connect(self._refresh_overlay)
-        top_lay.addWidget(self._streak_spin)
+        self._marker_count_lbl = QLabel("0 markers")
+        self._marker_count_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        top_lay.addWidget(self._marker_count_lbl)
 
-        self._streak_chk.toggled.connect(self._streak_lbl.setVisible)
-        self._streak_chk.toggled.connect(self._streak_spin.setVisible)
-        self._streak_lbl.setVisible(False)
-        self._streak_spin.setVisible(False)
+        self._clear_markers_btn = QPushButton("Clear")
+        self._clear_markers_btn.setFixedHeight(28)
+        self._clear_markers_btn.setToolTip("Remove all markers")
+        self._clear_markers_btn.setStyleSheet(
+            f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
+            f" padding:3px 10px; border-radius:4px; font-size:11px;")
+        self._clear_markers_btn.clicked.connect(self._clear_markers)
+        top_lay.addWidget(self._clear_markers_btn)
+
+        self._trail_lbl = QLabel("Trail:")
+        self._trail_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        top_lay.addWidget(self._trail_lbl)
+
+        self._trail_combo = QComboBox()
+        self._trail_combo.addItem("Full", 0)
+        for n in (10, 25, 50, 100):
+            self._trail_combo.addItem(f"{n} frames", n)
+        self._trail_combo.setToolTip("How much trajectory history to draw")
+        self._trail_combo.setFixedWidth(96)
+        self._trail_combo.currentIndexChanged.connect(self._refresh_overlay)
+        top_lay.addWidget(self._trail_combo)
+
+        for w in (self._place_btn, self._marker_count_lbl, self._clear_markers_btn,
+                  self._trail_lbl, self._trail_combo):
+            w.setVisible(False)
 
         top_lay.addSpacing(12)
 
@@ -256,6 +282,9 @@ class ResultsPage(QWidget):
         # Canvas
         self._canvas = ImageCanvas()
         self._canvas.seed_enabled = False  # Disable seed placement here
+        self._canvas.marker_requested.connect(self._on_marker_requested)
+        self._canvas.markers_changed.connect(self._on_markers_changed)
+        self._canvas.marker_selected.connect(self._on_marker_selected)
         self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
                                    QSizePolicy.Policy.Expanding)
         body_lay.addWidget(self._canvas, 1)
@@ -313,6 +342,47 @@ class ResultsPage(QWidget):
             f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;"
         )
         sb_lay.addWidget(exp_hdr)
+
+        # ── Marker panel (visible only while Streaklines is on) ──
+        self._marker_panel = QWidget()
+        mp_lay = QVBoxLayout(self._marker_panel)
+        mp_lay.setContentsMargins(0, 0, 0, 0)
+        mp_lay.setSpacing(6)
+
+        mk_hdr = QLabel("TRAJECTORY MARKERS")
+        mk_hdr.setStyleSheet(
+            f"color:{_C_TEXT3}; font-size:10px; font-weight:800; letter-spacing:1px;")
+        mp_lay.addWidget(mk_hdr)
+
+        self._marker_hint = QLabel(
+            "Enable <b>Place markers</b> and click the image to add a point to track.")
+        self._marker_hint.setWordWrap(True)
+        self._marker_hint.setStyleSheet(
+            f"color:{_C_TEXT2}; font-size:10px; background:{_C_CARD};"
+            f" border:1px dashed {_C_BORDER}; border-radius:4px; padding:7px;")
+        mp_lay.addWidget(self._marker_hint)
+
+        self._marker_list = QListWidget()
+        self._marker_list.setFixedHeight(132)
+        self._marker_list.setStyleSheet(
+            f"QListWidget{{background:{_C_CARD}; border:1px solid {_C_BORDER};"
+            f" border-radius:4px; font-size:10px; padding:2px;}}"
+            f"QListWidget::item{{padding:3px 2px;}}"
+            f"QListWidget::item:selected{{background:{_C_RAISED}; border-left:2px solid {_C_ACCENT};}}")
+        self._marker_list.currentRowChanged.connect(self._canvas.select_marker)
+        mp_lay.addWidget(self._marker_list)
+
+        self._del_marker_btn = QPushButton("Remove selected")
+        self._del_marker_btn.setFixedHeight(26)
+        self._del_marker_btn.setStyleSheet(
+            f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
+            f" border-radius:4px; font-size:10px;")
+        self._del_marker_btn.clicked.connect(
+            lambda: self._canvas.remove_marker(self._canvas.selected_marker))
+        mp_lay.addWidget(self._del_marker_btn)
+
+        self._marker_panel.setVisible(False)
+        sb_lay.addWidget(self._marker_panel)
 
         for label, slot in [("CSV (this frame)", self._export_csv),
                              ("HDF5 (all frames)", self._export_hdf5)]:
@@ -399,9 +469,140 @@ class ResultsPage(QWidget):
     # Public API — called by wizard
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Trajectory markers
+    # ------------------------------------------------------------------
+    def _on_streak_toggled(self, on: bool) -> None:
+        for w in (self._place_btn, self._marker_count_lbl, self._clear_markers_btn,
+                  self._trail_lbl, self._trail_combo):
+            w.setVisible(on)
+        self._marker_panel.setVisible(on)
+        if not on:
+            self._place_btn.setChecked(False)
+            self._canvas.set_marker_mode(False)
+        self._refresh_overlay()
+
+    def _on_place_toggled(self, on: bool) -> None:
+        self._canvas.set_marker_mode(on)
+        self._place_btn.setText("● Placing…" if on else "＋ Place markers")
+
+    def _on_marker_requested(self, x: float, y: float) -> None:
+        """
+        Canvas click -> reference-frame marker.
+
+        The canvas shows the DEFORMED frame, so a click at frame N is a current
+        position. Markers are stored in reference coordinates, so map it back;
+        otherwise a marker placed while scrubbed forward would follow the wrong
+        material point.
+        """
+        analysis = self._wizard.analysis
+        if not analysis.results:
+            return
+        mapped = analysis.reference_from_current(x, y, self._frame)
+        if mapped is None:
+            QMessageBox.information(self, "No data",
+                                    "This frame has no valid correlation data yet.")
+            return
+        (rx, ry), resid = mapped
+        if resid > 25.0:
+            QMessageBox.information(
+                self, "Outside analysed region",
+                "That point isn't inside the analysed region for this frame.\n"
+                f"Nearest tracked material point is {resid:.0f} px away.")
+            return
+        self._canvas.add_marker(rx, ry)
+
+    def _on_markers_changed(self, pts) -> None:
+        n = len(pts)
+        self._marker_count_lbl.setText("1 marker" if n == 1 else f"{n} markers")
+        self._rebuild_marker_list()
+        self._refresh_overlay()
+
+    def _clear_markers(self) -> None:
+        self._canvas.clear_markers()
+
+    def _on_marker_selected(self, i: int) -> None:
+        if 0 <= i < self._marker_list.count() and self._marker_list.currentRow() != i:
+            self._marker_list.blockSignals(True)
+            self._marker_list.setCurrentRow(i)
+            self._marker_list.blockSignals(False)
+        self._del_marker_btn.setEnabled(i >= 0)
+
+    def reset_markers(self) -> None:
+        """Drop all marker state. Called when a new session starts."""
+        self._place_btn.setChecked(False)
+        self._streak_chk.setChecked(False)
+        self._trail_combo.setCurrentIndex(0)
+        self._canvas.set_marker_mode(False)
+        self._canvas.clear_markers()
+        self._marker_list.clear()
+
+    def _rebuild_marker_list(self) -> None:
+        self._marker_list.blockSignals(True)
+        self._marker_list.clear()
+        analysis = self._wizard.analysis
+        pts = self._canvas.markers()
+        trail = self._trail_combo.currentData() or 0
+        trajs = analysis.get_trajectories_from_seeds(pts, self._frame, trail) if pts else []
+        for i, (x, y) in enumerate(pts):
+            if i < len(trajs) and trajs[i]["lost_at"] is not None:
+                status = f"lost @ frame {trajs[i]['lost_at']}"
+            elif i < len(trajs):
+                npts = len(trajs[i]["points"])
+                status = f"{npts} pts"
+            else:
+                status = "—"
+            it = QListWidgetItem(f"  {i+1}.   x={x:.0f}, y={y:.0f}    ·  {status}")
+            it.setForeground(marker_color(i))
+            self._marker_list.addItem(it)
+        sel = self._canvas.selected_marker
+        if 0 <= sel < self._marker_list.count():
+            self._marker_list.setCurrentRow(sel)
+        self._marker_list.blockSignals(False)
+        self._marker_hint.setVisible(len(pts) == 0)
+
+    def _render_trajectories(self, idx: int) -> None:
+        analysis = self._wizard.analysis
+        if not self._streak_chk.isChecked():
+            self._canvas.set_streaklines(None)
+            self._canvas.set_markers([])
+            return
+        pts = self._canvas.markers()
+        self._canvas.set_marker_draw_positions(analysis.marker_positions(pts, idx))
+        if not pts:
+            self._canvas.set_streaklines(None)
+            return
+        trail = self._trail_combo.currentData() or 0
+        trajs = analysis.get_trajectories_from_seeds(pts, idx, trail)
+        self._canvas.set_streaklines(
+            [t["points"] for t in trajs],
+            colors=[marker_color(i) for i in range(len(trajs))],
+            lost_flags=[t["lost_at"] is not None for t in trajs],
+        )
+
+    def on_before_show(self) -> None:
+        """Cheap synchronous blanking so no stale frame is ever painted."""
+        try:
+            self._canvas.clear_result_overlay()
+            self._canvas.set_streaklines(None)
+            self._canvas.set_markers([])
+            self._canvas.set_marker_mode(False)
+            self._marker_list.clear()
+            self._place_btn.setChecked(False)
+            self._slider.setValue(0)
+            self._frame = 0
+            for lbl in getattr(self, "_stat_labels", {}).values():
+                lbl.setText("—")
+        except Exception:
+            pass
+
     def on_enter(self) -> None:
         """Refresh after analysis completes."""
         n = len(self._wizard.analysis.results)
+        # Markers are indexed against the previous run's displacement fields, so
+        # they are meaningless for a new sequence.
+        self._canvas.clear_markers()
+        self._marker_list.clear()
         self._slider.setMaximum(max(0, n - 1))
         self._slider.setValue(0)
         self._frame = 0
@@ -455,14 +656,8 @@ class ResultsPage(QWidget):
         else:
             self._canvas.set_result_overlay_rgba(None)
 
-        # 3. ── Render Streaklines ────────────────────────────────────
-        if hasattr(self, '_streak_chk') and self._streak_chk.isChecked():
-            step = self._streak_spin.value()
-            self._canvas.streakline_thickness = min(3.5, 1.0 + (step - 1) * 0.15)
-            self._canvas.set_streaklines(analysis.get_trajectories(idx, step=step))
-        else:
-            if hasattr(self._canvas, 'set_streaklines'):
-                self._canvas.set_streaklines(None)
+        # 3. ── Render marker trajectories ───────────────────────────
+        self._render_trajectories(idx)
 
         # 4. ── Update sidebar ────────────────────────────────────────
         self._update_stats(result)
