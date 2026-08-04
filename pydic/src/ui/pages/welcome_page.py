@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox
 )
 
+from src.core.units import LENGTH_UNIT_ORDER
+
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 from src.ui.components import FooterButton
@@ -172,6 +174,39 @@ class ImageLoadSettingsDialog(QDialog):
             fps_lay.addStretch()
         lay.addLayout(fps_lay)
 
+        # 2b. Spatial scale — the space counterpart to the frame rate above.
+        # Without it displacements can only ever be reported in pixels, which is
+        # rarely the unit anyone actually wants to publish.
+        scale_lay = QHBoxLayout()
+        scale_lay.addWidget(QLabel("Pixel size:"))
+        self.px_size_spin = QDoubleSpinBox()
+        self.px_size_spin.setRange(0.0, 1e9)
+        self.px_size_spin.setDecimals(6)
+        self.px_size_spin.setValue(0.0)
+        self.px_size_spin.setSpecialValueText("— unknown —")
+        self.px_size_spin.setToolTip(
+            "Physical size of one pixel, so results read in real units.\n"
+            "Leave at 0 to work in pixels; it can also be set later on the\n"
+            "results page without re-running the analysis.")
+        self.px_size_spin.setStyleSheet(
+            f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; "
+            f"padding:4px 8px; border-radius:4px;")
+        scale_lay.addWidget(self.px_size_spin)
+
+        self.px_unit_combo = QComboBox()
+        self.px_unit_combo.addItems(LENGTH_UNIT_ORDER)
+        self.px_unit_combo.setCurrentText("mm")
+        self.px_unit_combo.setStyleSheet(
+            f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; "
+            f"padding:4px 8px; border-radius:4px;")
+        scale_lay.addWidget(self.px_unit_combo)
+
+        per_lbl = QLabel("per pixel")
+        per_lbl.setStyleSheet(f"color:{_C_TEXT2};")
+        scale_lay.addWidget(per_lbl)
+        scale_lay.addStretch()
+        lay.addLayout(scale_lay)
+
         # Divider
         div2 = QFrame()
         div2.setFrameShape(QFrame.Shape.HLine)
@@ -231,6 +266,13 @@ class ImageLoadSettingsDialog(QDialog):
         roi_path = self.roi_edit.text().strip()
         user_fps = self.fps_spin.value() if self.fps_spin else None
         return step, limit, roi_path if roi_path else None, user_fps
+
+    def get_calibration(self):
+        """Calibration chosen in this dialog (uncalibrated when pixel size is 0)."""
+        from src.core.units import Calibration
+        val = float(self.px_size_spin.value())
+        unit = self.px_unit_combo.currentText()
+        return Calibration.from_pixel_size(val, unit) if val > 0 else Calibration(None, unit)
 
 
 class WelcomePage(QWidget):
@@ -452,6 +494,7 @@ class WelcomePage(QWidget):
             if dlg.exec() == 0:
                 return
             step, limit, roi_path, user_fps = dlg.get_settings()
+            self._wizard.analysis.calibration = dlg.get_calibration()
         except Exception as e:
             QMessageBox.critical(self, "Dialog Error", f"Failed to open settings dialog:\n{e}")
             return

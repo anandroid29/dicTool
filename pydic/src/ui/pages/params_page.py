@@ -1,5 +1,5 @@
 """
-params_page.py — Step 3: DIC parameters with live preview.
+params_page.py — Step 4: DIC parameters with live preview.
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING
@@ -45,25 +45,37 @@ def _section_label(text: str) -> QLabel:
     return lbl
 
 
+# Panel and control widths. The label column previously got 140 px against a
+# 340 px fixed panel (292 px usable after margins), which left names like
+# "Correlation cutoff" elided and every spin box pinned at its 80 px minimum.
+_PANEL_W  = 400
+_LABEL_W  = 168
+_FIELD_W  = 104
+_UNIT_W   = 30
+
+
 def _param_row(label: str, tooltip: str, widget: QWidget, unit: str = "") -> QHBoxLayout:
     row = QHBoxLayout()
-    row.setSpacing(12)
+    row.setSpacing(10)
     lbl = QLabel(label)
     lbl.setStyleSheet(f"color:{_C_TEXT}; font-size:12px;")
     lbl.setToolTip(tooltip)
-    lbl.setFixedWidth(140)
+    lbl.setFixedWidth(_LABEL_W)
     row.addWidget(lbl)
+    # Also put the tooltip on the control: hovering the thing you are about to
+    # change is the natural gesture, and the label-only tooltip was easy to miss.
+    widget.setToolTip(tooltip)
     row.addWidget(widget)
-    if unit:
-        u = QLabel(unit)
-        u.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
-        row.addWidget(u)
+    u = QLabel(unit)
+    u.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+    u.setFixedWidth(_UNIT_W)
+    row.addWidget(u)
     row.addStretch()
     return row
 
 
 class ParamsPage(QWidget):
-    """Step 3 — set DIC parameters."""
+    """Step 4 — set DIC parameters."""
 
     def __init__(self, wizard: "Wizard") -> None:
         super().__init__()
@@ -84,10 +96,10 @@ class ParamsPage(QWidget):
 
         back = QPushButton("← Back")
         back.setFixedWidth(90)
-        back.clicked.connect(self._wizard.go_roi)
+        back.clicked.connect(self._wizard.go_before_params)
         top_lay.addWidget(back)
 
-        title = QLabel("Step 3  ·  Analysis Parameters")
+        title = QLabel("Step 4  ·  Analysis Parameters")
         title.setStyleSheet(f"color:{_C_TEXT}; font-size:13px; font-weight:600;")
         top_lay.addWidget(title)
         top_lay.addStretch()
@@ -108,11 +120,11 @@ class ParamsPage(QWidget):
 
         # Right: parameters panel
         right = QWidget()
-        right.setFixedWidth(340)
+        right.setFixedWidth(_PANEL_W)
         right.setStyleSheet(f"background:{_C_SURFACE}; border-left:1px solid {_C_BORDER};")
         right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(24, 28, 24, 28)
-        right_lay.setSpacing(20)
+        right_lay.setContentsMargins(22, 24, 22, 24)
+        right_lay.setSpacing(16)
 
         # -- Subset --
         right_lay.addWidget(_section_label("Subset"))
@@ -122,7 +134,7 @@ class ParamsPage(QWidget):
             s.setRange(lo, hi)
             s.setValue(val)
             s.setSingleStep(step)
-            s.setFixedWidth(80)
+            s.setFixedWidth(_FIELD_W)
             return s
 
         def dspin(lo, hi, val, step=0.05, dec=2):
@@ -131,7 +143,7 @@ class ParamsPage(QWidget):
             s.setValue(val)
             s.setSingleStep(step)
             s.setDecimals(dec)
-            s.setFixedWidth(80)
+            s.setFixedWidth(_FIELD_W)
             return s
 
         params = self._wizard.analysis.params
@@ -150,16 +162,22 @@ class ParamsPage(QWidget):
             "Smaller = denser result grid, longer analysis time.",
             self._sp_spacing, "px"))
 
-        self._cb_dynamic_roi = QComboBox()
-        self._cb_dynamic_roi.addItems(["None", "Contrast", "Edge Detection", "Hybrid"])
-        self._cb_dynamic_roi.setCurrentText(params.dynamic_roi)
-        self._cb_dynamic_roi.setFixedWidth(110)
-        self._cb_dynamic_roi.currentTextChanged.connect(self._on_param_changed)
+        # Dynamic ROI now has its own step, where the threshold and the manual
+        # include/exclude regions can be seen against the reference frame. Keep
+        # a read-only summary here so the setting is still discoverable from the
+        # page where the rest of the analysis is configured.
+        self._dyn_btn = QPushButton("Edit…")
+        self._dyn_btn.setFixedWidth(_FIELD_W + _UNIT_W)
+        self._dyn_btn.setFixedHeight(28)
+        self._dyn_btn.clicked.connect(self._wizard.go_dynamic_roi)
         right_lay.addLayout(_param_row(
-            "Dynamic ROI", "Dynamically updates the valid ROI for each frame based on the deformed image.\n"
-            "Useful for cutting experiments where material is removed.\n"
-            "Pixels excluded by this method are set to NaN and ignored in stress/strain calculations.",
-            self._cb_dynamic_roi, ""))
+            "Dynamic ROI", "Per-frame texture masking, configured in Step 3.\n"
+            "Useful for cutting experiments where material is removed.",
+            self._dyn_btn, ""))
+        self._dyn_lbl = QLabel("")
+        self._dyn_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        self._dyn_lbl.setWordWrap(True)
+        right_lay.addWidget(self._dyn_lbl)
 
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Strain"))
@@ -176,6 +194,15 @@ class ParamsPage(QWidget):
             "Must cover at least ~5 grid points across, i.e. keep it\n"
             "at least 2x the subset spacing, or strains come out empty.",
             self._sp_strain, "px"))
+
+        # A strain window too small for the grid spacing silently produced an
+        # entirely empty strain field. The solver clamps it, but the clamp was
+        # only a console print -- say it here, where the value is being chosen.
+        self._strain_warn = QLabel("")
+        self._strain_warn.setWordWrap(True)
+        self._strain_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
+        self._strain_warn.setVisible(False)
+        right_lay.addWidget(self._strain_warn)
 
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Optimizer"))
@@ -338,8 +365,32 @@ class ParamsPage(QWidget):
         p.conv_tol       = self._sp_tol.value()
         p.corr_cutoff    = self._sp_cutoff.value()
         p.search_radius  = self._sp_search.value()
-        p.dynamic_roi    = self._cb_dynamic_roi.currentText()
         p.shape_order    = int(self._cb_order.currentData() or 1)
+
+        eff = p.effective_strain_window(warn=False)
+        if eff != p.strain_window:
+            n_pts = 2 * p.strain_window // max(1, p.subset_spacing) + 1
+            self._strain_warn.setText(
+                f"⚠  {p.strain_window} px spans only {n_pts} grid points at "
+                f"{p.subset_spacing} px spacing — too few to fit a strain plane. "
+                f"{eff} px will be used instead.")
+            self._strain_warn.setVisible(True)
+        else:
+            self._strain_warn.setVisible(False)
+
+        method = getattr(p, "dynamic_roi", "None")
+        if method in ("None", None):
+            self._dyn_lbl.setText("Off — every pixel of the ROI is analysed in every frame.")
+        else:
+            thr = getattr(p, "dynamic_roi_threshold", None)
+            thr_txt = "automatic threshold" if thr is None else f"threshold {thr*100:.0f}%"
+            a = self._wizard.analysis
+            n_inc = int(a.dynamic_include_mask.sum()) if a.dynamic_include_mask is not None else 0
+            n_exc = int(a.dynamic_exclude_mask.sum()) if a.dynamic_exclude_mask is not None else 0
+            extra = ""
+            if n_inc or n_exc:
+                extra = f", {n_inc:,} px forced in / {n_exc:,} px forced out"
+            self._dyn_lbl.setText(f"{method} — {thr_txt}{extra}.")
 
         if hasattr(self._canvas, "set_subset_radius"):
             self._canvas.set_subset_radius(p.subset_radius)
@@ -444,11 +495,7 @@ class ParamsPage(QWidget):
         self._cb_order.blockSignals(False)
         self._update_order_note()
 
-        self._cb_dynamic_roi.blockSignals(True)
-        self._cb_dynamic_roi.setCurrentText(p.dynamic_roi)
-        self._cb_dynamic_roi.blockSignals(False)
-
-        self._on_param_changed()  # Update the subset counter text
+        self._on_param_changed()  # Update the subset counter and dynamic-ROI summary
 
         QMessageBox.information(
             self, "Defaults Reset",

@@ -24,8 +24,19 @@ class DICParams:
     # 2*(1 - ZNCC). A cutoff of 2.0 therefore accepts ZNCC >= 0, i.e. it
     # accepts everything. 0.3 corresponds to ZNCC >= 0.85.
     corr_cutoff:    float = 0.30
+    # Half-width of the NCC template search used to SEED a frame.
     search_radius:  int   = 50
+    # Half-width of the GPU solver's per-subset integer-shift rescue sweep.
+    # Deliberately separate from search_radius and deliberately small: a wide
+    # sweep over quasi-periodic speckle locks onto false ZNSSD minima. Raising
+    # this trades robustness for reach -- see icgn_gpu.py for the measurement.
+    rescue_radius:  int   = 12
     dynamic_roi:    str   = "Hybrid"
+    # Texture threshold for the dynamic ROI, normalised to [0, 1]. None keeps
+    # the automatic (Otsu on the reference frame) choice.
+    dynamic_roi_threshold: Optional[float] = None
+    # Drop connected regions smaller than this fraction of the largest one.
+    dynamic_roi_min_area_frac: float = 0.02
     # Restrict subset pixels to the ROI. Correct when the ROI outlines a
     # material boundary (specimen edge, hole, grip). Turn off when the ROI is
     # just a crop of a larger uniform speckle field, where the surrounding

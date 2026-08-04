@@ -1,5 +1,5 @@
 """
-analysis_page.py — Step 4: Live progress during DIC analysis.
+analysis_page.py — Step 5: Live progress during DIC analysis.
 """
 from __future__ import annotations
 import time
@@ -59,7 +59,7 @@ class _Worker(QObject):
 # ---------------------------------------------------------------------------
 
 class AnalysisPage(QWidget):
-    """Step 4 — runs DIC in background, shows live progress."""
+    """Step 5 — runs DIC in background, shows live progress."""
 
     def __init__(self, wizard: "Wizard") -> None:
         super().__init__()
@@ -86,7 +86,7 @@ class AnalysisPage(QWidget):
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(20, 0, 20, 0)
 
-        self._title = QLabel("Step 4  ·  Running Analysis")
+        self._title = QLabel("Step 5  ·  Running Analysis")
         self._title.setStyleSheet(f"color:{_C_TEXT}; font-size:13px; font-weight:600;")
         top_lay.addWidget(self._title)
         top_lay.addStretch()
