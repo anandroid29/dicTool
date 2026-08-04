@@ -12,11 +12,15 @@ from src.ui.theme import STYLESHEET
 from src.ui.components import WizardStepper
 from src.ui.pages.welcome_page import WelcomePage
 from src.ui.pages.roi_page import ROIPage
+from src.ui.pages.dynamic_roi_page import DynamicROIPage
 from src.ui.pages.params_page import ParamsPage
 from src.ui.pages.analysis_page import AnalysisPage
 from src.ui.pages.results_page import ResultsPage
 
-_STEPS = ["Import", "ROI", "Parameters", "Analysis", "Results"]
+# Dynamic ROI sits between the static ROI and the numeric parameters: it is a
+# masking decision, so it belongs with the other masking step rather than as a
+# bare dropdown among the solver settings.
+_STEPS = ["Import", "ROI", "Dynamic ROI", "Parameters", "Analysis", "Results"]
 
 
 class Wizard(QMainWindow):
@@ -36,6 +40,41 @@ class Wizard(QMainWindow):
 
         self.setStyleSheet(STYLESHEET)
         self._build_ui()
+        # Settings repairs used to be a console print the user never saw, while
+        # the stored value had been quietly producing bad results. Surface them.
+        QTimer.singleShot(400, self._show_settings_notices)
+
+    def _show_settings_notices(self) -> None:
+        notices = getattr(self.analysis, "settings_notices", None)
+        if not notices:
+            return
+        from PyQt6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Saved settings adjusted")
+        box.setText("Some saved settings could not be used as stored and have "
+                    "been corrected:")
+        box.setInformativeText("\n\n".join(f"•  {n}" for n in notices))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+        notices.clear()
+
+    def dynamic_roi_enabled(self) -> bool:
+        return getattr(self.analysis.params, "dynamic_roi", "None") not in ("None", None, "")
+
+    def go_after_roi(self) -> None:
+        """Forward from the ROI step, skipping dynamic ROI when it is off."""
+        if self.dynamic_roi_enabled():
+            self.go_dynamic_roi()
+        else:
+            self.go_params()
+
+    def go_before_params(self) -> None:
+        """Back from the parameters step, skipping dynamic ROI when it is off."""
+        if self.dynamic_roi_enabled():
+            self.go_dynamic_roi()
+        else:
+            self.go_roi()
 
     def _build_ui(self) -> None:
         container = QWidget()
@@ -51,11 +90,12 @@ class Wizard(QMainWindow):
         self._stack = QStackedWidget()
         self._welcome = WelcomePage(self)
         self._roi = ROIPage(self)
+        self._dynroi = DynamicROIPage(self)
         self._params = ParamsPage(self)
         self._analysis = AnalysisPage(self)
         self._results = ResultsPage(self)
 
-        for page in (self._welcome, self._roi, self._params,
+        for page in (self._welcome, self._roi, self._dynroi, self._params,
                      self._analysis, self._results):
             self._stack.addWidget(page)
 
@@ -96,7 +136,7 @@ class Wizard(QMainWindow):
             pass
         self.analysis = DICAnalysis()
         self.seed_xy = None
-        for page in (self._welcome, self._roi, self._params,
+        for page in (self._welcome, self._roi, self._dynroi, self._params,
                      self._analysis, self._results):
             for hook in ("reset_markers", "on_before_show", "reset_page"):
                 fn = getattr(page, hook, None)
@@ -113,14 +153,17 @@ class Wizard(QMainWindow):
     def go_roi(self) -> None:
         self._go(1, self._roi)
 
+    def go_dynamic_roi(self) -> None:
+        self._go(2, self._dynroi)
+
     def go_params(self) -> None:
-        self._go(2, self._params)
+        self._go(3, self._params)
 
     def go_analysis(self) -> None:
-        self._go(3, self._analysis)
+        self._go(4, self._analysis)
 
     def go_results(self) -> None:
-        self._go(4, self._results)
+        self._go(5, self._results)
 
     def closeEvent(self, event) -> None:
         self.analysis.cancel()

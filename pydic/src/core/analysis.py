@@ -28,6 +28,21 @@ except ImportError:
 from .rg_dic import DICParams, DICResult, run_rg_dic
 from .strain_accum import StrainAccumulator, total_strain
 from .roi_loader import load_roi_mask
+from .units import Calibration
+
+
+# Native (uncalibrated) unit of each exportable field, used to label exports.
+# Kept beside the data rather than in the UI so a headless export says the same
+# thing the results view does.
+_FIELD_BASE_UNIT = {
+    "u": "px", "v": "px",
+    "Vx": "px/s", "Vy": "px/s", "Veff": "px/s",
+    "Exx": "", "Exy": "", "Eyy": "", "Eeff": "",
+    "Exx_rate": "1/s", "Exy_rate": "1/s", "Eyy_rate": "1/s", "Eeff_rate": "1/s",
+    "dVx_dx": "1/s", "dVx_dy": "1/s", "dVy_dx": "1/s", "dVy_dy": "1/s",
+    "du_dx": "", "du_dy": "", "dv_dx": "", "dv_dy": "",
+    "corr": "ZNSSD",
+}
 
 
 @dataclass
@@ -74,13 +89,46 @@ class DICAnalysis:
         self.params:  DICParams      = DICParams()
         self.results: List[PairResult] = []
         self.fps: float = 1.0
+        # Spatial calibration. Uncalibrated by default: the solver is pixel-native
+        # and stays that way -- this only affects how results are presented.
+        self.calibration: Calibration = Calibration()
         self._cancel: list = [False]
+
+        # Human-readable notes about anything load_settings had to correct. The
+        # console print alone was too easy to miss -- a silently repaired
+        # setting is exactly the kind of thing that should be surfaced, since
+        # the stored value was producing bad results. The UI drains this once at
+        # startup.
+        self.settings_notices: List[str] = []
+        # Cleared if the settings file exists but cannot be parsed, which blocks
+        # save_settings from overwriting it with defaults.
+        self._settings_readable: bool = True
+
+        # Operator overrides for the dynamic ROI, in reference-frame coordinates.
+        # Arrays, so they live here rather than in the JSON-serialised params.
+        self.dynamic_include_mask: Optional[np.ndarray] = None
+        self.dynamic_exclude_mask: Optional[np.ndarray] = None
 
         self.last_video_directory: str = os.path.expanduser("~")
         self.last_image_directory: str = os.path.expanduser("~")
         self.last_hdf5_directory: str = os.path.expanduser("~")
 
         self.load_settings()
+
+    def make_dynamic_roi(self) -> "DynamicROI":
+        """Build the dynamic ROI from params + operator overrides.
+
+        Single construction point so the CPU and GPU paths cannot drift apart
+        in how they interpret the threshold and include/exclude masks.
+        """
+        return DynamicROI(
+            self.params.dynamic_roi,
+            keep_min_area_frac=getattr(self.params, "dynamic_roi_min_area_frac", 0.02),
+            threshold=getattr(self.params, "dynamic_roi_threshold", None),
+            include_mask=self.dynamic_include_mask,
+            exclude_mask=self.dynamic_exclude_mask,
+            roi_mask=self._roi_mask,
+        )
 
     def set_reference(self, path: str) -> None:
         self.ref_path = path
@@ -158,7 +206,7 @@ class DICAnalysis:
         # threshold on every image, so "enough texture to correlate" drifted
         # frame to frame and the mask edge flickered -- see DynamicROI's
         # docstring, which the GPU path already follows.
-        dyn_roi = DynamicROI(self.params.dynamic_roi)
+        dyn_roi = self.make_dynamic_roi()
         dyn_roi.calibrate(ref)
 
         for i, def_path in enumerate(self.def_paths):
@@ -306,7 +354,7 @@ class DICAnalysis:
         total_dv_dx = None; total_dv_dy = None
         prev_image = self._ref_image  # first reference is frame 0
         accum = None
-        dyn_roi = DynamicROI(self.params.dynamic_roi)
+        dyn_roi = self.make_dynamic_roi()
         dyn_roi.calibrate(self._ref_image)
 
         H_img, W_img = self._ref_image.shape
@@ -712,10 +760,21 @@ class DICAnalysis:
                   "Vx", "Vy", "Veff",
                   "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
                   "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate", "corr")
+        # CSV is a one-way export, so write the values as displayed and state the
+        # unit in the header. (HDF5 is different: it must round-trip, so it keeps
+        # raw pixels plus the calibration as metadata.) With no calibration set
+        # this is byte-identical to the old behaviour.
         for name in fields:
             arr = getattr(res, name, None)
-            if arr is not None:
-                np.savetxt(os.path.join(directory, f"{base}_{name}.csv"), arr, delimiter=",")
+            if arr is None:
+                continue
+            base_unit = _FIELD_BASE_UNIT.get(name, "")
+            out, unit = self.calibration.convert(name, arr, base_unit)
+            header = f"{name} [{unit}]" if unit else name
+            if self.calibration.calibrated:
+                header += f"  ({self.calibration.describe()})"
+            np.savetxt(os.path.join(directory, f"{base}_{name}.csv"), out,
+                       delimiter=",", header=header)
 
     def export_hdf5(self, path: str, progress_cb: Optional[Callable[[float], None]] = None) -> None:
         import h5py
@@ -727,6 +786,13 @@ class DICAnalysis:
                 subset_spacing=self.params.subset_spacing,
                 strain_window=self.params.strain_window,
                 fps=self.fps,
+                # Datasets stay in the solver's native pixel units so a file
+                # round-trips exactly; the calibration rides along as metadata
+                # and is what the viewer applies on display.
+                metres_per_pixel=(self.calibration.metres_per_pixel
+                                  if self.calibration.calibrated else 0.0),
+                display_unit=self.calibration.display_unit,
+                length_units="pixels",
             ))
 
             # 2. Save the ROI Mask (CRITICAL FIX)
@@ -775,6 +841,11 @@ class DICAnalysis:
             self.params.strain_window = int(f.attrs.get("strain_window", self.params.strain_window))
             self.fps = float(f.attrs.get("fps", 1.0))
 
+            mpp = float(f.attrs.get("metres_per_pixel", 0.0) or 0.0)
+            self.calibration = Calibration(
+                mpp if mpp > 0 else None,
+                str(f.attrs.get("display_unit", "mm")))
+
             # 2. Restore the ROI Mask (CRITICAL FIX)
             if "roi_mask" in f:
                 self._roi_mask = f["roi_mask"][:].astype(bool)
@@ -819,7 +890,14 @@ class DICAnalysis:
 
         if os.path.exists(path):
             try:
-                with open(path, "r") as f:
+                # utf-8-sig, not the platform default. A settings file carrying a
+                # UTF-8 BOM (anything that has touched it from PowerShell, an
+                # editor, or a sync tool) otherwise raised JSONDecodeError, the
+                # except branch below quietly kept the defaults, and the next
+                # save_settings() wrote those defaults straight over the user's
+                # real values. A read failure must never be able to destroy the
+                # file -- see the guard in the handler.
+                with open(path, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
 
                 # Settings written before the tolerance/cutoff semantics changed
@@ -831,11 +909,18 @@ class DICAnalysis:
                 stale = int(data.get("schema_version", 1)) < SCHEMA
                 DROP_ON_MIGRATE = {"conv_tol", "corr_cutoff"}
                 migrated = []
+                if "calibration" in data:
+                    self.calibration = Calibration.from_dict(data.get("calibration"))
+
                 for k, v in data.items():
-                    if k == "schema_version":
+                    if k in ("schema_version", "calibration"):
                         continue
                     if stale and k in DROP_ON_MIGRATE:
                         migrated.append(k)
+                        self.settings_notices.append(
+                            f"“{k}” was written under older semantics and has been "
+                            f"reset to the current default "
+                            f"({getattr(self.params, k, '?')}).")
                         continue
                     if hasattr(self.params, k):
                         setattr(self.params, k, v)
@@ -854,6 +939,10 @@ class DICAnalysis:
                           f"range [{CONV_TOL_MIN:g}, {CONV_TOL_MAX:g}]; using {clamped:g}.")
                     self.params.conv_tol = clamped
                     migrated.append("conv_tol")
+                    self.settings_notices.append(
+                        f"Convergence tolerance was {ct:g} px, which no subset can "
+                        f"ever reach — every one ran the full iteration budget. "
+                        f"Raised to {clamped:g} px.")
 
                 if migrated:
                     print(f"[Settings] Migrated to schema {SCHEMA}; reset to new "
@@ -867,13 +956,28 @@ class DICAnalysis:
                         setattr(self, d, data[d])
 
             except Exception as e:
+                # Do NOT let a later save overwrite a file we could not read.
+                # Failing to parse means the user's real settings are still in
+                # there; silently replacing them with defaults turns a recoverable
+                # read problem into permanent data loss.
+                self._settings_readable = False
                 print(f"[Warning] Failed to load settings: {e}")
+                self.settings_notices.append(
+                    f"Your settings file could not be read ({e}). Defaults are in "
+                    f"use for this session and the file has been left untouched: "
+                    f"{path}")
         else:
             self.save_settings()
 
     def save_settings(self) -> None:
         import json, os
         path = self._get_settings_path()
+
+        # Refuse to write over a file we failed to parse -- the values in it are
+        # the user's, and defaults would clobber them irrecoverably.
+        if not getattr(self, "_settings_readable", True):
+            print(f"[Settings] Not overwriting unreadable settings file: {path}")
+            return
 
         try:
             data = {
@@ -886,6 +990,9 @@ class DICAnalysis:
                 "corr_cutoff": self.params.corr_cutoff,
                 "search_radius": self.params.search_radius,
                 "dynamic_roi": getattr(self.params, "dynamic_roi", "None"),
+                "dynamic_roi_threshold": getattr(self.params, "dynamic_roi_threshold", None),
+                "dynamic_roi_min_area_frac": getattr(self.params, "dynamic_roi_min_area_frac", 0.02),
+                "calibration": self.calibration.to_dict(),
                 "shape_order": getattr(self.params, "shape_order", 1),
                 "mask_subsets_to_roi": getattr(self.params, "mask_subsets_to_roi", True),
 
@@ -931,11 +1038,33 @@ class DynamicROI:
     frame 500 as in frame 1.
     """
 
-    def __init__(self, method: str, keep_min_area_frac: float = 0.02):
+    def __init__(self, method: str, keep_min_area_frac: float = 0.02,
+                 threshold: Optional[float] = None,
+                 include_mask: Optional[np.ndarray] = None,
+                 exclude_mask: Optional[np.ndarray] = None,
+                 roi_mask: Optional[np.ndarray] = None):
         self.method = method
         self.keep_min_area_frac = keep_min_area_frac
+        # The static ROI the operator drew. The dynamic mask REFINES that region
+        # rather than competing with it: nothing outside it is ever kept, and --
+        # just as importantly -- the threshold is calibrated only from pixels
+        # inside it. Calibrating over the whole frame let background and tooling
+        # dominate the statistics, so the threshold that came back described the
+        # scene rather than the specimen.
+        self.roi_mask = None if roi_mask is None else roi_mask.astype(bool)
+        # Normalised texture threshold in [0, 1]. None means "pick it with Otsu
+        # on the reference frame", which is the old behaviour and stays the
+        # default; the dynamic-ROI editor sets it explicitly when the user
+        # drags the slider.
+        self.threshold = threshold
+        # Hard user overrides, in REFERENCE-frame coordinates. include wins over
+        # exclude wins over the texture metric, so a region the operator marked
+        # is never silently reinterpreted frame to frame.
+        self.include_mask = include_mask
+        self.exclude_mask = exclude_mask
         self.scale = None
         self.thresh = None
+        self.auto_thresh = None
         self.enabled = method not in ("None", None) and _HAVE_CV2
         if method not in ("None", None) and not _HAVE_CV2:
             print("[Warning] cv2 not available for dynamic ROI. Ignoring.")
@@ -970,23 +1099,53 @@ class DynamicROI:
         if m is None:
             self.enabled = False
             return
-        self.scale = float(np.percentile(m, 99.0)) or 1.0
-        m8 = np.clip(m / self.scale * 255.0, 0, 255).astype(np.uint8)
-        m8 = cv2.GaussianBlur(m8, (5, 5), 0)
-        thr, _ = cv2.threshold(m8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        self.thresh = float(thr)
+        # Scale and Otsu threshold from ROI pixels only -- see roi_mask above.
+        sel = m[self.roi_mask] if (self.roi_mask is not None and self.roi_mask.any()) else m
+        self.scale = float(np.percentile(sel, 99.0)) or 1.0
+        m8 = self._metric8(ref_image, m)
+        sel8 = m8[self.roi_mask] if (self.roi_mask is not None and self.roi_mask.any()) else m8
+        thr, _ = cv2.threshold(sel8.reshape(-1, 1), 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        self.auto_thresh = float(thr)
+        self.thresh = (self.auto_thresh if self.threshold is None
+                       else float(np.clip(self.threshold, 0.0, 1.0)) * 255.0)
+
+    def _metric8(self, img: np.ndarray, m: Optional[np.ndarray] = None):
+        """Texture metric rescaled to uint8 against the calibrated scale."""
+        if m is None:
+            m = self._metric(img)
+        if m is None:
+            return None
+        s = self.scale if self.scale else (float(np.percentile(m, 99.0)) or 1.0)
+        m8 = np.clip(m / s * 255.0, 0, 255).astype(np.uint8)
+        return cv2.GaussianBlur(m8, (5, 5), 0)
+
+    # ---- helpers for the dynamic-ROI editor -------------------------------
+    def metric_normalised(self, img: np.ndarray) -> Optional[np.ndarray]:
+        """The texture metric as a 0..1 image, for preview and histogramming."""
+        m8 = self._metric8(img)
+        return None if m8 is None else m8.astype(np.float64) / 255.0
+
+    def auto_threshold_normalised(self) -> Optional[float]:
+        return None if self.auto_thresh is None else self.auto_thresh / 255.0
 
     def mask(self, cur_image: np.ndarray) -> Optional[np.ndarray]:
         if not self.enabled:
             return None
         if self.thresh is None:
             self.calibrate(cur_image)
-        m = self._metric(cur_image)
-        if m is None:
+        m8 = self._metric8(cur_image)
+        if m8 is None:
             return None
-        m8 = np.clip(m / self.scale * 255.0, 0, 255).astype(np.uint8)
-        m8 = cv2.GaussianBlur(m8, (5, 5), 0)
         mask = (m8 >= self.thresh).astype(np.uint8) * 255
+
+        # Operator overrides are applied BEFORE the morphology and
+        # connected-component steps so that a hand-included region takes part in
+        # closing and cannot be discarded as a too-small component.
+        if self.exclude_mask is not None:
+            mask[self.exclude_mask] = 0
+        if self.include_mask is not None:
+            mask[self.include_mask] = 255
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -997,16 +1156,24 @@ class DynamicROI:
         # of them outright, and which one is "largest" can flip between frames.
         n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
         if n_lab <= 1:
-            return mask > 0
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        min_area = self.keep_min_area_frac * float(areas.max())
-        keep = np.zeros(n_lab, bool)
-        keep[1:] = areas >= min_area
-        return keep[labels]
+            out = mask > 0
+        else:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            min_area = self.keep_min_area_frac * float(areas.max())
+            keep = np.zeros(n_lab, bool)
+            keep[1:] = areas >= min_area
+            out = keep[labels]
+
+        # Never extend past the static ROI. Morphological closing dilates the
+        # mask, so without this the dynamic result could spill outside the
+        # region the operator actually drew.
+        if self.roi_mask is not None:
+            out = out & self.roi_mask
+        return out
 
 
-def _compute_dynamic_mask(cur_image: np.ndarray, method: str) -> Optional[np.ndarray]:
-    """Backward-compatible single-shot wrapper (calibrates on the frame given)."""
-    roi = DynamicROI(method)
-    roi.calibrate(cur_image)
-    return roi.mask(cur_image)
+# The old _compute_dynamic_mask() wrapper is gone. It recalibrated scale and
+# threshold on whichever frame it was handed, which is precisely the per-frame
+# drift DynamicROI exists to avoid, and it had no way to receive the static ROI
+# or the operator's include/exclude regions. Build the object through
+# DICAnalysis.make_dynamic_roi() and calibrate it once on the reference frame.

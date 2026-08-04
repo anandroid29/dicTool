@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFrame, QToolButton, QButtonGroup,
-    QSizePolicy, QFileDialog, QMessageBox,
+    QSizePolicy, QFileDialog, QMessageBox, QComboBox,
 )
 from src.ui.components import FooterButton
 
@@ -185,6 +185,26 @@ class ROIPage(QWidget):
 
         foot_lay.addStretch()
 
+        # Dynamic ROI is chosen here, next to the static ROI it refines, so the
+        # answer is known before we decide whether the tuning step is even
+        # needed. "None" skips that step entirely.
+        dyn_lbl = QLabel("Dynamic ROI")
+        dyn_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        foot_lay.addWidget(dyn_lbl)
+
+        self._cb_dynamic = QComboBox()
+        self._cb_dynamic.addItems(["None", "Contrast", "Edge Detection", "Hybrid"])
+        self._cb_dynamic.setFixedWidth(134)
+        self._cb_dynamic.setToolTip(
+            "Per-frame texture masking, applied INSIDE the ROI you drew.\n"
+            "Useful for cutting experiments where material leaves the field.\n\n"
+            "Anything other than None adds a tuning step where you can set the\n"
+            "threshold and force regions in or out by hand.")
+        self._cb_dynamic.currentTextChanged.connect(self._on_dynamic_changed)
+        foot_lay.addWidget(self._cb_dynamic)
+
+        foot_lay.addSpacing(18)
+
         self._seed_status = QLabel("No seed — will default to ROI centroid")
         self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
         foot_lay.addWidget(self._seed_status)
@@ -196,14 +216,28 @@ class ROIPage(QWidget):
         self._next_btn.setFixedHeight(36)
         self._next_btn.setMinimumWidth(150)
         self._next_btn.setEnabled(False)
-        self._next_btn.clicked.connect(self._wizard.go_params)
+        self._next_btn.clicked.connect(self._wizard.go_after_roi)
         foot_lay.addWidget(self._next_btn)
 
         root.addWidget(footer)
 
     # ------------------------------------------------------------------
+    def _on_dynamic_changed(self, text: str) -> None:
+        self._wizard.analysis.params.dynamic_roi = text
+        self._next_btn.setText("Dynamic ROI  →" if text not in ("None", "")
+                               else "Parameters  →")
+
+    def _sync_dynamic_combo(self) -> None:
+        cur = getattr(self._wizard.analysis.params, "dynamic_roi", "None") or "None"
+        self._cb_dynamic.blockSignals(True)
+        self._cb_dynamic.setCurrentText(cur)
+        self._cb_dynamic.blockSignals(False)
+        self._next_btn.setText("Dynamic ROI  →" if cur not in ("None", "")
+                               else "Parameters  →")
+
     def on_enter(self) -> None:
         """Called by wizard when this page becomes visible."""
+        self._sync_dynamic_combo()
         img = self._wizard.analysis.reference_image
         if img is not None:
             # Only set the image if it's new so we don't reset the user's pan/zoom

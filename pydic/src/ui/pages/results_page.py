@@ -1,5 +1,5 @@
 """
-results_page.py — Step 5: Results viewer with correct frame synchronisation.
+results_page.py — Step 6: Results viewer with correct frame synchronisation.
 
 Critical fix: every time the temporal scrubber moves to frame N, we:
   1. Load the actual deformed image for frame N and set it as the canvas background
@@ -19,8 +19,10 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QSpinBox, QToolButton, QProgressDialog, QProgressBar,
-    QListWidget, QListWidgetItem, QGroupBox, QGridLayout,
+    QListWidget, QListWidgetItem, QGroupBox, QGridLayout, QDoubleSpinBox,
 )
+
+from src.core.units import LENGTH_UNIT_ORDER
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
@@ -66,9 +68,46 @@ FIELDS = {
     "Eeff": ("Effective Strain", "ε"),
 }
 
-CMAPS = ["inferno","magma","plasma","cividis","hot","afmhot",
-         "gist_heat","copper","RdBu_r","seismic","bwr","coolwarm",
-         "viridis","turbo","jet","gray"]
+# Field families, in the order they appear in the category dropdown. Only the
+# members of the selected family get a button in the toolbar.
+FIELD_GROUPS = {
+    "Displacement": ["u", "v"],
+    "Velocity":     ["Vx", "Vy", "Veff"],
+    "Strain rate":  ["Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate"],
+    "Strain":       ["Exx", "Exy", "Eyy", "Eeff"],
+}
+
+# Short button captions, now that the family is named by the dropdown.
+_FIELD_SHORT = {
+    "u": "u", "v": "v",
+    "Vx": "Vx", "Vy": "Vy", "Veff": "eff",
+    "Exx_rate": "Ėxx", "Exy_rate": "Ėxy", "Eyy_rate": "Ėyy", "Eeff_rate": "Ėeff",
+    "Exx": "Exx", "Exy": "Exy", "Eyy": "Eyy", "Eeff": "Eeff",
+}
+
+
+def _field_short(key: str) -> str:
+    return _FIELD_SHORT.get(key, key)
+
+
+def _group_of(field: str) -> str:
+    for g, keys in FIELD_GROUPS.items():
+        if field in keys:
+            return g
+    return next(iter(FIELD_GROUPS))
+
+
+# FEA-style rainbow ramps first: blue (low) through cyan/green/yellow to red
+# (high) is the contour convention every ANSYS/Abaqus user reads instinctively.
+# turbo is the default rather than jet -- same blue-to-red identity, but without
+# jet's false banding at cyan/yellow, which invents contour edges that are not in
+# the data. jet is kept immediately below for matching legacy figures exactly.
+CMAPS = ["turbo","jet","rainbow","nipy_spectral",
+         "RdBu_r","seismic","bwr","coolwarm",
+         "viridis","inferno","magma","plasma","cividis",
+         "hot","afmhot","gist_heat","copper","gray"]
+
+DEFAULT_CMAP = "turbo"
 
 
 class ExportWorker(QThread):
@@ -133,7 +172,7 @@ class _ColorBar(QWidget):
 
 
 class ResultsPage(QWidget):
-    """Step 5 — results viewer with correct frame-by-frame image updates."""
+    """Step 6 — results viewer with correct frame-by-frame image updates."""
 
     def __init__(self, wizard: "Wizard") -> None:
         super().__init__()
@@ -170,11 +209,22 @@ class ResultsPage(QWidget):
 
         top_lay.addSpacing(12)
 
-        # Field selector tabs
+        # Field selector: a category dropdown plus a short row of buttons for
+        # the members of that category. All 13 fields used to sit in this bar as
+        # individual buttons, which together with the marker, trail and colormap
+        # controls left the row overflowing.
+        self._cat_combo = QComboBox()
+        self._cat_combo.addItems(list(FIELD_GROUPS.keys()))
+        self._cat_combo.setFixedWidth(132)
+        self._cat_combo.setToolTip("Which family of results to display.")
+        self._cat_combo.currentTextChanged.connect(self._select_category)
+        top_lay.addWidget(self._cat_combo)
+        top_lay.addSpacing(6)
+
         self._field_btns: dict[str, QToolButton] = {}
         for key, (label, _) in FIELDS.items():
             btn = QToolButton()
-            btn.setText(key.replace("_rate", "̇ ").replace("_", " "))
+            btn.setText(_field_short(key))
             btn.setToolTip(label)
             btn.setCheckable(True)
             btn.setChecked(key == self._field)
@@ -183,6 +233,10 @@ class ResultsPage(QWidget):
             self._field_btns[key] = btn
 
         self._apply_tab_style()
+        self._cat_combo.blockSignals(True)
+        self._cat_combo.setCurrentText(_group_of(self._field))
+        self._cat_combo.blockSignals(False)
+        self._sync_field_buttons()
 
         # ─── PROMINENT STREAKLINES BLOCK (Just after Eff) ───
         top_lay.addSpacing(12)
@@ -260,7 +314,7 @@ class ResultsPage(QWidget):
 
         self._cmap_combo = QComboBox()
         self._cmap_combo.addItems(CMAPS)
-        self._cmap_combo.setCurrentText("inferno")
+        self._cmap_combo.setCurrentText(DEFAULT_CMAP)
         self._cmap_combo.setFixedWidth(100)
         self._cmap_combo.currentTextChanged.connect(self._refresh_overlay)
         top_lay.addWidget(self._cmap_combo)
@@ -463,7 +517,64 @@ class ResultsPage(QWidget):
         )
         bot_lay.addWidget(self._fps_spin)
 
+        # ── Scale: pixel size and the unit to report in ───────────────
+        # Placed here next to frame rate: together they are the two physical
+        # calibrations (space and time) that turn pixel results into engineering
+        # quantities, and both can be set after the fact without re-running.
+        bot_lay.addSpacing(16)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet(f"background:{_C_BORDER}; max-width:1px;")
+        bot_lay.addWidget(sep)
+        bot_lay.addSpacing(16)
+
+        scale_lbl = QLabel("1 px =")
+        scale_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        scale_lbl.setToolTip(
+            "Physical size of one pixel. Set this and displacements and\n"
+            "velocities are reported in real units instead of pixels.\n"
+            "Strain and strain rate are ratios and never change.")
+        bot_lay.addWidget(scale_lbl)
+
+        self._px_size_spin = QDoubleSpinBox()
+        self._px_size_spin.setDecimals(6)
+        self._px_size_spin.setRange(0.0, 1e9)
+        self._px_size_spin.setValue(0.0)
+        self._px_size_spin.setSpecialValueText("— none —")
+        self._px_size_spin.setFixedWidth(104)
+        self._px_size_spin.setToolTip("0 leaves results in pixels.")
+        self._px_size_spin.valueChanged.connect(self._on_calibration_changed)
+        bot_lay.addWidget(self._px_size_spin)
+
+        self._unit_combo = QComboBox()
+        self._unit_combo.addItems(LENGTH_UNIT_ORDER)
+        self._unit_combo.setCurrentText("mm")
+        self._unit_combo.setFixedWidth(66)
+        self._unit_combo.currentTextChanged.connect(self._on_calibration_changed)
+        bot_lay.addWidget(self._unit_combo)
+
         root.addWidget(bottom)
+
+    def _on_calibration_changed(self, *_):
+        if getattr(self, "_syncing_calibration", False):
+            return
+        from src.core.units import Calibration
+        unit = self._unit_combo.currentText()
+        val = float(self._px_size_spin.value())
+        self._wizard.analysis.calibration = (
+            Calibration.from_pixel_size(val, unit) if val > 0 else Calibration(None, unit))
+        try:
+            self._wizard.analysis.save_settings()
+        except Exception:
+            pass
+        self._refresh_overlay()
+
+    def _sync_calibration_controls(self) -> None:
+        cal = self._wizard.analysis.calibration
+        self._syncing_calibration = True
+        self._unit_combo.setCurrentText(cal.display_unit)
+        self._px_size_spin.setValue(cal.pixel_size_in(cal.display_unit) or 0.0)
+        self._syncing_calibration = False
 
     # ------------------------------------------------------------------
     # Public API — called by wizard
@@ -603,6 +714,7 @@ class ResultsPage(QWidget):
         # they are meaningless for a new sequence.
         self._canvas.clear_markers()
         self._marker_list.clear()
+        self._sync_calibration_controls()
         self._slider.setMaximum(max(0, n - 1))
         self._slider.setValue(0)
         self._frame = 0
@@ -649,7 +761,7 @@ class ResultsPage(QWidget):
 
         # 2. ── Render field overlay ──────────────────────────────────
         result = analysis.results[idx]
-        arr = getattr(result, self._field, None)
+        arr, _ = self._display_array(result)
         if arr is not None and np.any(np.isfinite(arr)):
             # _apply_overlay internally checks if static_scale_chk is enabled
             self._apply_overlay(arr)
@@ -670,6 +782,11 @@ class ResultsPage(QWidget):
         """
         if getattr(self, '_static_scale_chk', False) and self._static_scale_chk.isChecked():
             vmin, vmax = self._wizard.analysis.get_global_range(self._field)
+            # get_global_range works on the stored (pixel) arrays; `arr` arrives
+            # already converted, so the fixed scale has to be converted too or
+            # the colourbar and the image disagree.
+            factor, _ = self._unit_factor()
+            vmin, vmax = vmin * factor, vmax * factor
         else:
             valid_mask = np.isfinite(arr)
             if not valid_mask.any():
@@ -744,17 +861,37 @@ class ResultsPage(QWidget):
             print(f"Overlay error: {exc}")
             self._canvas.set_result_overlay_rgba(None)
 
+    # ------------------------------------------------------------------
+    # Physical units
+    # ------------------------------------------------------------------
+    # Results are computed and stored in pixels. Everything the user reads --
+    # overlay range, colourbar, statistics -- goes through this one conversion
+    # so the number and its unit can never disagree.
+
+    def _unit_factor(self) -> tuple:
+        cal = self._wizard.analysis.calibration
+        base = FIELDS.get(self._field, ("", ""))[1]
+        return cal.factor_and_unit(self._field, base)
+
+    def _display_array(self, result):
+        """The selected field in display units, plus its unit label."""
+        arr = getattr(result, self._field, None)
+        factor, unit = self._unit_factor()
+        if arr is None or factor == 1.0:
+            return arr, unit
+        return arr * factor, unit
+
     def _update_colorbar(self, cmap, vmin, vmax):
         n_bar = 64
         bar_colors = []
         for i in range(n_bar):
             r, g, b, _ = cmap(i / (n_bar - 1))
             bar_colors.append((int(r * 255), int(g * 255), int(b * 255)))
-        unit = FIELDS.get(self._field, ("", ""))[1]
+        _, unit = self._unit_factor()
         self._colorbar.update_bar(vmin, vmax, unit, bar_colors)
 
     def _update_stats(self, result) -> None:
-        arr = getattr(result, self._field, None)
+        arr, unit = self._display_array(result)
         if arr is None:
             for v in self._stat_labels.values():
                 v.setText("—")
@@ -766,10 +903,11 @@ class ResultsPage(QWidget):
                 v.setText("—")
             return
 
-        self._stat_labels["Mean"].setText(f"{valid.mean():.4g}")
-        self._stat_labels["Std Dev"].setText(f"{valid.std():.4g}")
-        self._stat_labels["Min"].setText(f"{valid.min():.4g}")
-        self._stat_labels["Max"].setText(f"{valid.max():.4g}")
+        suffix = f" {unit}" if unit else ""
+        self._stat_labels["Mean"].setText(f"{valid.mean():.4g}{suffix}")
+        self._stat_labels["Std Dev"].setText(f"{valid.std():.4g}{suffix}")
+        self._stat_labels["Min"].setText(f"{valid.min():.4g}{suffix}")
+        self._stat_labels["Max"].setText(f"{valid.max():.4g}{suffix}")
         self._stat_labels["Valid px"].setText(f"{valid.size:,}")
 
     # ------------------------------------------------------------------
@@ -780,10 +918,29 @@ class ResultsPage(QWidget):
         self._frame = val
         self._show_frame(val)
 
+    def _sync_field_buttons(self) -> None:
+        """Show only the buttons belonging to the selected category."""
+        visible = set(FIELD_GROUPS.get(self._cat_combo.currentText(), []))
+        for k, btn in self._field_btns.items():
+            btn.setVisible(k in visible)
+            btn.setChecked(k == self._field)
+
+    def _select_category(self, name: str) -> None:
+        keys = FIELD_GROUPS.get(name, [])
+        if keys and self._field not in keys:
+            self._field = keys[0]
+        self._sync_field_buttons()
+        self._apply_tab_style()
+        self._refresh_overlay()
+
     def _select_field(self, key: str) -> None:
         self._field = key
-        for k, btn in self._field_btns.items():
-            btn.setChecked(k == key)
+        grp = _group_of(key)
+        if self._cat_combo.currentText() != grp:
+            self._cat_combo.blockSignals(True)
+            self._cat_combo.setCurrentText(grp)
+            self._cat_combo.blockSignals(False)
+        self._sync_field_buttons()
         self._apply_tab_style()
         self._refresh_overlay()
 

@@ -28,6 +28,16 @@ try:
 except ImportError:
     _HAS_CUPY = False
 
+# Cubic B-spline prefiltering runs once per frame over the WHOLE image. Doing it
+# with scipy meant a full-resolution CPU pass plus a host->device copy on every
+# frame, on the critical path of an otherwise GPU-resident pipeline. CuPy has
+# the same filter; fall back to scipy only if this CuPy build lacks it.
+try:
+    from cupyx.scipy.ndimage import spline_filter as _cp_spline_filter
+    _HAS_CP_SPLINE = _HAS_CUPY
+except ImportError:
+    _HAS_CP_SPLINE = False
+
 DEBUG_BATCHES = False
 
 
@@ -37,10 +47,27 @@ class GPUWavefrontDIC:
             raise RuntimeError("CuPy is required for GPU execution.")
         self.params = params
         self._initialized = False
+        self._warned_cpu_spline = False
 
         self.state = None
         self.p_global = None
         self.cls_global = None
+
+    def _spline_coeff(self, img: np.ndarray) -> "cp.ndarray":
+        """Cubic B-spline coefficients of `img`, computed on the GPU when possible."""
+        if _HAS_CP_SPLINE:
+            try:
+                gpu_img = cp.asarray(img, dtype=cp.float64)
+                return _cp_spline_filter(gpu_img, order=3, output=cp.float64, mode='mirror')
+            except Exception as e:
+                if not self._warned_cpu_spline:
+                    print(f"[GPU] CuPy spline_filter unavailable ({e}); "
+                          f"falling back to the scipy CPU path.")
+                    self._warned_cpu_spline = True
+        return cp.asarray(
+            scipy.ndimage.spline_filter(np.asarray(img, dtype=np.float64),
+                                        order=3, mode='mirror'),
+            dtype=cp.float64)
 
     def precompute_reference(self, ref_image: np.ndarray, roi_mask: np.ndarray):
         self.H, self.W = ref_image.shape
@@ -58,9 +85,7 @@ class GPUWavefrontDIC:
         self.valid_mask = roi_mask[self.gy_flat, self.gx_flat]
         self.N_total = len(self.gx_flat)
 
-        ref_f64 = ref_image.astype(np.float64)
-        ref_coeff_cpu = scipy.ndimage.spline_filter(ref_f64, order=3, mode='mirror')
-        self.ref_coeff = cp.asarray(ref_coeff_cpu, dtype=cp.float64)
+        self.ref_coeff = self._spline_coeff(ref_image)
 
         dy_sub, dx_sub = np.mgrid[-self.r:self.r+1, -self.r:self.r+1]
         mask_sub = (dx_sub**2 + dy_sub**2) <= self.r**2
@@ -77,18 +102,22 @@ class GPUWavefrontDIC:
         """Update reference B-spline coefficients for Updated Lagrangian tracking.
         Grid geometry and subset offsets are unchanged — only the reference
         intensity data is replaced with the new (previous) frame."""
-        ref_f64 = new_ref_image.astype(np.float64)
-        ref_coeff_cpu = scipy.ndimage.spline_filter(ref_f64, order=3, mode='mirror')
-        self.ref_coeff = cp.asarray(ref_coeff_cpu, dtype=cp.float64)
+        self.ref_coeff = self._spline_coeff(new_ref_image)
+
+    def _out_of_bounds(self, xs: "cp.ndarray", ys: "cp.ndarray") -> "cp.ndarray":
+        """Per-subset flag: does any pixel of this subset fall outside the image?
+
+        Half-pixel margins match the CPU solver's test in icgn.run_icgn.
+        """
+        return ((xs.min(axis=1) < -0.5) | (xs.max(axis=1) > self.W - 0.5) |
+                (ys.min(axis=1) < -0.5) | (ys.max(axis=1) > self.H - 0.5))
 
     def solve_frame(self, cur_image: np.ndarray, seed_idx: int = -1, seed_p: np.ndarray = None, warm_start: bool = False, total_u: np.ndarray = None, total_v: np.ndarray = None):
         if not self._initialized:
             raise RuntimeError("Must precompute reference before solving frames.")
 
-        cur_f64 = cur_image.astype(np.float64)
-        cur_coeff_cpu = scipy.ndimage.spline_filter(cur_f64, order=3, mode='mirror')
-        cur_coeff = cp.asarray(cur_coeff_cpu, dtype=cp.float64)
-        cur_gpu = cp.asarray(cur_f64, dtype=cp.float64)
+        cur_coeff = self._spline_coeff(cur_image)
+        cur_gpu = cp.asarray(np.asarray(cur_image, dtype=np.float64), dtype=cp.float64)
 
         if not warm_start:
             self.state = cp.zeros(self.N_total, dtype=cp.int8)
@@ -161,6 +190,18 @@ class GPUWavefrontDIC:
             ref_xs_act = gx_act[:, None] + u_ref_act[:, None] + self.dx_sub[None, :]
             ref_ys_act = gy_act[:, None] + v_ref_act[:, None] + self.dy_sub[None, :]
 
+            # Every map_coordinates call here uses mode='mirror', which does not
+            # fail on out-of-range coordinates -- it REFLECTS the image and
+            # returns fabricated intensities. A subset tracking material that
+            # has left the frame therefore keeps correlating, against a mirror
+            # image of the interior, and can score well enough to be accepted.
+            # Its affine terms are then meaningless, and because Eeff is a
+            # monotonically increasing path integral those bogus increments are
+            # summed in permanently -- which is why strain skyrockets exactly
+            # where material exits the frame. The CPU solver has always
+            # rejected this (run_icgn's bounds test); the GPU never did.
+            ref_oob = self._out_of_bounds(ref_xs_act, ref_ys_act)
+
             coords_ref = cp.stack([ref_ys_act.ravel(), ref_xs_act.ravel()], axis=0)
 
             f = map_coordinates(self.ref_coeff, coords_ref, order=3, mode='mirror', prefilter=False).reshape(N_act, self.N_px)
@@ -208,23 +249,66 @@ class GPUWavefrontDIC:
             # +/-12 px window around a correct guess reliably contains false
             # minima. It now only rescues subsets whose propagated guess is
             # already poor, and leaves good guesses alone.
-            def _znssd_at(shift_x, shift_y, rows=None):
-                if rows is None:
-                    xs_b, ys_b, p_b, fn = ref_xs_act, ref_ys_act, p_act, f_norm_act
-                else:
-                    xs_b, ys_b = ref_xs_act[rows], ref_ys_act[rows]
-                    p_b, fn = p_act[rows], f_norm_act[rows]
-                x_t = xs_b + p_b[:, 0:1] + shift_x
-                y_t = ys_b + p_b[:, 1:2] + shift_y
-                c = cp.stack([y_t.ravel(), x_t.ravel()], axis=0)
-                gt = map_coordinates(cur_gpu, c, order=1, mode='mirror',
-                                     prefilter=False).reshape(len(p_b), self.N_px)
-                gtc = gt - gt.mean(axis=1, keepdims=True)
-                gtn = gtc / cp.maximum(cp.sqrt((gtc ** 2).sum(axis=1, keepdims=True)), 1e-12)
-                return ((gtn - fn) ** 2).sum(axis=1)
+            def _znssd_grid(rows, base_u, base_v, dxs, dys, mask_oob=True):
+                """Best integer shift per row over the offsets (dxs, dys).
+
+                Every (row, shift) pair is evaluated in batched GPU work rather
+                than one kernel launch per shift, which is what made a wide
+                search unaffordable before. Returns (score, du, dv) per row.
+                """
+                XS = ref_xs_act if rows is None else ref_xs_act[rows]
+                YS = ref_ys_act if rows is None else ref_ys_act[rows]
+                FN = f_norm_act if rows is None else f_norm_act[rows]
+                n = XS.shape[0]
+                best_s = cp.full(n, cp.inf, dtype=cp.float64)
+                best_du = cp.zeros(n, dtype=cp.float64)
+                best_dv = cp.zeros(n, dtype=cp.float64)
+                if n == 0 or len(dxs) == 0:
+                    return best_s, best_du, best_dv
+
+                # Keep each batch's temporaries near a fixed element budget so a
+                # large rescue set cannot blow up device memory.
+                budget = 8_000_000
+                k_max = max(1, int(budget // max(1, n * self.N_px)))
+                for s0 in range(0, len(dxs), k_max):
+                    dxc = cp.asarray(dxs[s0:s0 + k_max], dtype=cp.float64)
+                    dyc = cp.asarray(dys[s0:s0 + k_max], dtype=cp.float64)
+                    k = int(dxc.size)
+                    xt = XS[None] + (base_u[None, :] + dxc[:, None])[:, :, None]
+                    yt = YS[None] + (base_v[None, :] + dyc[:, None])[:, :, None]
+                    c = cp.stack([yt.ravel(), xt.ravel()], axis=0)
+                    gt = map_coordinates(cur_gpu, c, order=1, mode='mirror',
+                                         prefilter=False).reshape(k, n, self.N_px)
+                    gtc = gt - gt.mean(axis=2, keepdims=True)
+                    gtn = gtc / cp.maximum(
+                        cp.sqrt((gtc ** 2).sum(axis=2, keepdims=True)), 1e-12)
+                    sc = ((gtn - FN[None]) ** 2).sum(axis=2)          # (k, n)
+                    if mask_oob:
+                        # A candidate shift that pushes the subset off the image
+                        # is scored as unusable, so the rescue cannot snap onto
+                        # mirrored data.
+                        oob = ((xt.min(axis=2) < -0.5) | (xt.max(axis=2) > self.W - 0.5) |
+                               (yt.min(axis=2) < -0.5) | (yt.max(axis=2) > self.H - 0.5))
+                        sc = cp.where(oob, cp.inf, sc)
+
+                    jb = cp.argmin(sc, axis=0)                        # (n,)
+                    sb = cp.take_along_axis(sc, jb[None, :], axis=0)[0]
+                    imp = sb < best_s
+                    best_s = cp.where(imp, sb, best_s)
+                    best_du = cp.where(imp, dxc[jb], best_du)
+                    best_dv = cp.where(imp, dyc[jb], best_dv)
+                return best_s, best_du, best_dv
 
             best_u, best_v = p_act[:, 0].copy(), p_act[:, 1].copy()
-            best_score = _znssd_at(0, 0)
+            # Scored WITHOUT the out-of-bounds substitution on purpose. This
+            # value only decides "is the current guess poor enough to search
+            # from". Scoring an already-off-frame guess as infinitely bad sends
+            # it into the rescue, which then finds some in-bounds speckle match
+            # and hands back a confident wrong answer -- measured at 49 such
+            # subsets on the off-frame regression, versus 0 when they are left
+            # alone to be rejected by the bounds test at acceptance time.
+            best_score, _, _ = _znssd_grid(None, p_act[:, 0], p_act[:, 1],
+                                           np.zeros(1), np.zeros(1), mask_oob=False)
 
             # Absolute ZNSSD quality bar for 'this guess is poor, go search'.
             # Must NOT be tied to corr_cutoff: that is an acceptance
@@ -233,19 +317,39 @@ class GPUWavefrontDIC:
             need = best_score > SEARCH_TRIGGER
             if bool(need.any()):
                 rows = cp.where(need)[0]
-                sr = int(max(4, min(12, self.params.search_radius // 4)))
-                shifts = np.arange(-sr, sr + 1)
-                sxg, syg = np.meshgrid(shifts, shifts)
-                for sx_shift, sy_shift in zip(sxg.ravel(), syg.ravel()):
-                    if sx_shift == 0 and sy_shift == 0:
-                        continue
-                    sc = _znssd_at(float(sx_shift), float(sy_shift), rows)
-                    imp = sc < best_score[rows]
-                    if bool(imp.any()):
-                        ridx = rows[imp]
-                        best_score[ridx] = sc[imp]
-                        best_u[ridx] = p_act[ridx, 0] + float(sx_shift)
-                        best_v[ridx] = p_act[ridx, 1] + float(sy_shift)
+
+                # Rescue radius is its own parameter, NOT a function of
+                # params.search_radius.
+                #
+                # search_radius sizes the NCC template search that seeds a
+                # frame; reusing it here reads as though it also widens this
+                # per-subset sweep, and it did feed a min(12, search_radius//4)
+                # expression that silently ignored anything above 48. Widening
+                # it is not the fix, though: measured on a synthetic pure
+                # translation, taking this sweep out to +/-50 made subsets lock
+                # onto false ZNSSD minima -- displacement error rose from 0.000
+                # to 236 px and spurious gradients appeared where the truth is
+                # exactly zero. Speckle is quasi-periodic, so a wide window
+                # reliably contains minima as deep as the true one, and nothing
+                # local can tell them apart.
+                #
+                # So the radius stays deliberately small and is now stated
+                # outright. Frame-scale motion is the NCC fallback's job, not
+                # this sweep's.
+                R = int(max(1, getattr(self.params, "rescue_radius", 12)))
+
+                base_u = p_act[rows, 0].copy()
+                base_v = p_act[rows, 1].copy()
+
+                g = np.arange(-R, R + 1, dtype=np.float64)
+                gxg, gyg = np.meshgrid(g, g)
+                s1, du1, dv1 = _znssd_grid(rows, base_u, base_v,
+                                           gxg.ravel(), gyg.ravel())
+
+                imp = s1 < best_score[rows]
+                best_score[rows] = cp.where(imp, s1, best_score[rows])
+                best_u[rows] = cp.where(imp, base_u + du1, base_u)
+                best_v[rows] = cp.where(imp, base_v + dv1, base_v)
 
             # --- Bug 3 Fix: Reset gradients when integer search shifts significantly ---
             # Only during wavefront propagation (not warm-start). In warm-start,
@@ -296,7 +400,11 @@ class GPUWavefrontDIC:
                 residual = g_norm - f_norm_act[mask_proc]
 
                 # Score the CURRENT parameters before stepping away from them.
+                # An iterate that has warped the subset off the image is scored
+                # as infinitely bad so it can never win the best-iterate test --
+                # its correlation is against mirrored, fabricated data.
                 cls_iter = (residual ** 2).sum(axis=1)
+                cls_iter = cp.where(self._out_of_bounds(x_prime, y_prime), cp.inf, cls_iter)
                 proc_rows = cp.where(mask_proc)[0]
                 imp = cls_iter < best_cls[proc_rows]
                 if bool(imp.any()):
@@ -369,9 +477,17 @@ class GPUWavefrontDIC:
             final_cls = ((g_norm - f_norm_act) ** 2).sum(axis=1)
             final_cls = cp.where(cp.isfinite(final_cls), final_cls, cp.inf)
 
+            final_cls = cp.where(self._out_of_bounds(x_prime, y_prime), cp.inf, final_cls)
+
             better = final_cls < best_cls
             cls_act = cp.where(better, final_cls, best_cls)
             p_act = cp.where(better[:, None], p_act, best_p)
+
+            # Re-test the parameters actually being returned: the winner of the
+            # best/final comparison may differ from either candidate tested above.
+            xw = ref_xs_act + p_act[:, 0:1] + p_act[:, 2:3]*self.dx_sub + p_act[:, 3:4]*self.dy_sub
+            yw = ref_ys_act + p_act[:, 1:2] + p_act[:, 4:5]*self.dx_sub + p_act[:, 5:6]*self.dy_sub
+            oob = ref_oob | self._out_of_bounds(xw, yw)
 
             # Relaxed the jump threshold to reduce erosion (was subset_spacing + 1, 5.0)
             cutoff_disp = float(max(self.params.subset_spacing * 1.5, 10.0))
@@ -384,13 +500,14 @@ class GPUWavefrontDIC:
             # `failed` only means "stopped iterating early" now. Whether the
             # subset is usable is decided by the correlation of the parameters
             # actually being returned, not by how the iteration ended.
-            accepted = ~mask_failed_cls & ~mask_failed_jump
+            accepted = ~mask_failed_cls & ~mask_failed_jump & ~oob
 
             if DEBUG_BATCHES:
                 print(f"\n[DEBUG] --- BATCH {batch_count} | Mode: {'Warm-Start' if warm_start else 'Wavefront'} ---")
                 print(f"[DEBUG] Processing {N_act} subsets. Accepted {int(accepted.sum().get())}. "
                       f"Rejections: {int(mask_failed_jump.sum().get())} Jump, "
-                      f"{int(mask_failed_cls.sum().get())} ZNSSD "
+                      f"{int(mask_failed_cls.sum().get())} ZNSSD, "
+                      f"{int(oob.sum().get())} off-frame "
                       f"({int(failed.sum().get())} stopped iterating early).")
                 sys.stdout.flush()
 
