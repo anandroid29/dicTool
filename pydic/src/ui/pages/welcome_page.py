@@ -495,6 +495,10 @@ class WelcomePage(QWidget):
                 return
             step, limit, roi_path, user_fps = dlg.get_settings()
             self._wizard.analysis.calibration = dlg.get_calibration()
+            # Persist immediately. Setting it here and relying on some later
+            # save meant a pixel size entered at import was lost if the session
+            # ended before anything else happened to write the settings.
+            self._wizard.analysis.save_settings()
         except Exception as e:
             QMessageBox.critical(self, "Dialog Error", f"Failed to open settings dialog:\n{e}")
             return

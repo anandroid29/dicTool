@@ -128,6 +128,7 @@ class DICAnalysis:
             include_mask=self.dynamic_include_mask,
             exclude_mask=self.dynamic_exclude_mask,
             roi_mask=self._roi_mask,
+            fill_holes=getattr(self.params, "dynamic_roi_fill_holes", True),
         )
 
     def set_reference(self, path: str) -> None:
@@ -882,6 +883,13 @@ class DICAnalysis:
 
     def _get_settings_path(self) -> str:
         import os
+        # PYDIC_SETTINGS_PATH lets a test (or a second instance) point at its own
+        # file. Relying on HOME/USERPROFILE for that is unreliable -- expanduser
+        # consults several variables in a platform-specific order, so a test can
+        # believe it is sandboxed and still write over the real settings.
+        override = os.environ.get("PYDIC_SETTINGS_PATH")
+        if override:
+            return override
         return os.path.join(os.path.expanduser("~"), ".pydic_settings.json")
 
     def load_settings(self) -> None:
@@ -992,6 +1000,7 @@ class DICAnalysis:
                 "dynamic_roi": getattr(self.params, "dynamic_roi", "None"),
                 "dynamic_roi_threshold": getattr(self.params, "dynamic_roi_threshold", None),
                 "dynamic_roi_min_area_frac": getattr(self.params, "dynamic_roi_min_area_frac", 0.02),
+                "dynamic_roi_fill_holes": getattr(self.params, "dynamic_roi_fill_holes", True),
                 "calibration": self.calibration.to_dict(),
                 "shape_order": getattr(self.params, "shape_order", 1),
                 "mask_subsets_to_roi": getattr(self.params, "mask_subsets_to_roi", True),
@@ -1042,9 +1051,17 @@ class DynamicROI:
                  threshold: Optional[float] = None,
                  include_mask: Optional[np.ndarray] = None,
                  exclude_mask: Optional[np.ndarray] = None,
-                 roi_mask: Optional[np.ndarray] = None):
+                 roi_mask: Optional[np.ndarray] = None,
+                 fill_holes: bool = True):
         self.method = method
         self.keep_min_area_frac = keep_min_area_frac
+        # Fill regions that the texture metric rejected but which are completely
+        # enclosed by kept material. A hole in the middle of valid material is
+        # almost always a local dropout -- a glare spot, a patch where the
+        # speckle is momentarily washed out -- not an absence of specimen, and
+        # leaving it out fragments the field for no physical reason. Morphological
+        # closing alone only ever fixed holes smaller than its kernel.
+        self.fill_holes = bool(fill_holes)
         # The static ROI the operator drew. The dynamic mask REFINES that region
         # rather than competing with it: nothing outside it is ever kept, and --
         # just as importantly -- the threshold is calibrated only from pixels
@@ -1164,11 +1181,38 @@ class DynamicROI:
             keep[1:] = areas >= min_area
             out = keep[labels]
 
-        # Never extend past the static ROI. Morphological closing dilates the
-        # mask, so without this the dynamic result could spill outside the
-        # region the operator actually drew.
+        # Clip to the static ROI before filling, so "enclosed" means enclosed
+        # within the region being analysed rather than within the whole frame.
         if self.roi_mask is not None:
             out = out & self.roi_mask
+
+        # Contour fill: anything fully surrounded by kept material becomes kept.
+        # Unlike the morphological close above, this has no size limit -- a hole
+        # is filled because it is enclosed, not because it is small.
+        if self.fill_holes and out.any():
+            from scipy.ndimage import binary_fill_holes
+            out = binary_fill_holes(out)
+            if self.roi_mask is not None:
+                out = out & self.roi_mask
+
+        # Re-apply the operator's decisions LAST. Setting them before morphology
+        # was not enough to make them stick, and both were being partly undone:
+        #
+        #   * closing is a dilate-then-erode, so it grew neighbouring kept
+        #     material back over the edge of an excluded region;
+        #   * component pruning deleted a force-included patch whenever it was
+        #     smaller than keep_min_area_frac of the largest region -- measured
+        #     at 0 of 900 px surviving, i.e. include did nothing at all.
+        #
+        # Doing it here also means an explicit Exclude beats the hole fill, which
+        # is the escape hatch when an enclosed gap is a genuine void rather than
+        # a texture dropout. Precedence: include > exclude > fill > metric.
+        if self.exclude_mask is not None:
+            out = out & ~self.exclude_mask
+        if self.include_mask is not None:
+            out = out | self.include_mask
+            if self.roi_mask is not None:
+                out = out & self.roi_mask
         return out
 
 

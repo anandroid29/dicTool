@@ -37,6 +37,10 @@ class DICParams:
     dynamic_roi_threshold: Optional[float] = None
     # Drop connected regions smaller than this fraction of the largest one.
     dynamic_roi_min_area_frac: float = 0.02
+    # Keep regions the texture metric rejected when they are fully enclosed by
+    # kept material -- a hole inside valid specimen is a local dropout, not a
+    # gap in the material.
+    dynamic_roi_fill_holes: bool = True
     # Restrict subset pixels to the ROI. Correct when the ROI outlines a
     # material boundary (specimen edge, hole, grip). Turn off when the ROI is
     # just a crop of a larger uniform speckle field, where the surrounding

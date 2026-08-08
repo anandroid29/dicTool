@@ -213,6 +213,34 @@ QCheckBox::indicator:checked {{
     border-color: {C_ACCENT};
 }}
 QCheckBox:hover {{ color: {C_TEXT}; }}
+QCheckBox:disabled {{ color: {C_TEXT3}; }}
+QCheckBox::indicator:disabled {{ border-color: {C_RAISED}; background: {C_BG}; }}
+
+/* QRadioButton had no rules at all, so radios fell back to the native widget
+   style and rendered as a pale slab against the dark theme. Same geometry as
+   the checkbox, round indicator, accent dot when selected. */
+QRadioButton {{
+    color: {C_TEXT2};
+    spacing: 6px;
+    padding: 1px 4px;
+}}
+QRadioButton::indicator {{
+    width: 14px; height: 14px;
+    border: 1px solid {C_BORDER};
+    border-radius: 8px;
+    background: {C_SURFACE};
+}}
+QRadioButton::indicator:hover {{ border-color: {C_ACCENT}; }}
+QRadioButton::indicator:checked {{
+    border-color: {C_ACCENT};
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.62, fx:0.5, fy:0.5,
+                stop:0 {C_ACCENT}, stop:0.55 {C_ACCENT},
+                stop:0.6 {C_SURFACE}, stop:1 {C_SURFACE});
+}}
+QRadioButton:checked {{ color: {C_TEXT}; font-weight: 600; }}
+QRadioButton:hover {{ color: {C_TEXT}; }}
+QRadioButton:disabled {{ color: {C_TEXT3}; }}
+QRadioButton::indicator:disabled {{ border-color: {C_RAISED}; background: {C_BG}; }}
 
 /* ── Progress bar ───────────────────────────────────────────────────── */
 QProgressBar {{

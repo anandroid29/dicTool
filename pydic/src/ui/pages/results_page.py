@@ -20,9 +20,12 @@ from PyQt6.QtWidgets import (
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QSpinBox, QToolButton, QProgressDialog, QProgressBar,
     QListWidget, QListWidgetItem, QGroupBox, QGridLayout, QDoubleSpinBox,
+    QRadioButton, QButtonGroup,
 )
 
 from src.core.units import LENGTH_UNIT_ORDER
+from src.ui import render
+from src.ui.render import RangeSpec
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
@@ -129,6 +132,35 @@ class ExportWorker(QThread):
             self.finished_export.emit(False, str(e))
 
 
+class _VideoWorker(QThread):
+    """Renders and writes the export off the GUI thread.
+
+    Safe to do here precisely because rendering is pure numpy/OpenCV -- no
+    QPixmap or QWidget is touched, so there is no thread-affinity problem.
+    """
+    progress = pyqtSignal(int)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, analysis, spec, path, markers, parent=None):
+        super().__init__(parent)
+        self._analysis = analysis
+        self._spec = spec
+        self._path = path
+        self._markers = list(markers or [])
+        self.cancel_flag = [False]
+
+    def run(self):
+        try:
+            from src.ui.video_export import export_video
+            out = export_video(
+                self._analysis, self._spec, self._path, markers=self._markers,
+                progress_cb=lambda f, _m: self.progress.emit(int(f * 100)),
+                cancel_flag=self.cancel_flag)
+            self.done.emit(True, out)
+        except Exception as e:
+            self.done.emit(False, str(e))
+
+
 class _ColorBar(QWidget):
     """A thin horizontal gradient bar with vmin/vmax labels."""
 
@@ -182,8 +214,24 @@ class ResultsPage(QWidget):
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(200)
         self._play_timer.timeout.connect(self._advance)
-        self._static_scale_chk = QCheckBox("Static Global Scale")
-        self._static_scale_chk.toggled.connect(lambda: self._show_frame(self._slider.value()))
+        # Colour-scale mode. Radio buttons, not checkboxes: the three are
+        # mutually exclusive, and as checkboxes they suggested combinations that
+        # do not exist (ticking both "Static" and "Range" only ever meant
+        # "Range"). Sym is a separate modifier and stays a checkbox.
+        self._scale_group = QButtonGroup(self)
+        self._scale_auto_rb = QRadioButton("Auto")
+        self._scale_global_rb = QRadioButton("Global")
+        self._scale_manual_rb = QRadioButton("Range")
+        for rb, tip in (
+            (self._scale_auto_rb, "Rescale to each frame's own min/max."),
+            (self._scale_global_rb, "Fix the scale to the min/max across the whole sequence."),
+            (self._scale_manual_rb, "Pin the scale to explicit limits, in the units\n"
+                                    "shown on the colourbar."),
+        ):
+            rb.setToolTip(tip)
+            self._scale_group.addButton(rb)
+        self._scale_auto_rb.setChecked(True)
+        self._scale_group.buttonToggled.connect(self._on_scale_mode_changed)
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -323,7 +371,33 @@ class ResultsPage(QWidget):
         self._sym_chk.setToolTip("Centre colormap around zero")
         self._sym_chk.stateChanged.connect(self._refresh_overlay)
         top_lay.addWidget(self._sym_chk)
-        top_lay.addWidget(self._static_scale_chk)
+
+        scale_lbl = QLabel("Scale:")
+        scale_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        top_lay.addWidget(scale_lbl)
+        for rb in (self._scale_auto_rb, self._scale_global_rb, self._scale_manual_rb):
+            top_lay.addWidget(rb)
+
+        self._range_min_spin = QDoubleSpinBox()
+        self._range_max_spin = QDoubleSpinBox()
+        for sb, tip in ((self._range_min_spin, "Lower colour limit"),
+                        (self._range_max_spin, "Upper colour limit")):
+            sb.setDecimals(6)
+            sb.setRange(-1e12, 1e12)
+            sb.setFixedWidth(96)
+            sb.setToolTip(tip)
+            sb.setEnabled(False)
+            sb.setKeyboardTracking(False)   # only fire on commit, not per digit
+            sb.valueChanged.connect(self._refresh_overlay)
+            top_lay.addWidget(sb)
+
+        self._range_fit_btn = QPushButton("Fit")
+        self._range_fit_btn.setFixedWidth(40)
+        self._range_fit_btn.setToolTip(
+            "Fill the limits from this frame's data, then keep them pinned.")
+        self._range_fit_btn.setEnabled(False)
+        self._range_fit_btn.clicked.connect(self._fit_range_to_frame)
+        top_lay.addWidget(self._range_fit_btn)
 
         root.addWidget(top)
 
@@ -439,7 +513,8 @@ class ResultsPage(QWidget):
         sb_lay.addWidget(self._marker_panel)
 
         for label, slot in [("CSV (this frame)", self._export_csv),
-                             ("HDF5 (all frames)", self._export_hdf5)]:
+                             ("HDF5 (all frames)", self._export_hdf5),
+                             ("Video / image sequence…", self._export_video)]:
             btn = QPushButton(label)
             btn.setFixedHeight(30)
             btn.clicked.connect(slot)
@@ -775,88 +850,108 @@ class ResultsPage(QWidget):
         self._update_stats(result)
         self._frame_lbl.setText(f"Frame {idx + 1} / {n}")
 
-    def _apply_overlay(self, arr: np.ndarray) -> None:
-        """
-        Professional Continuous Overlay using Fast Grid Resampling.
-        Synchronous execution (takes < 5ms).
-        """
-        if getattr(self, '_static_scale_chk', False) and self._static_scale_chk.isChecked():
-            vmin, vmax = self._wizard.analysis.get_global_range(self._field)
-            # get_global_range works on the stored (pixel) arrays; `arr` arrives
-            # already converted, so the fixed scale has to be converted too or
-            # the colourbar and the image disagree.
-            factor, _ = self._unit_factor()
-            vmin, vmax = vmin * factor, vmax * factor
-        else:
-            valid_mask = np.isfinite(arr)
-            if not valid_mask.any():
-                self._canvas.set_result_overlay_rgba(None)
-                return
-            values = arr[valid_mask]
-            vmin, vmax = float(values.min()), float(values.max())
+    def _on_scale_mode_changed(self, *_):
+        """Enable the manual boxes only in Range mode, then re-render once.
 
-        use_sym = getattr(self, '_sym_chk', False) and self._sym_chk.isChecked()
+        buttonToggled fires twice per change (off for the old button, on for the
+        new one), so act only on the checked signal or every switch renders the
+        frame twice.
+        """
+        if len(_) >= 2 and _[1] is False:
+            return
+        manual = self._scale_manual_rb.isChecked()
+        for w in (self._range_min_spin, self._range_max_spin, self._range_fit_btn):
+            w.setEnabled(manual)
+        if manual and self._range_min_spin.value() == self._range_max_spin.value():
+            # Seed from what is on screen rather than making the user guess.
+            self._fit_range_to_frame()
+        else:
+            self._refresh_overlay()
+
+    def _fit_range_to_frame(self) -> None:
+        """Load the current frame's actual limits into the manual boxes."""
+        results = self._wizard.analysis.results
+        if not results:
+            return
+        idx = max(0, min(self._frame, len(results) - 1))
+        arr, _ = self._display_array(results[idx])
+        if arr is None:
+            return
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return
+        vals = arr[finite]
+        blocked = (self._range_min_spin.blockSignals(True),
+                   self._range_max_spin.blockSignals(True))
+        self._range_min_spin.setValue(float(vals.min()))
+        self._range_max_spin.setValue(float(vals.max()))
+        self._range_min_spin.blockSignals(False)
+        self._range_max_spin.blockSignals(False)
+        self._refresh_overlay()
+
+    def _update_range_placeholders(self, vmin: float, vmax: float) -> None:
+        """Keep the disabled boxes showing the range actually in use.
+
+        Ticking Range then starts from what you were already looking at instead
+        of from zero.
+        """
+        if self._scale_manual_rb.isChecked():
+            return
+        for sb, v in ((self._range_min_spin, vmin), (self._range_max_spin, vmax)):
+            sb.blockSignals(True)
+            sb.setValue(float(v))
+            sb.blockSignals(False)
+
+    def current_range_spec(self) -> "RangeSpec":
+        """How the colour limits are currently chosen.
+
+        Manual wins over the static global scale, which wins over per-frame
+        auto. Manual limits are read in DISPLAY units because that is what the
+        colourbar is labelled with and therefore what the user typed against.
+        """
+        mode = "auto"
+        vmin = vmax = None
+        if self._scale_manual_rb.isChecked():
+            mode = "manual"
+            vmin, vmax = self._range_min_spin.value(), self._range_max_spin.value()
+        elif self._scale_global_rb.isChecked():
+            mode = "global"
+        return RangeSpec(mode=mode, vmin=vmin, vmax=vmax,
+                         symmetric=self._sym_chk.isChecked())
+
+    def _apply_overlay(self, arr: np.ndarray) -> None:
+        """Colour-map the selected field onto the canvas.
+
+        The pixel work lives in ui/render.py so that the video exporter renders
+        through exactly the same code and the two can never drift apart.
+        """
+        analysis = self._wizard.analysis
+        spec = self.current_range_spec()
+
+        # get_global_range works on the stored (pixel) arrays, but `arr` arrives
+        # already converted, so the fixed scale has to be converted too or the
+        # colourbar and the image disagree.
+        global_rng = None
+        if spec.mode == "global":
+            factor, _ = self._unit_factor()
+            lo, hi = analysis.get_global_range(self._field)
+            global_rng = (lo * factor, hi * factor)
+
+        rng = spec.resolve(arr, global_rng)
+        if rng is None:
+            self._canvas.set_result_overlay_rgba(None)
+            return
+        vmin, vmax = rng
         cmap_name = self._cmap_combo.currentText()
-        roi_mask = self._wizard.analysis.roi_mask
-        spacing = self._wizard.analysis.params.subset_spacing
 
         try:
-            import cv2
-            import matplotlib.cm as cm
-            import matplotlib.colors as mc
-            from scipy.ndimage import gaussian_filter
-            from scipy.interpolate import griddata
-
-            valid_mask = np.isfinite(arr)
-            ys, xs = np.where(valid_mask)
-            ymin, ymax = ys.min(), ys.max()
-            xmin, xmax = xs.min(), xs.max()
-
-            cropped_arr = arr[ymin:ymax+1, xmin:xmax+1].copy()
-            cropped_mask = valid_mask[ymin:ymax+1, xmin:xmax+1]
-
-            s = max(1, spacing)
-            small_arr = cropped_arr[0::s, 0::s]
-            small_mask = cropped_mask[0::s, 0::s]
-
-            if not small_mask.all():
-                sys, sxs = np.where(small_mask)
-                svals = small_arr[small_mask]
-                grid_y, grid_x = np.mgrid[0:small_arr.shape[0], 0:small_arr.shape[1]]
-                small_arr = griddata((sys, sxs), svals, (grid_y, grid_x), method='nearest')
-                small_arr = np.nan_to_num(small_arr)
-
-            if vmin == vmax: vmax = vmin + 1e-12
-            if use_sym:
-                lim = max(abs(vmin), abs(vmax))
-                vmin, vmax = -lim, lim
-
-            norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
-            cmap_obj = cm.get_cmap(cmap_name, 256)
-
-            rgba_small = cmap_obj(norm(small_arr), bytes=True).astype(np.float32)
-            rgba_small[..., :3] = np.clip(0.5 + (rgba_small[..., :3] / 255.0 - 0.5) * 1.35, 0.0, 1.0) * 255.0
-            rgba_small[..., 3] = 195.0
-
-            # Mask out the dynamic ROI holes on the dense small grid BEFORE interpolation
-            rgba_small[~small_mask, 3] = 0.0
-
-            target_h, target_w = ymax - ymin + 1, xmax - xmin + 1
-            rgba_crop_large = cv2.resize(rgba_small, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-
-            rgba_full = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.float32)
-            rgba_full[ymin:ymax+1, xmin:xmax+1] = rgba_crop_large
-
-            # Apply the static ROI mask to the alpha channel
-            if roi_mask is not None:
-                rgba_full[~roi_mask, 3] = 0.0
-
-            rgba_full[..., 3] = gaussian_filter(rgba_full[..., 3], sigma=0.5)
-            safe_rgba = np.ascontiguousarray(rgba_full.astype(np.uint8))
-
-            self._canvas.set_result_overlay_rgba(safe_rgba)
-            self._update_colorbar(cmap_obj, vmin, vmax)
-
+            rgba = render.field_to_rgba(
+                arr, vmin, vmax, cmap_name,
+                roi_mask=analysis.roi_mask,
+                spacing=analysis.params.subset_spacing)
+            self._canvas.set_result_overlay_rgba(rgba)
+            self._update_colorbar(render.get_cmap(cmap_name, 256), vmin, vmax)
+            self._update_range_placeholders(vmin, vmax)
         except Exception as exc:
             print(f"Overlay error: {exc}")
             self._canvas.set_result_overlay_rgba(None)
@@ -980,6 +1075,64 @@ class ResultsPage(QWidget):
             QMessageBox.information(self, "Exported", f"CSV files saved to:\n{directory}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
+
+    def _export_video(self) -> None:
+        analysis = self._wizard.analysis
+        if not analysis.results:
+            QMessageBox.warning(self, "Nothing to export", "Run an analysis first.")
+            return
+
+        from src.ui.pages.video_export_dialog import VideoExportDialog
+        from src.ui.video_export import CODECS, export_video
+
+        dlg = VideoExportDialog(FIELDS, CMAPS, len(analysis.results),
+                                self._field, self._cmap_combo.currentText(),
+                                fps=float(self._fps_spin.value()), parent=self)
+        # Carry the on-screen colour range into panel 1 so "export what I'm
+        # looking at" is the default rather than something to reconstruct.
+        rng = self.current_range_spec()
+        if dlg._editors:
+            e = dlg._editors[0]
+            i = e.range_mode.findData(rng.mode)
+            if i >= 0:
+                e.range_mode.setCurrentIndex(i)
+            if rng.vmin is not None:
+                e.vmin.setValue(rng.vmin)
+                e.vmax.setValue(rng.vmax)
+            e.symmetric.setChecked(rng.symmetric)
+
+        if dlg.exec() == 0:
+            return
+        spec = dlg.spec()
+
+        ext = CODECS.get(spec.codec, (".mp4", None))[0]
+        start = getattr(analysis, "last_hdf5_directory", os.path.expanduser("~"))
+        default = os.path.join(start, "dic_view" + (".png" if spec.writes_sequence else ext))
+        path, _ = QFileDialog.getSaveFileName(self, "Export video", default,
+                                              f"*{ext}")
+        if not path:
+            return
+
+        self._export_progress.show()
+        self._export_progress.setValue(0)
+        self._export_progress.setFormat("Rendering… %p%")
+        markers = self._canvas.markers()
+        trail = self._trail_combo.currentData() or 0
+        spec.trail = trail
+
+        self._video_worker = _VideoWorker(analysis, spec, path, markers, self)
+        self._video_worker.progress.connect(self._export_progress.setValue)
+        self._video_worker.done.connect(self._on_video_done)
+        self._video_worker.start()
+
+    def _on_video_done(self, ok: bool, msg: str) -> None:
+        self._export_progress.setValue(100 if ok else 0)
+        self._export_progress.setFormat("Video export complete" if ok else "Video export failed ✗")
+        QTimer.singleShot(2500, self._export_progress.hide)
+        if ok:
+            QMessageBox.information(self, "Exported", f"Written to:\n{msg}")
+        else:
+            QMessageBox.warning(self, "Export Error", msg)
 
     def _export_hdf5(self) -> None:
         # Use shared memory directory
