@@ -165,6 +165,17 @@ class DynamicROIPage(QWidget):
         arow.addStretch()
         lay.addLayout(arow)
 
+        self._fill_chk = QCheckBox("Fill enclosed holes")
+        self._fill_chk.setChecked(True)
+        self._fill_chk.setToolTip(
+            "Keep a region the texture metric rejected when it is completely\n"
+            "surrounded by kept material — a glare spot or washed-out patch\n"
+            "inside the specimen is a local dropout, not a gap in the material.\n\n"
+            "No size limit: a hole is filled because it is enclosed, not because\n"
+            "it is small. Use Exclude to override it where a gap is genuine.")
+        self._fill_chk.toggled.connect(self._on_threshold_changed)
+        lay.addWidget(self._fill_chk)
+
         lay.addWidget(self._sep())
 
         # -- manual overrides --
@@ -253,6 +264,7 @@ class DynamicROIPage(QWidget):
         if thr is not None:
             self._slider.setValue(int(round(float(thr) * 100)))
         self._area_spin.setValue(float(getattr(a.params, "dynamic_roi_min_area_frac", 0.02)))
+        self._fill_chk.setChecked(bool(getattr(a.params, "dynamic_roi_fill_holes", True)))
         self._updating = False
 
         self._set_channel(self._channel)
@@ -322,6 +334,7 @@ class DynamicROIPage(QWidget):
         a.params.dynamic_roi_threshold = (
             None if self._auto_chk.isChecked() else self._slider.value() / 100.0)
         a.params.dynamic_roi_min_area_frac = float(self._area_spin.value())
+        a.params.dynamic_roi_fill_holes = bool(self._fill_chk.isChecked())
 
         # Overrides only mean anything inside the static ROI, so clip them to it
         # rather than storing regions the solver will discard.
