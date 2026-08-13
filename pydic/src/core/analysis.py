@@ -36,6 +36,7 @@ from .units import Calibration
 # thing the results view does.
 _FIELD_BASE_UNIT = {
     "u": "px", "v": "px",
+    "u_inc": "px", "v_inc": "px", "mag_inc": "px",
     "Vx": "px/s", "Vy": "px/s", "Veff": "px/s",
     "Exx": "", "Exy": "", "Eyy": "", "Eeff": "",
     "Exx_rate": "1/s", "Exy_rate": "1/s", "Eyy_rate": "1/s", "Eeff_rate": "1/s",
@@ -59,6 +60,13 @@ class PairResult:
     dv_dx: np.ndarray
     dv_dy: np.ndarray
     corr:  np.ndarray
+    # Frame-to-frame displacement: how far each material point moved since the
+    # PREVIOUS frame, as opposed to u/v which accumulate from the reference.
+    # Both are Lagrangian -- indexed by reference-frame material point -- so the
+    # increment is a plain difference at matching indices.
+    u_inc:   Optional[np.ndarray] = None
+    v_inc:   Optional[np.ndarray] = None
+    mag_inc: Optional[np.ndarray] = None
     Vx:    Optional[np.ndarray] = None
     Vy:    Optional[np.ndarray] = None
     Veff:  Optional[np.ndarray] = None
@@ -287,6 +295,7 @@ class DICAnalysis:
             ))
 
         if not self._cancel[0] and self.results:
+            self._compute_incremental_displacements()
             self._compute_velocities_and_rates(progress_cb)
 
         if progress_cb:
@@ -508,10 +517,48 @@ class DICAnalysis:
             ))
 
         if not self._cancel[0] and self.results:
+            self._compute_incremental_displacements()
             self._compute_velocities_and_rates(progress_cb)
 
         if progress_cb:
             progress_cb(1.0, "Complete.")
+
+    def _compute_incremental_displacements(self) -> None:
+        """Per-frame displacement increments, u_inc[i] = u[i] - u[i-1].
+
+        u/v accumulate against the fixed reference, so at frame 900 they report
+        the whole history rather than what happened between frames 899 and 900.
+        Both fields index the same reference-frame material points, which is what
+        makes the plain difference the correct material increment.
+
+        Frame 0 has no predecessor: its increment is its own displacement from
+        the reference, which is exactly the reference -> frame-0 step.
+
+        A point needs valid data at BOTH ends for its increment to mean anything.
+        Where it does not, the increment is NaN rather than a difference taken
+        against a frozen or missing value.
+        """
+        def _val(r) -> np.ndarray:
+            m = np.isfinite(r.u) & np.isfinite(r.v)
+            return (m & r.valid) if r.valid is not None else m
+
+        prev = None
+        prev_val = None
+        for res in self.results:
+            here_val = _val(res)
+            if prev is None:
+                u_i = np.where(here_val, res.u, np.nan)
+                v_i = np.where(here_val, res.v, np.nan)
+            else:
+                both = here_val & prev_val
+                u_i = np.where(both, res.u - prev.u, np.nan)
+                v_i = np.where(both, res.v - prev.v, np.nan)
+
+            res.u_inc, res.v_inc = u_i, v_i
+            with np.errstate(invalid="ignore"):
+                res.mag_inc = np.sqrt(u_i ** 2 + v_i ** 2)
+
+            prev, prev_val = res, here_val
 
     def _compute_velocities_and_rates(self, progress_cb: Optional[Callable[[float, str], None]] = None) -> None:
         N = len(self.results)
@@ -743,6 +790,120 @@ class DICAnalysis:
                         "seed": (float(sx), float(sy))})
         return out
 
+    # ------------------------------------------------------------------
+    # Frame-pair analysis
+    # ------------------------------------------------------------------
+    # A "pair" is two frames (i, j) treated as one measurement interval. Every
+    # quantity below is derived from that interval alone, so several pairs drawn
+    # from different parts of a sequence can be averaged into one field.
+    #
+    # Cumulative strain is deliberately absent. Exx/Eyy/Exy/Eeff measure total
+    # deformation since the reference, so they carry the whole history before
+    # the pair even begins -- averaging them across pairs would average that
+    # shared history, not the pairs. Rates and displacements are interval
+    # quantities and average correctly.
+
+    PAIR_FIELDS = ("u", "v", "u_inc", "v_inc", "mag_inc",
+                   "Vx", "Vy", "Veff",
+                   "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+                   "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate")
+
+    def pair_interval(self, i: int, j: int) -> float:
+        """Elapsed time between two frames, in seconds."""
+        return abs(j - i) / max(self.fps, 1e-9)
+
+    def pair_kinematics(self, i: int, j: int) -> "PairResult":
+        """Displacement, velocity and strain rate between frames i and j.
+
+        u/v and u_inc/v_inc both carry the pair's own displacement: an isolated
+        interval has no "cumulative" value distinct from its own increment.
+        """
+        n = len(self.results)
+        if not (0 <= i < n and 0 <= j < n):
+            raise IndexError(f"Frame pair ({i}, {j}) out of range 0..{n - 1}")
+        if i == j:
+            raise ValueError("A frame pair needs two different frames.")
+        if j < i:
+            i, j = j, i
+
+        a, b = self.results[i], self.results[j]
+
+        def _val(r):
+            m = np.isfinite(r.u) & np.isfinite(r.v)
+            return (m & r.valid) if r.valid is not None else m
+
+        ok = _val(a) & _val(b)
+        du = np.where(ok, b.u - a.u, np.nan)
+        dv = np.where(ok, b.v - a.v, np.nan)
+        with np.errstate(invalid="ignore"):
+            mag = np.sqrt(du ** 2 + dv ** 2)
+
+        dt = self.pair_interval(i, j)
+        Vx, Vy = du / dt, dv / dt
+        with np.errstate(invalid="ignore"):
+            Veff = np.sqrt(Vx ** 2 + Vy ** 2)
+
+        # Rates come from this pair's own mean velocity field, so they describe
+        # the interval rather than borrowing a neighbouring frame's derivative.
+        from .strain import compute_velocity_strains
+        roi = self._roi_mask if self._roi_mask is not None else np.ones(du.shape, dtype=bool)
+        rate_valid = roi & np.isfinite(Vx) & np.isfinite(Vy)
+        rates = compute_velocity_strains(
+            Vx, Vy, rate_valid, self.params.effective_strain_window())
+
+        nan = np.full(du.shape, np.nan)
+        return PairResult(
+            image_path=f"pair {i + 1}→{j + 1}",
+            u=du, v=dv,
+            u_inc=du, v_inc=dv, mag_inc=mag,
+            Exx=nan.copy(), Exy=nan.copy(), Eyy=nan.copy(), Eeff=nan.copy(),
+            du_dx=nan.copy(), du_dy=nan.copy(),
+            dv_dx=nan.copy(), dv_dy=nan.copy(),
+            corr=np.where(ok, b.corr, np.nan),
+            Vx=Vx, Vy=Vy, Veff=Veff,
+            dVx_dx=rates["dVx_dx"], dVx_dy=rates["dVx_dy"],
+            dVy_dx=rates["dVy_dx"], dVy_dy=rates["dVy_dy"],
+            Exx_rate=rates["Exx_rate"], Exy_rate=rates["Exy_rate"],
+            Eyy_rate=rates["Eyy_rate"], Eeff_rate=rates["Eeff_rate"],
+            valid=ok, elapsed=dt,
+        )
+
+    def average_pairs(self, pairs) -> "PairResult":
+        """Element-wise mean across several frame pairs.
+
+        Averaging ignores NaN per pixel, so a point that dropped out during one
+        pair still contributes through the pairs where it was tracked. A point
+        present in no pair stays NaN rather than becoming zero.
+        """
+        pairs = [tuple(p) for p in pairs]
+        if not pairs:
+            raise ValueError("Select at least one frame pair.")
+
+        per_pair = [self.pair_kinematics(i, j) for i, j in pairs]
+
+        out = per_pair[0]
+        if len(per_pair) > 1:
+            for name in self.PAIR_FIELDS:
+                stack = [getattr(p, name) for p in per_pair]
+                stack = [s for s in stack if s is not None]
+                if not stack:
+                    continue
+                with np.errstate(invalid="ignore"):
+                    # all-NaN pixels warn under plain nanmean; they are expected
+                    # here and must stay NaN.
+                    arr = np.stack(stack)
+                    counts = np.sum(np.isfinite(arr), axis=0)
+                    summed = np.nansum(arr, axis=0)
+                    mean = np.where(counts > 0, summed / np.maximum(counts, 1), np.nan)
+                setattr(out, name, mean)
+            out.valid = np.any(np.stack([p.valid for p in per_pair]), axis=0)
+            out.elapsed = float(np.mean([p.elapsed for p in per_pair]))
+
+        label = ", ".join(f"{i + 1}→{j + 1}" for i, j in pairs)
+        out.image_path = (f"average of {len(pairs)} pairs [{label}]"
+                          if len(pairs) > 1 else f"pair {label}")
+        return out
+
     def get_global_range(self, field: str) -> tuple[float, float]:
         vmin, vmax = float('inf'), float('-inf')
         for res in self.results:
@@ -754,10 +915,20 @@ class DICAnalysis:
                     vmax = max(vmax, float(valid.max()))
         return (vmin, vmax) if vmin != float('inf') else (0.0, 1.0)
 
-    def export_csv(self, result_index: int, directory: str) -> None:
-        res = self.results[result_index]
+    def export_csv(self, result_index, directory: str) -> None:
+        """Write the selected frame's fields as CSV.
+
+        Accepts a frame index or a PairResult directly, so a frame-pair average
+        exports through exactly the same path as a single frame.
+        """
+        res = (self.results[result_index] if isinstance(result_index, (int, np.integer))
+               else result_index)
         base = os.path.splitext(os.path.basename(res.image_path))[0]
-        fields = ("u", "v", "Exx", "Exy", "Eyy", "Eeff",
+        # Pair labels ("average of 3 pairs [1→2, ...]") are not filenames.
+        base = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in base).strip("_")
+        base = base or "export"
+        fields = ("u", "v", "u_inc", "v_inc", "mag_inc",
+                  "Exx", "Exy", "Eyy", "Eeff",
                   "Vx", "Vy", "Veff",
                   "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
                   "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate", "corr")
@@ -768,6 +939,12 @@ class DICAnalysis:
         for name in fields:
             arr = getattr(res, name, None)
             if arr is None:
+                continue
+            # A field with nothing finite in it has no data to export. This is
+            # how cumulative strain is skipped for a frame-pair average, where
+            # it is deliberately undefined -- writing a grid of "nan" would
+            # read as a failed measurement rather than an excluded one.
+            if arr.size == 0 or not np.any(np.isfinite(arr)):
                 continue
             base_unit = _FIELD_BASE_UNIT.get(name, "")
             out, unit = self.calibration.convert(name, arr, base_unit)
@@ -812,7 +989,8 @@ class DICAnalysis:
                 g = f.create_group(f"frame_{i:04d}")
                 g.attrs["image_path"] = res.image_path
                 g.attrs["elapsed_s"] = res.elapsed
-                fields = ("u", "v", "Exx", "Exy", "Eyy", "Eeff",
+                fields = ("u", "v", "u_inc", "v_inc", "mag_inc",
+                          "Exx", "Exy", "Eyy", "Eeff",
                           "Vx", "Vy", "Veff",
                           "du_dx", "du_dy", "dv_dx", "dv_dy",
                           "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
@@ -874,12 +1052,19 @@ class DICAnalysis:
                     corr=g["corr"][:] if "corr" in g else np.zeros(0),
                     elapsed=float(g.attrs.get("elapsed_s", 0.0))
                 )
-                extra_fields = ("Vx", "Vy", "Veff", "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+                extra_fields = ("u_inc", "v_inc", "mag_inc",
+                                "Vx", "Vy", "Veff", "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
                                 "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate")
                 for rate in extra_fields:
                     if rate in g:
                         setattr(res, rate, g[rate][:])
                 self.results.append(res)
+
+        # Files written before incremental displacement existed carry only the
+        # cumulative fields. Deriving them here costs one subtraction per frame
+        # and spares the user a full re-run to see the new view.
+        if self.results and any(r.u_inc is None for r in self.results):
+            self._compute_incremental_displacements()
 
     def _get_settings_path(self) -> str:
         import os
