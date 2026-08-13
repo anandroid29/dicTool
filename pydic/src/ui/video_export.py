@@ -143,9 +143,10 @@ class ViewRenderer:
                 rgb = R.alpha_over(rgb, rgba)
 
         if spec.wants_streaklines and self.markers:
+            # Trajectory only. The marker circle used to be stamped on the
+            # leading end of every streakline, which hid the very tip the
+            # viewer is trying to follow.
             rgb = R.draw_streaklines(rgb, self._trajectories(idx), MARKER_RGB)
-            rgb = R.draw_markers(rgb, self.analysis.marker_positions(self.markers, idx),
-                                 MARKER_RGB)
 
         if spec.content == "field" and spec.show_colorbar and vmin is not None:
             rgb = R.draw_colorbar(rgb, spec.cmap, vmin, vmax, unit)

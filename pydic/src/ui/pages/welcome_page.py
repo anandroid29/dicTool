@@ -152,26 +152,34 @@ class ImageLoadSettingsDialog(QDialog):
         lay.addWidget(div)
 
         # 2. Camera FPS Rate
+        # Always editable. A detected value only pre-fills the box: metadata can
+        # carry a container playback rate rather than the true capture rate, and
+        # a locked-in wrong rate silently rescales every velocity and strain rate.
         fps_lay = QHBoxLayout()
-        if self._fps_from_meta is not None:
-            lbl = QLabel(f"Camera frame rate: {self._fps_from_meta:.2f} Hz (detected from metadata)")
-            lbl.setStyleSheet(f"color:{_C_SUCCESS}; font-size:12px; font-weight:bold;")
-            fps_lay.addWidget(lbl)
-            fps_lay.addStretch()
-            self.fps_spin = None
-        else:
-            fps_lay.addWidget(QLabel("Camera frame rate:"))
-            self.fps_spin = QDoubleSpinBox()
-            self.fps_spin.setRange(0.01, 1000000.0)
-            self.fps_spin.setValue(1.0)
-            self.fps_spin.setDecimals(2)
-            self.fps_spin.setStyleSheet(f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px;")
-            fps_lay.addWidget(self.fps_spin)
+        fps_lay.addWidget(QLabel("Camera frame rate:"))
+        self.fps_spin = QDoubleSpinBox()
+        self.fps_spin.setRange(0.01, 10000000.0)
+        self.fps_spin.setDecimals(2)
+        self.fps_spin.setValue(
+            self._fps_from_meta if self._fps_from_meta is not None else 1.0)
+        self.fps_spin.setStyleSheet(f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px;")
+        self.fps_spin.setToolTip(
+            "True rate the camera captured at, in Hz.\n\n"
+            "For high-speed footage this is not the video's playback rate — a\n"
+            "2000 Hz recording is often written out as a 50 fps slow-motion file.\n"
+            "Δt = 1 / this value drives velocity and strain rate."
+        )
+        fps_lay.addWidget(self.fps_spin)
 
-            lbl_hz = QLabel("Hz")
-            lbl_hz.setStyleSheet(f"color:{_C_TEXT2};")
-            fps_lay.addWidget(lbl_hz)
-            fps_lay.addStretch()
+        lbl_hz = QLabel("Hz")
+        lbl_hz.setStyleSheet(f"color:{_C_TEXT2};")
+        fps_lay.addWidget(lbl_hz)
+
+        if self._fps_from_meta is not None:
+            det = QLabel(f"detected {self._fps_from_meta:.2f} Hz — override if wrong")
+            det.setStyleSheet(f"color:{_C_SUCCESS}; font-size:11px;")
+            fps_lay.addWidget(det)
+        fps_lay.addStretch()
         lay.addLayout(fps_lay)
 
         # 2b. Spatial scale — the space counterpart to the frame rate above.
@@ -264,7 +272,9 @@ class ImageLoadSettingsDialog(QDialog):
         step = self.step_spin.value()
         limit = self.max_frames_spin.value() if self.radio_limit_frames.isChecked() else None
         roi_path = self.roi_edit.text().strip()
-        user_fps = self.fps_spin.value() if self.fps_spin else None
+        # Pre-filled from metadata when present, so this already carries the
+        # detected rate unless the operator changed it.
+        user_fps = self.fps_spin.value()
         return step, limit, roi_path if roi_path else None, user_fps
 
     def get_calibration(self):
@@ -523,7 +533,11 @@ class WelcomePage(QWidget):
             QMessageBox.warning(self, "Empty Selection", "Your sampling settings filtered out all deformed frames.")
             return
 
-        base_fps = original_fps if original_fps is not None else (user_fps if user_fps is not None else 1.0)
+        # The dialog's spin box is seeded from metadata, so it is the detected
+        # rate unless the operator overrode it -- preferring original_fps here
+        # would throw that override away.
+        base_fps = user_fps if user_fps is not None else (
+            original_fps if original_fps is not None else 1.0)
 
         analysis = self._wizard.analysis
         analysis.fps = base_fps / step
