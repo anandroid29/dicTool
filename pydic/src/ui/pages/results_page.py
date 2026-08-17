@@ -16,7 +16,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QColor, QPainter, QLinearGradient, QFont
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialog,
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QSpinBox, QToolButton, QProgressDialog, QProgressBar,
     QListWidget, QListWidgetItem, QGroupBox, QGridLayout, QDoubleSpinBox,
@@ -50,8 +50,14 @@ _C_SUCCESS = "#10b981"
 
 FIELDS = {
     # 1. Displacements
-    "u": ("Displacement u", "px"),
-    "v": ("Displacement v", "px"),
+    # Incremental first: "how far did it move between these two frames" is the
+    # everyday question, and it is the one the cumulative fields cannot answer
+    # once the sequence is long.
+    "u_inc": ("Δu (frame-to-frame)", "px"),
+    "v_inc": ("Δv (frame-to-frame)", "px"),
+    "mag_inc": ("|Δ| (frame-to-frame)", "px"),
+    "u": ("Displacement u (cumulative)", "px"),
+    "v": ("Displacement v (cumulative)", "px"),
 
     # 2. Velocities
     "Vx": ("Velocity Vx", "px/s"),
@@ -74,7 +80,7 @@ FIELDS = {
 # Field families, in the order they appear in the category dropdown. Only the
 # members of the selected family get a button in the toolbar.
 FIELD_GROUPS = {
-    "Displacement": ["u", "v"],
+    "Displacement": ["u_inc", "v_inc", "mag_inc", "u", "v"],
     "Velocity":     ["Vx", "Vy", "Veff"],
     "Strain rate":  ["Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate"],
     "Strain":       ["Exx", "Exy", "Eyy", "Eeff"],
@@ -83,6 +89,7 @@ FIELD_GROUPS = {
 # Short button captions, now that the family is named by the dropdown.
 _FIELD_SHORT = {
     "u": "u", "v": "v",
+    "u_inc": "Δu", "v_inc": "Δv", "mag_inc": "|Δ|",
     "Vx": "Vx", "Vy": "Vy", "Veff": "eff",
     "Exx_rate": "Ėxx", "Exy_rate": "Ėxy", "Eyy_rate": "Ėyy", "Eeff_rate": "Ėeff",
     "Exx": "Exx", "Exy": "Exy", "Eyy": "Eyy", "Eeff": "Eeff",
@@ -211,6 +218,11 @@ class ResultsPage(QWidget):
         self._wizard = wizard
         self._frame  = 0
         self._field  = "Eeff_rate"
+        # Frame-pair average. When set, the viewer shows this instead of a
+        # single frame and the scrubber is inert -- the average has no position
+        # in the sequence to scrub to.
+        self._pair_avg = None
+        self._pair_list: list = []
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(200)
         self._play_timer.timeout.connect(self._advance)
@@ -512,6 +524,41 @@ class ResultsPage(QWidget):
         self._marker_panel.setVisible(False)
         sb_lay.addWidget(self._marker_panel)
 
+        # ── Frame-pair average ──────────────────────────────────────
+        pair_hdr = QLabel("FRAME PAIRS")
+        pair_hdr.setStyleSheet(
+            f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;")
+        sb_lay.addWidget(pair_hdr)
+
+        self._pair_btn = QPushButton("Average frame pairs…")
+        self._pair_btn.setFixedHeight(30)
+        self._pair_btn.setToolTip(
+            "Pick any number of frame pairs and average the displacement,\n"
+            "velocity and strain rate measured across them.\n\n"
+            "Cumulative strain is excluded — it carries the history before\n"
+            "each pair begins, so it cannot be averaged across pairs.")
+        self._pair_btn.clicked.connect(self._open_pair_dialog)
+        sb_lay.addWidget(self._pair_btn)
+
+        self._pair_banner = QLabel("")
+        self._pair_banner.setWordWrap(True)
+        self._pair_banner.setStyleSheet(
+            f"color:{_C_SUCCESS}; font-size:10px; background:{_C_CARD};"
+            f" border:1px solid {_C_SUCCESS}; border-radius:4px; padding:6px;")
+        self._pair_banner.setVisible(False)
+        sb_lay.addWidget(self._pair_banner)
+
+        self._pair_exit_btn = QPushButton("← Back to single frames")
+        self._pair_exit_btn.setFixedHeight(26)
+        self._pair_exit_btn.setStyleSheet(
+            f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
+            f" border-radius:4px; font-size:10px;")
+        self._pair_exit_btn.clicked.connect(self._clear_pair_average)
+        self._pair_exit_btn.setVisible(False)
+        sb_lay.addWidget(self._pair_exit_btn)
+
+        sb_lay.addWidget(self._sep())
+
         for label, slot in [("CSV (this frame)", self._export_csv),
                              ("HDF5 (all frames)", self._export_hdf5),
                              ("Video / image sequence…", self._export_video)]:
@@ -789,6 +836,12 @@ class ResultsPage(QWidget):
         # they are meaningless for a new sequence.
         self._canvas.clear_markers()
         self._marker_list.clear()
+        # Same reasoning for a stored pair average: its frame indices and its
+        # arrays belong to the run that produced them. Keeping it across a
+        # re-analysis would silently show the previous run's numbers.
+        self._pair_avg = None
+        self._pair_list = []
+        self._sync_pair_ui()
         self._sync_calibration_controls()
         self._slider.setMaximum(max(0, n - 1))
         self._slider.setValue(0)
@@ -932,10 +985,17 @@ class ResultsPage(QWidget):
         # already converted, so the fixed scale has to be converted too or the
         # colourbar and the image disagree.
         global_rng = None
-        if spec.mode == "global":
+        if spec.mode == "global" and self._pair_avg is None:
             factor, _ = self._unit_factor()
             lo, hi = analysis.get_global_range(self._field)
             global_rng = (lo * factor, hi * factor)
+        elif spec.mode == "global":
+            # The sequence-wide range is measured on per-frame fields, whose
+            # magnitudes differ from a pair's (cumulative u spans the whole run,
+            # a pair's Δu spans one interval). Applying it here would flatten the
+            # image to one colour, so the averaged field scales to itself.
+            spec = RangeSpec(mode="auto", vmin=None, vmax=None,
+                             symmetric=spec.symmetric)
 
         rng = spec.resolve(arr, global_rng)
         if rng is None:
@@ -1040,7 +1100,114 @@ class ResultsPage(QWidget):
         self._refresh_overlay()
 
     def _refresh_overlay(self, *_) -> None:
-        self._show_frame(self._frame)
+        if self._pair_avg is not None:
+            self._show_pair_average()
+        else:
+            self._show_frame(self._frame)
+
+    # ------------------------------------------------------------------
+    # Frame-pair average
+    # ------------------------------------------------------------------
+
+    def _open_pair_dialog(self) -> None:
+        analysis = self._wizard.analysis
+        n = len(analysis.results)
+        if n < 2:
+            QMessageBox.information(
+                self, "PyDIC",
+                "Frame-pair averaging needs at least two analysed frames.")
+            return
+
+        from src.ui.pages.frame_pair_dialog import FramePairDialog
+        dlg = FramePairDialog(n, analysis.fps, self._pair_list, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        pairs = dlg.pairs()
+        try:
+            avg = analysis.average_pairs(pairs)
+        except Exception as exc:
+            QMessageBox.warning(self, "Frame-Pair Average", str(exc))
+            return
+
+        self._pair_list = pairs
+        self._pair_avg = avg
+
+        # Cumulative strain is not defined for an average of pairs, so move off
+        # it rather than showing an all-NaN field with no explanation.
+        if self._field in ("Exx", "Exy", "Eyy", "Eeff"):
+            self._select_field("mag_inc")
+
+        self._sync_pair_ui()
+        self._refresh_overlay()
+
+    def _clear_pair_average(self) -> None:
+        self._pair_avg = None
+        self._sync_pair_ui()
+        self._refresh_overlay()
+
+    def _sync_pair_ui(self) -> None:
+        """Show the averaging state and lock out controls it makes meaningless."""
+        active = self._pair_avg is not None
+        self._pair_banner.setVisible(active)
+        self._pair_exit_btn.setVisible(active)
+        self._pair_btn.setText(
+            "Edit frame pairs…" if active else "Average frame pairs…")
+
+        if active:
+            n = len(self._pair_list)
+            label = ", ".join(f"{a + 1}→{b + 1}" for a, b in self._pair_list[:4])
+            if n > 4:
+                label += f", +{n - 4} more"
+            self._pair_banner.setText(
+                f"<b>Averaging {n} frame pair{'s' if n != 1 else ''}</b><br>{label}"
+                f"<br>Cumulative strain unavailable in this mode.")
+
+        # Scrubbing and playback have no meaning for a single averaged field.
+        if active and self._play_btn.isChecked():
+            self._play_btn.setChecked(False)
+            self._toggle_play(False)
+        for w in (self._slider, self._play_btn):
+            w.setEnabled(not active)
+
+        # Cumulative strain buttons cannot be honoured while averaging.
+        for k, btn in self._field_btns.items():
+            if k in ("Exx", "Exy", "Eyy", "Eeff"):
+                btn.setEnabled(not active)
+                btn.setToolTip(
+                    "Not available while averaging frame pairs — cumulative "
+                    "strain includes the history before each pair begins."
+                    if active else "")
+
+    def _show_pair_average(self) -> None:
+        """Render the averaged field over the reference image.
+
+        The reference is the right backdrop here: an average spans several
+        intervals, so no single deformed frame is the one it belongs to.
+        """
+        analysis = self._wizard.analysis
+        res = self._pair_avg
+        if res is None:
+            return
+
+        ref = analysis.reference_image
+        if ref is not None:
+            safe_img = np.ascontiguousarray(ref * 0.45, dtype=np.float64)
+            keep = self._canvas._image_arr is not None
+            self._canvas.set_image(safe_img, keep_view=keep)
+
+        arr, _ = self._display_array(res)
+        if arr is not None and np.any(np.isfinite(arr)):
+            self._apply_overlay(arr)
+        else:
+            self._canvas.set_result_overlay_rgba(None)
+
+        self._canvas.set_streaklines(None)
+        self._canvas.set_markers([])
+
+        self._update_stats(res)
+        n = len(self._pair_list)
+        self._frame_lbl.setText(f"Average of {n} pair{'s' if n != 1 else ''}")
 
     def _prev_frame(self) -> None:
         self._slider.setValue(max(0, self._slider.value() - 1))
@@ -1071,7 +1238,8 @@ class ResultsPage(QWidget):
         if not directory:
             return
         try:
-            self._wizard.analysis.export_csv(self._frame, directory)
+            target = self._pair_avg if self._pair_avg is not None else self._frame
+            self._wizard.analysis.export_csv(target, directory)
             QMessageBox.information(self, "Exported", f"CSV files saved to:\n{directory}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))

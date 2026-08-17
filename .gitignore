@@ -5,3 +5,5 @@
 *.h5
 *.tif
 *.mp4
+__pycache__/
+*.py[cod]

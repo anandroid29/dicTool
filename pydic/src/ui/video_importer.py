@@ -16,7 +16,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QSlider, QSpinBox, QLineEdit,
+    QLabel, QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QLineEdit,
     QProgressBar, QFileDialog, QGroupBox, QSizePolicy,
     QMessageBox, QFrame, QCheckBox,
 )
@@ -159,9 +159,12 @@ _BTN_ACCENT = (
     "QPushButton:disabled { background:#21262d; color:#484f58; }"
 )
 _SPIN = (
-    "QSpinBox { background:#21262d; color:#e6edf3; border:1px solid #30363d; "
+    "QSpinBox, QDoubleSpinBox { background:#21262d; color:#e6edf3; "
+    "border:1px solid #30363d; "
     "border-radius:5px; padding:3px 6px; font-size:11px; } "
-    "QSpinBox::up-button, QSpinBox::down-button { border:none; width:16px; }"
+    "QSpinBox::up-button, QSpinBox::down-button, "
+    "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button "
+    "{ border:none; width:16px; }"
 )
 _LABEL_DIM = "color:#8b949e; font-size:11px;"
 _LABEL_PRI = "color:#e6edf3; font-size:11px;"
@@ -210,6 +213,9 @@ class VideoImporterDialog(QDialog):
         self._video_path: Optional[str] = None
         self._cap:        Optional['cv2.VideoCapture'] = None
         self._total_frames: int = 0
+        # Playback rate stored in the container. For a high-speed camera this
+        # is NOT the rate the frames were captured at -- a 2000 Hz recording is
+        # routinely written out as a 50 fps file for normal-speed viewing.
         self._fps:          float = 25.0
         self.extracted_paths: List[str] = []
         self.reference_index: int = 0
@@ -262,6 +268,41 @@ class VideoImporterDialog(QDialog):
         self._info_lbl = QLabel("")
         self._info_lbl.setStyleSheet(_LABEL_DIM)
         vlay.addWidget(self._info_lbl)
+
+        # ── True capture rate ──────────────────────────────────────────
+        # The container's fps is a playback hint, not physics. High-speed
+        # footage is almost always saved slowed-down, so trusting it makes
+        # dt too large and scales every velocity and strain rate down by
+        # exactly the slow-down factor.
+        cap_row = QHBoxLayout()
+        cap_lbl = QLabel("True capture rate:")
+        cap_lbl.setStyleSheet(_LABEL_PRI)
+        cap_row.addWidget(cap_lbl)
+        self._capture_fps_spin = QDoubleSpinBox()
+        self._capture_fps_spin.setRange(0.01, 10_000_000.0)
+        self._capture_fps_spin.setDecimals(2)
+        self._capture_fps_spin.setValue(25.0)
+        self._capture_fps_spin.setStyleSheet(_SPIN)
+        self._capture_fps_spin.setToolTip(
+            "Frames per second the camera actually recorded at.\n\n"
+            "Video files store a playback rate, which for high-speed footage is\n"
+            "deliberately much lower than the capture rate (e.g. 2000 Hz recorded,\n"
+            "50 fps written out so it plays back in slow motion).\n\n"
+            "Velocity and strain rate divide by Δt = 1 / this value, so leaving it\n"
+            "at the playback rate scales those results down by the slow-down factor."
+        )
+        self._capture_fps_spin.valueChanged.connect(self._update_capture_note)
+        cap_row.addWidget(self._capture_fps_spin)
+        cap_row.addWidget(QLabel("Hz"))
+        cap_row.itemAt(cap_row.count() - 1).widget().setStyleSheet(_LABEL_DIM)
+        cap_row.addStretch()
+        vlay.addLayout(cap_row)
+
+        self._capture_note = QLabel("")
+        self._capture_note.setStyleSheet(_LABEL_DIM)
+        self._capture_note.setWordWrap(True)
+        vlay.addWidget(self._capture_note)
+
         root.addWidget(vgrp)
 
         # ── Preview ────────────────────────────────────────────────────
@@ -441,9 +482,15 @@ class VideoImporterDialog(QDialog):
         self._file_edit.setText(os.path.basename(path))
         duration = total / fps if fps else 0
         self._info_lbl.setText(
-            f"{w}×{h} px  •  {total} frames  •  {fps:.2f} fps  •  "
+            f"{w}×{h} px  •  {total} frames  •  {fps:.2f} fps (playback)  •  "
             f"{duration:.1f} s"
         )
+
+        # Seed the capture rate with the container's value: correct for ordinary
+        # footage, and the right starting point to edit for high-speed footage.
+        self._capture_fps_spin.blockSignals(True)
+        self._capture_fps_spin.setValue(fps if fps > 0 else 25.0)
+        self._capture_fps_spin.blockSignals(False)
 
         for sp in (self._start_spin, self._end_spin,
                    self._ref_spin, self._preview_slider):
@@ -470,9 +517,11 @@ class VideoImporterDialog(QDialog):
         ret, frame = self._cap.read()
         if ret:
             self._preview.show_frame(frame)
-        t = idx / self._fps if self._fps else 0
+        # Real capture time, not playback position.
+        rate = self._capture_fps_spin.value()
+        t = idx / rate if rate else 0
         self._preview_frame_lbl.setText(
-            f"{idx}  ({t:.2f}s)"
+            f"{idx}  ({t:.4g}s)"
         )
 
     # ------------------------------------------------------------------
@@ -502,6 +551,38 @@ class VideoImporterDialog(QDialog):
 
         if self._video_path and hasattr(self, '_extract_btn'):
             self._extract_btn.setEnabled(True)
+
+        self._update_capture_note()
+
+    def effective_fps(self) -> float:
+        """Sample rate of the extracted sequence, in Hz.
+
+        Capture rate divided by the extraction step: keeping every 4th frame of
+        a 2000 Hz recording samples the motion at 500 Hz, and that is the rate
+        Δt must come from.
+        """
+        step = self._step_spin.value() if hasattr(self, "_step_spin") else 1
+        fps = self._capture_fps_spin.value()
+        return fps / step if step > 0 else fps
+
+    def _update_capture_note(self) -> None:
+        note = getattr(self, "_capture_note", None)
+        if note is None:
+            return
+        eff = self.effective_fps()
+        if eff <= 0:
+            note.setText("")
+            return
+        txt = f"Δt = {1000.0 / eff:.4g} ms between extracted frames  ·  sampled at {eff:,.2f} Hz"
+        container = self._fps
+        # Only worth flagging once a video is loaded and the two disagree.
+        if self._video_path and container > 0:
+            ratio = self._capture_fps_spin.value() / container
+            if ratio > 1.01:
+                txt += f"   (file plays back at {container:.2f} fps — {ratio:.4g}× slow motion)"
+            elif ratio < 0.99:
+                txt += f"   (file reports {container:.2f} fps)"
+        note.setText(txt)
 
     def _browse_out(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.start_dir)
@@ -591,11 +672,15 @@ class VideoImporterDialog(QDialog):
             out_dir = os.path.dirname(paths[0])
             meta_path = os.path.join(out_dir, "dic_metadata.json")
 
-            extraction_step = self._step_spin.value()
-            effective_fps = self._fps / extraction_step if extraction_step > 0 else self._fps
-
+            # Derived from the operator-supplied capture rate, not the
+            # container's playback rate, so downstream Δt is real time.
             with open(meta_path, "w") as f:
-                json.dump({"fps": effective_fps}, f)
+                json.dump({
+                    "fps": self.effective_fps(),
+                    "capture_fps": self._capture_fps_spin.value(),
+                    "container_fps": self._fps,
+                    "extraction_step": self._step_spin.value(),
+                }, f)
         except Exception as e:
             print(f"Failed to save metadata: {e}")
 
