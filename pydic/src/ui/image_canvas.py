@@ -705,7 +705,10 @@ class ImageCanvas(QWidget):
                 painter.drawPath(path)
 
         # ─── DRAW MARKERS ───
-        if self._markers:
+        # The head circle sits right on the streakline's leading end and buries
+        # it, so it is suppressed while trajectories are on screen. Marker mode
+        # keeps it: there it is the grab handle, not decoration.
+        if self._markers and not (self._streak_paths and not self._marker_mode):
             r_out = 6.5 / self._zoom
             r_in = 2.4 / self._zoom
             for i in range(len(self._markers)):
