@@ -42,6 +42,18 @@ _C_EXCLUDE = (239, 68, 68)     # red
 _PANEL_W = 400
 _METHODS = ["None", "Contrast", "Edge Detection", "Hybrid"]
 
+_CHOICE_STYLE = f"""
+QPushButton {{
+    background: {_C_CARD}; color: {_C_TEXT2}; border: 1px solid {_C_BORDER};
+    border-radius: 6px;
+}}
+QPushButton:hover {{ border-color: {_C_ACCENT}; color: {_C_TEXT}; }}
+QPushButton:checked {{
+    background: {_C_ACCENT}; color: #ffffff; border-color: {_C_ACCENT};
+    font-weight: 700;
+}}
+"""
+
 
 def _section(text: str) -> QLabel:
     lbl = QLabel(text)
@@ -59,7 +71,8 @@ class DynamicROIPage(QWidget):
         # Reference-frame boolean overrides, edited one channel at a time.
         self._include: Optional[np.ndarray] = None
         self._exclude: Optional[np.ndarray] = None
-        self._channel = "exclude"          # which one the canvas is editing
+        self._channel = "include"          # which one the canvas is editing
+        self._tool = ROITool.RECTANGLE      # active drawing geometry
         self._updating = False             # guard against feedback loops
         self._build_ui()
 
@@ -82,6 +95,11 @@ class DynamicROIPage(QWidget):
         title.setStyleSheet(f"color:{_C_TEXT}; font-size:13px; font-weight:600;")
         top_lay.addWidget(title)
         top_lay.addStretch()
+        self._reset_view_btn = QPushButton("Reset Zoom")
+        self._reset_view_btn.setFixedHeight(30)
+        self._reset_view_btn.setToolTip("Fit the reference image back into the viewport.")
+        self._reset_view_btn.clicked.connect(self._canvas_fit_image)
+        top_lay.addWidget(self._reset_view_btn)
         root.addWidget(top)
 
         body = QWidget()
@@ -189,24 +207,34 @@ class DynamicROIPage(QWidget):
         crow = QHBoxLayout()
         self._btn_inc = QPushButton("Include")
         self._btn_exc = QPushButton("Exclude")
-        grp = QButtonGroup(self)
+        self._channel_group = QButtonGroup(self)
+        self._channel_group.setExclusive(True)
         for b, chan in ((self._btn_inc, "include"), (self._btn_exc, "exclude")):
             b.setCheckable(True)
             b.setFixedHeight(30)
-            grp.addButton(b)
+            b.setStyleSheet(_CHOICE_STYLE)
+            self._channel_group.addButton(b)
             b.clicked.connect(lambda _c, ch=chan: self._set_channel(ch))
             crow.addWidget(b)
-        self._btn_exc.setChecked(True)
+        self._btn_inc.setChecked(True)
         lay.addLayout(crow)
 
         trow2 = QHBoxLayout()
+        self._tool_group = QButtonGroup(self)
+        self._tool_group.setExclusive(True)
+        self._tool_buttons = {}
         for label, tool in (("Rect", ROITool.RECTANGLE),
                             ("Poly", ROITool.POLYGON),
                             ("Circle", ROITool.CIRCLE)):
             b = QPushButton(label)
+            b.setCheckable(True)
             b.setFixedHeight(28)
-            b.clicked.connect(lambda _c, t=tool: self._canvas.set_tool(t))
+            b.setStyleSheet(_CHOICE_STYLE)
+            self._tool_group.addButton(b)
+            self._tool_buttons[tool] = b
+            b.clicked.connect(lambda _c, t=tool: self._set_tool(t))
             trow2.addWidget(b)
+        self._tool_buttons[ROITool.RECTANGLE].setChecked(True)
         lay.addLayout(trow2)
 
         crow2 = QHBoxLayout()
@@ -233,6 +261,10 @@ class DynamicROIPage(QWidget):
 
         body_lay.addWidget(right)
         root.addWidget(body, 1)
+
+    def _canvas_fit_image(self) -> None:
+        if self._canvas._image_arr is not None:
+            self._canvas.fit_image()
 
     def _sep(self) -> QFrame:
         f = QFrame()
@@ -300,10 +332,17 @@ class DynamicROIPage(QWidget):
         from PyQt6.QtGui import QColor
         self._canvas._ROI_FILL_COLOR = QColor(r, g, b, 70)
         self._canvas._ROI_BORDER_COLOR = QColor(r, g, b, 210)
-        self._canvas.set_tool(ROITool.RECTANGLE)
+        self._canvas.set_tool(self._tool)
         self._btn_inc.setChecked(chan == "include")
         self._btn_exc.setChecked(chan == "exclude")
         self._refresh()
+
+    def _set_tool(self, tool: ROITool) -> None:
+        """Select a drawing geometry and keep its button visibly active."""
+        self._tool = tool
+        self._canvas.set_tool(tool)
+        for candidate, button in self._tool_buttons.items():
+            button.setChecked(candidate == tool)
 
     def _on_canvas_roi(self, mask) -> None:
         if self._updating or mask is None:
@@ -330,6 +369,14 @@ class DynamicROIPage(QWidget):
     # --------------------------------------------------------------- preview
     def _commit_to_analysis(self) -> None:
         a = self._wizard.analysis
+        old_params = (
+            getattr(a.params, "dynamic_roi", "None"),
+            getattr(a.params, "dynamic_roi_threshold", None),
+            getattr(a.params, "dynamic_roi_min_area_frac", 0.02),
+            getattr(a.params, "dynamic_roi_fill_holes", True),
+        )
+        old_inc = a.dynamic_include_mask
+        old_exc = a.dynamic_exclude_mask
         a.params.dynamic_roi = self._cb_method.currentText()
         a.params.dynamic_roi_threshold = (
             None if self._auto_chk.isChecked() else self._slider.value() / 100.0)
@@ -347,6 +394,21 @@ class DynamicROIPage(QWidget):
                 exc = exc & static
         a.dynamic_include_mask = inc.copy() if inc is not None and inc.any() else None
         a.dynamic_exclude_mask = exc.copy() if exc is not None and exc.any() else None
+        new_params = (
+            a.params.dynamic_roi, a.params.dynamic_roi_threshold,
+            a.params.dynamic_roi_min_area_frac,
+            a.params.dynamic_roi_fill_holes,
+        )
+        masks_changed = not (
+            (old_inc is None and a.dynamic_include_mask is None or
+             old_inc is not None and a.dynamic_include_mask is not None and
+             np.array_equal(old_inc, a.dynamic_include_mask)) and
+            (old_exc is None and a.dynamic_exclude_mask is None or
+             old_exc is not None and a.dynamic_exclude_mask is not None and
+             np.array_equal(old_exc, a.dynamic_exclude_mask))
+        )
+        if old_params != new_params or masks_changed:
+            a.results.clear()
 
     def _refresh(self) -> None:
         a = self._wizard.analysis

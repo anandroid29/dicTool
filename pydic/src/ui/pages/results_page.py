@@ -49,15 +49,11 @@ _C_TEXT3   = "#475569"
 _C_SUCCESS = "#10b981"
 
 FIELDS = {
-    # 1. Displacements
-    # Incremental first: "how far did it move between these two frames" is the
-    # everyday question, and it is the one the cumulative fields cannot answer
-    # once the sequence is long.
-    "u_inc": ("Δu (frame-to-frame)", "px"),
-    "v_inc": ("Δv (frame-to-frame)", "px"),
-    "mag_inc": ("|Δ| (frame-to-frame)", "px"),
-    "u": ("Displacement u (cumulative)", "px"),
-    "v": ("Displacement v (cumulative)", "px"),
+    # Displacement is always the current previous-frame -> current-frame
+    # interval. u_inc/v_inc remain file/API aliases but are not duplicated here.
+    "u": ("Instantaneous displacement u", "px"),
+    "v": ("Instantaneous displacement v", "px"),
+    "mag_inc": ("Instantaneous displacement magnitude", "px"),
 
     # 2. Velocities
     "Vx": ("Velocity Vx", "px/s"),
@@ -66,33 +62,40 @@ FIELDS = {
 
     # 3. Strain Rates
     "Exx_rate": ("Strain Rate  Ėxx", "s⁻¹"),
-    "Exy_rate": ("Strain Rate  Ėxy", "s⁻¹"),
+    "Exy_rate": ("Tensor Shear Strain Rate  Ėxy", "s⁻¹"),
     "Eyy_rate": ("Strain Rate  Ėyy", "s⁻¹"),
     "Eeff_rate": ("Effective Strain Rate", "s⁻¹"),
 
-    # 4. Accumulated Strains
-    "Exx": ("Strain  Exx", "ε"),
-    "Exy": ("Strain  Exy", "ε"),
-    "Eyy": ("Strain  Eyy", "ε"),
-    "Eeff": ("Effective Strain", "ε"),
+    # The user-facing strain measure is Green-Lagrange. Legacy infinitesimal
+    # and engineering-shear arrays remain loadable/exportable for old sessions,
+    # but no longer compete with the selected strain convention in the UI.
+    "Exx_gl": ("Accumulated strain Exx", "dimensionless"),
+    "Eyy_gl": ("Accumulated strain Eyy", "dimensionless"),
+    "Exy_gl": ("Accumulated tensor shear strain Exy", "dimensionless"),
+    "Eeff_gl": ("Accumulated equivalent strain magnitude", "dimensionless"),
 }
 
 # Field families, in the order they appear in the category dropdown. Only the
 # members of the selected family get a button in the toolbar.
 FIELD_GROUPS = {
-    "Displacement": ["u_inc", "v_inc", "mag_inc", "u", "v"],
+    "Displacement": ["u", "v", "mag_inc"],
     "Velocity":     ["Vx", "Vy", "Veff"],
-    "Strain rate":  ["Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate"],
-    "Strain":       ["Exx", "Exy", "Eyy", "Eeff"],
+    "Strain rate":  ["Exx_rate", "Eyy_rate", "Exy_rate", "Eeff_rate"],
+    "Strain":       ["Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"],
+}
+
+_ACCUMULATED_STRAIN_FIELDS = {
+    "Exx_inf", "Eyy_inf", "Exy_inf", "Gxy_inf", "Eeff_inf",
+    "Exx_gl", "Eyy_gl", "Exy_gl", "Gxy_gl", "Eeff_gl",
 }
 
 # Short button captions, now that the family is named by the dropdown.
 _FIELD_SHORT = {
     "u": "u", "v": "v",
-    "u_inc": "Δu", "v_inc": "Δv", "mag_inc": "|Δ|",
+    "u_inc": "du", "v_inc": "dv", "mag_inc": "|d|",
     "Vx": "Vx", "Vy": "Vy", "Veff": "eff",
     "Exx_rate": "Ėxx", "Exy_rate": "Ėxy", "Eyy_rate": "Ėyy", "Eeff_rate": "Ėeff",
-    "Exx": "Exx", "Exy": "Exy", "Eyy": "Eyy", "Eeff": "Eeff",
+    "Exx_gl": "Exx", "Eyy_gl": "Eyy", "Exy_gl": "Exy", "Eeff_gl": "Eeq",
 }
 
 
@@ -203,7 +206,10 @@ class _ColorBar(QWidget):
         font = QFont("Fira Code, Consolas, monospace", 9)
         p.setFont(font)
         vmin_s = f"{self._vmin:.4g}"
-        vmax_s = f"{self._vmax:.4g} {self._unit}"
+        # The unit is shown once in the sidebar section heading. Repeating a
+        # long unit such as "dimensionless" here made the right endpoint grow
+        # into the left endpoint in the deliberately compact sidebar.
+        vmax_s = f"{self._vmax:.4g}"
         p.drawText(lm, 4 + th + 13, vmin_s)
         fm = p.fontMetrics()
         p.drawText(lm + w - fm.horizontalAdvance(vmax_s), 4 + th + 13, vmax_s)
@@ -440,11 +446,20 @@ class ResultsPage(QWidget):
         sb_lay.setSpacing(14)
 
         # Stats
+        stats_head_row = QHBoxLayout()
+        stats_head_row.setContentsMargins(0, 0, 0, 0)
         stats_hdr = QLabel("STATISTICS")
         stats_hdr.setStyleSheet(
             f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;"
         )
-        sb_lay.addWidget(stats_hdr)
+        stats_head_row.addWidget(stats_hdr)
+        stats_head_row.addStretch()
+        self._stats_unit_lbl = QLabel("")
+        self._stats_unit_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._stats_unit_lbl.setStyleSheet(
+            f"color:{_C_TEXT2}; font-size:9px; font-style:italic;")
+        stats_head_row.addWidget(self._stats_unit_lbl)
+        sb_lay.addLayout(stats_head_row)
 
         self._stat_labels: dict[str, QLabel] = {}
         for stat in ("Mean", "Std Dev", "Min", "Max", "Valid px"):
@@ -466,11 +481,20 @@ class ResultsPage(QWidget):
         sb_lay.addWidget(self._sep())
 
         # Colorbar
+        cb_head_row = QHBoxLayout()
+        cb_head_row.setContentsMargins(0, 0, 0, 0)
         cb_hdr = QLabel("COLORBAR")
         cb_hdr.setStyleSheet(
             f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;"
         )
-        sb_lay.addWidget(cb_hdr)
+        cb_head_row.addWidget(cb_hdr)
+        cb_head_row.addStretch()
+        self._colorbar_unit_lbl = QLabel("")
+        self._colorbar_unit_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._colorbar_unit_lbl.setStyleSheet(
+            f"color:{_C_TEXT2}; font-size:9px; font-style:italic;")
+        cb_head_row.addWidget(self._colorbar_unit_lbl)
+        sb_lay.addLayout(cb_head_row)
         self._colorbar = _ColorBar()
         sb_lay.addWidget(self._colorbar)
 
@@ -991,9 +1015,9 @@ class ResultsPage(QWidget):
             global_rng = (lo * factor, hi * factor)
         elif spec.mode == "global":
             # The sequence-wide range is measured on per-frame fields, whose
-            # magnitudes differ from a pair's (cumulative u spans the whole run,
-            # a pair's Δu spans one interval). Applying it here would flatten the
-            # image to one colour, so the averaged field scales to itself.
+            # interval lengths can differ from the selected frame pairs.
+            # Applying it here can flatten the image to one colour, so the
+            # averaged field scales to itself.
             spec = RangeSpec(mode="auto", vmin=None, vmax=None,
                              symmetric=spec.symmetric)
 
@@ -1043,10 +1067,12 @@ class ResultsPage(QWidget):
             r, g, b, _ = cmap(i / (n_bar - 1))
             bar_colors.append((int(r * 255), int(g * 255), int(b * 255)))
         _, unit = self._unit_factor()
+        self._colorbar_unit_lbl.setText(unit)
         self._colorbar.update_bar(vmin, vmax, unit, bar_colors)
 
     def _update_stats(self, result) -> None:
         arr, unit = self._display_array(result)
+        self._stats_unit_lbl.setText(unit)
         if arr is None:
             for v in self._stat_labels.values():
                 v.setText("—")
@@ -1058,11 +1084,13 @@ class ResultsPage(QWidget):
                 v.setText("—")
             return
 
-        suffix = f" {unit}" if unit else ""
-        self._stat_labels["Mean"].setText(f"{valid.mean():.4g}{suffix}")
-        self._stat_labels["Std Dev"].setText(f"{valid.std():.4g}{suffix}")
-        self._stat_labels["Min"].setText(f"{valid.min():.4g}{suffix}")
-        self._stat_labels["Max"].setText(f"{valid.max():.4g}{suffix}")
+        # Units are section metadata, not part of every value. Keeping the
+        # values numeric prevents the label/value collision seen for the long
+        # word "dimensionless" and makes the rows easier to scan.
+        self._stat_labels["Mean"].setText(f"{valid.mean():.4g}")
+        self._stat_labels["Std Dev"].setText(f"{valid.std():.4g}")
+        self._stat_labels["Min"].setText(f"{valid.min():.4g}")
+        self._stat_labels["Max"].setText(f"{valid.max():.4g}")
         self._stat_labels["Valid px"].setText(f"{valid.size:,}")
 
     # ------------------------------------------------------------------
@@ -1135,7 +1163,7 @@ class ResultsPage(QWidget):
 
         # Cumulative strain is not defined for an average of pairs, so move off
         # it rather than showing an all-NaN field with no explanation.
-        if self._field in ("Exx", "Exy", "Eyy", "Eeff"):
+        if self._field in _ACCUMULATED_STRAIN_FIELDS:
             self._select_field("mag_inc")
 
         self._sync_pair_ui()
@@ -1172,7 +1200,7 @@ class ResultsPage(QWidget):
 
         # Cumulative strain buttons cannot be honoured while averaging.
         for k, btn in self._field_btns.items():
-            if k in ("Exx", "Exy", "Eyy", "Eeff"):
+            if k in _ACCUMULATED_STRAIN_FIELDS:
                 btn.setEnabled(not active)
                 btn.setToolTip(
                     "Not available while averaging frame pairs — cumulative "

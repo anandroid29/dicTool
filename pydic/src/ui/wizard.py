@@ -36,7 +36,7 @@ class Wizard(QMainWindow):
 
         self.analysis = DICAnalysis()
         self.seed_xy = None
-        self.use_gpu = False
+        self.use_gpu = bool(getattr(self.analysis, "prefer_gpu", True))
 
         self.setStyleSheet(STYLESHEET)
         self._build_ui()
@@ -116,13 +116,16 @@ class Wizard(QMainWindow):
         self._stack.setCurrentIndex(idx)
         self._step_bar.set_step(idx)
 
-        # Paint the cleared state before on_enter's heavier work runs.
+        # Populate the incoming page before control returns to Qt's event loop.
+        # The old 50 ms timer let the newly selected page paint once with stale
+        # data, then visibly jump to the current session -- especially obvious
+        # when navigating Back. Layout activation gives fit-to-window code its
+        # final geometry without introducing that extra painted frame.
         page = self._stack.widget(idx)
-        if page is not None:
-            page.repaint()
-
+        if page is not None and page.layout() is not None:
+            page.layout().activate()
         if page_with_enter is not None and hasattr(page_with_enter, "on_enter"):
-            QTimer.singleShot(50, page_with_enter.on_enter)
+            page_with_enter.on_enter()
 
     def new_session(self) -> None:
         """
@@ -136,6 +139,7 @@ class Wizard(QMainWindow):
             pass
         self.analysis = DICAnalysis()
         self.seed_xy = None
+        self.use_gpu = bool(getattr(self.analysis, "prefer_gpu", True))
         for page in (self._welcome, self._roi, self._dynroi, self._params,
                      self._analysis, self._results):
             for hook in ("reset_markers", "on_before_show", "reset_page"):

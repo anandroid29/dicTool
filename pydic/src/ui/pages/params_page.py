@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSpinBox, QDoubleSpinBox,
-    QFrame, QGridLayout, QSizePolicy, QCheckBox, QComboBox
+    QFrame, QGridLayout, QSizePolicy, QCheckBox, QComboBox, QScrollArea
 )
 
 from src.ui.components import FooterButton
@@ -48,10 +48,10 @@ def _section_label(text: str) -> QLabel:
 # Panel and control widths. The label column previously got 140 px against a
 # 340 px fixed panel (292 px usable after margins), which left names like
 # "Correlation cutoff" elided and every spin box pinned at its 80 px minimum.
-_PANEL_W  = 400
-_LABEL_W  = 168
+_PANEL_W  = 460
+_LABEL_W  = 145
 _FIELD_W  = 104
-_UNIT_W   = 30
+_UNIT_W   = 24
 
 
 def _param_row(label: str, tooltip: str, widget: QWidget, unit: str = "") -> QHBoxLayout:
@@ -80,6 +80,7 @@ class ParamsPage(QWidget):
     def __init__(self, wizard: "Wizard") -> None:
         super().__init__()
         self._wizard = wizard
+        self._preview_roi_mask = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -120,7 +121,7 @@ class ParamsPage(QWidget):
 
         # Right: parameters panel
         right = QWidget()
-        right.setFixedWidth(_PANEL_W)
+        right.setMinimumWidth(_PANEL_W - 4)
         right.setStyleSheet(f"background:{_C_SURFACE}; border-left:1px solid {_C_BORDER};")
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(22, 24, 22, 24)
@@ -185,14 +186,20 @@ class ParamsPage(QWidget):
         # Units are PIXELS, not subsets -- the label used to say "subsets",
         # which invites values far too small to work. The plane fit only sees
         # correlation grid points, spaced `subset spacing` apart, so a window of
-        # w px contains just (2w/spacing + 1)^2 of them; below ~6 the fit is
-        # rank-deficient and every strain field comes out empty with no error.
+        # w px contains [2*floor(w/spacing) + 1]^2 nominal samples; fewer than
+        # 3 points per axis cannot supply the six valid samples needed by the
+        # plane fit and can leave every strain field empty.
         self._sp_strain = spin(3, 200, params.strain_window, 1)
+        self._sp_strain.valueChanged.connect(self._on_param_changed)
+        # Some platform styles defer valueChanged until the editor commits.
+        # Validation should still follow valid text while it is being typed.
+        self._sp_strain.lineEdit().textEdited.connect(
+            self._on_strain_text_edited)
         right_lay.addLayout(_param_row(
             "Strain window", "Half-width in PIXELS of the neighbourhood used for\n"
             "the least-squares plane fit when computing strains.\n"
-            "Must cover at least ~5 grid points across, i.e. keep it\n"
-            "at least 2x the subset spacing, or strains come out empty.",
+            "Must cover at least 3 grid points across, i.e. keep the radius\n"
+            "at least equal to the subset spacing, or strains may be empty.",
             self._sp_strain, "px"))
 
         # A strain window too small for the grid spacing silently produced an
@@ -200,6 +207,9 @@ class ParamsPage(QWidget):
         # only a console print -- say it here, where the value is being chosen.
         self._strain_warn = QLabel("")
         self._strain_warn.setWordWrap(True)
+        self._strain_warn.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self._strain_warn.setMinimumHeight(46)
         self._strain_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
         self._strain_warn.setVisible(False)
         right_lay.addWidget(self._strain_warn)
@@ -211,13 +221,15 @@ class ParamsPage(QWidget):
         reset_btn = QPushButton("Reset to Defaults")
         reset_btn.setStyleSheet(
             "background: #132035; color: #94a3b8; border: 1px solid #1e3a5a; "
-            "padding: 6px; border-radius: 4px; margin-top: 10px;"
+            "padding: 6px; border-radius: 4px;"
         )
+        reset_btn.setFixedHeight(32)
         reset_btn.clicked.connect(self._reset_defaults)
         right_lay.addWidget(reset_btn)
         # ---------------------------------------
 
         self._sp_maxiter = spin(5, 200, params.max_iter, 5)
+        self._sp_maxiter.valueChanged.connect(self._on_param_changed)
         right_lay.addLayout(_param_row(
             "Max iterations", "Maximum IC-GN iterations per subset.",
             self._sp_maxiter, ""))
@@ -226,12 +238,14 @@ class ParamsPage(QWidget):
         # so anything smaller can never be reached and every subset just burns
         # all max_iter iterations before being given up on.
         self._sp_tol = dspin(1e-4, 0.1, params.conv_tol, 1e-4, 5)
+        self._sp_tol.valueChanged.connect(self._on_param_changed)
         right_lay.addLayout(_param_row(
             "Convergence tol", "Stop IC-GN once an iteration moves the subset\n"
             "edge by less than this many pixels.",
             self._sp_tol, "px"))
 
         self._sp_cutoff = dspin(0.0, 4.0, params.corr_cutoff, 0.05, 2)
+        self._sp_cutoff.valueChanged.connect(self._on_param_changed)
         right_lay.addLayout(_param_row(
             "Correlation cutoff", "Discard subsets with ZNSSD above this\n"
             "(lower = stricter; 0.8 is a good starting value).",
@@ -245,7 +259,7 @@ class ParamsPage(QWidget):
         self._cb_order.addItem("2nd order — quadratic (12 param)", 2)
         self._cb_order.setCurrentIndex(
             1 if int(getattr(params, "shape_order", 1)) >= 2 else 0)
-        self._cb_order.setFixedWidth(220)
+        self._cb_order.setFixedWidth(196)
         self._cb_order.currentIndexChanged.connect(self._on_order_changed)
         right_lay.addLayout(_param_row(
             "Shape order",
@@ -276,6 +290,7 @@ class ParamsPage(QWidget):
         right_lay.addWidget(_section_label("Search"))
 
         self._sp_search = spin(5, 500, params.search_radius, 10)
+        self._sp_search.valueChanged.connect(self._on_param_changed)
         right_lay.addLayout(_param_row(
             "NCC search radius", "Integer-pixel initial-guess search radius.",
             self._sp_search, "px"))
@@ -288,7 +303,18 @@ class ParamsPage(QWidget):
         self._grid_lbl.setWordWrap(True)
         right_lay.addWidget(self._grid_lbl)
 
-        body_lay.addWidget(right)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setFixedWidth(_PANEL_W)
+        right_scroll.setStyleSheet(
+            f"QScrollArea{{background:{_C_SURFACE}; border-left:1px solid {_C_BORDER};}}"
+            f"QScrollBar:vertical{{background:{_C_SURFACE}; width:10px;}}"
+            f"QScrollBar::handle:vertical{{background:{_C_BORDER}; border-radius:5px; min-height:28px;}}")
+        right_scroll.setWidget(right)
+        body_lay.addWidget(right_scroll)
         root.addWidget(body, 1)
 
         # ── Footer ────────────────────────────────────────────────────
@@ -307,7 +333,7 @@ class ParamsPage(QWidget):
         self._gpu_chk.setCursor(Qt.CursorShape.PointingHandCursor)
 
         if _HAS_GPU:
-            self._gpu_chk.setChecked(True)
+            self._gpu_chk.setChecked(bool(getattr(self._wizard, "use_gpu", True)))
             self._gpu_chk.setStyleSheet(
                 f"QPushButton:checked {{ background: {_C_ACCENT}; color: white; border: 1px solid {_C_ACCENT}; border-radius: 6px; padding: 0 12px; }}"
                 f"QPushButton:!checked {{ background: transparent; color: {_C_TEXT2}; border: 1px solid {_C_BORDER}; border-radius: 6px; padding: 0 12px; }}"
@@ -337,6 +363,7 @@ class ParamsPage(QWidget):
         self._update_order_note()
 
     def on_enter(self) -> None:
+        self._sync_controls_from_model()
         img = self._wizard.analysis.reference_image
         if img is not None:
             # Only set the image if it's new to preserve pan/zoom
@@ -344,10 +371,15 @@ class ParamsPage(QWidget):
                 self._canvas.set_image(img)
                 self._canvas.zoom_fit()
 
-        # Restore Mask
-        mask = self._wizard.analysis.roi_mask
+        # Show the mask the first interval will actually analyse. When dynamic
+        # ROI is enabled this is the calibrated reference mask from Step 3,
+        # rather than the larger static boundary behind it.
+        mask = self._wizard.analysis.reference_analysis_mask()
+        self._preview_roi_mask = None if mask is None else mask.copy()
         if mask is not None:
             self._canvas.set_roi_mask(mask)
+        else:
+            self._canvas.clear_roi()
 
         # Restore Seed
         if getattr(self._wizard, "seed_xy", None) is not None:
@@ -356,8 +388,44 @@ class ParamsPage(QWidget):
         # Trigger parameter refresh to draw the subset radius
         self._on_param_changed()
 
+    def _sync_controls_from_model(self) -> None:
+        """Restore cached/model values without firing partial updates.
+
+        This page survives a New Session while DICAnalysis is replaced. Without
+        this pull, its old widgets immediately overwrote the new analysis and
+        made correctly loaded settings appear not to be cached.
+        """
+        p = self._wizard.analysis.params
+        pairs = (
+            (self._sp_radius, p.subset_radius),
+            (self._sp_spacing, p.subset_spacing),
+            (self._sp_strain, p.strain_window),
+            (self._sp_maxiter, p.max_iter),
+            (self._sp_tol, p.conv_tol),
+            (self._sp_cutoff, p.corr_cutoff),
+            (self._sp_search, p.search_radius),
+        )
+        for widget, value in pairs:
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._cb_order.blockSignals(True)
+        self._cb_order.setCurrentIndex(
+            1 if int(getattr(p, "shape_order", 1)) >= 2 else 0)
+        self._cb_order.blockSignals(False)
+        if self._gpu_chk.isEnabled():
+            self._gpu_chk.blockSignals(True)
+            self._gpu_chk.setChecked(bool(getattr(
+                self._wizard.analysis, "prefer_gpu", True)))
+            self._gpu_chk.blockSignals(False)
+            self._wizard.use_gpu = self._gpu_chk.isChecked()
+        self._update_order_note()
+
     def _on_param_changed(self) -> None:
         p = self._wizard.analysis.params
+        old = (p.subset_radius, p.subset_spacing, p.strain_window,
+               p.max_iter, p.conv_tol, p.corr_cutoff, p.search_radius,
+               int(getattr(p, "shape_order", 1)))
         p.subset_radius  = self._sp_radius.value()
         p.subset_spacing = self._sp_spacing.value()
         p.strain_window  = self._sp_strain.value()
@@ -366,17 +434,15 @@ class ParamsPage(QWidget):
         p.corr_cutoff    = self._sp_cutoff.value()
         p.search_radius  = self._sp_search.value()
         p.shape_order    = int(self._cb_order.currentData() or 1)
+        new = (p.subset_radius, p.subset_spacing, p.strain_window,
+               p.max_iter, p.conv_tol, p.corr_cutoff, p.search_radius,
+               p.shape_order)
+        if old != new:
+            # Results belong to the parameter set that produced them. A visible
+            # edit must not leave old contours looking current.
+            self._wizard.analysis.results.clear()
 
-        eff = p.effective_strain_window(warn=False)
-        if eff != p.strain_window:
-            n_pts = 2 * p.strain_window // max(1, p.subset_spacing) + 1
-            self._strain_warn.setText(
-                f"⚠  {p.strain_window} px spans only {n_pts} grid points at "
-                f"{p.subset_spacing} px spacing — too few to fit a strain plane. "
-                f"{eff} px will be used instead.")
-            self._strain_warn.setVisible(True)
-        else:
-            self._strain_warn.setVisible(False)
+        self._update_strain_warning()
 
         method = getattr(p, "dynamic_roi", "None")
         if method in ("None", None):
@@ -397,7 +463,7 @@ class ParamsPage(QWidget):
 
         # Count estimated subsets
         img = self._wizard.analysis.reference_image
-        mask = self._wizard.analysis.roi_mask
+        mask = self._preview_roi_mask
         if img is not None and mask is not None:
             H, W = img.shape
             r, s = p.subset_radius, p.subset_spacing
@@ -409,6 +475,36 @@ class ParamsPage(QWidget):
                 f"≈ {cnt:,} subsets will be analysed\n"
                 f"({W}×{H} image, {s} px spacing)"
             )
+
+    def _on_strain_text_edited(self, text: str) -> None:
+        """Update validation while the operator is still typing."""
+        try:
+            value = int(text.strip())
+        except ValueError:
+            return
+        if not (self._sp_strain.minimum() <= value <= self._sp_strain.maximum()):
+            return
+        p = self._wizard.analysis.params
+        if p.strain_window != value:
+            p.strain_window = value
+            self._wizard.analysis.results.clear()
+        self._update_strain_warning(value)
+
+    def _update_strain_warning(self, window: int | None = None) -> None:
+        p = self._wizard.analysis.params
+        sw = int(p.strain_window if window is None else window)
+        eff = p.effective_strain_window(warn=False, window=sw)
+        if eff != sw:
+            n_pts = p.strain_points_per_axis(sw)
+            point_word = "point" if n_pts == 1 else "points"
+            self._strain_warn.setText(
+                f"⚠  {sw} px spans only {n_pts} grid {point_word} at "
+                f"{p.subset_spacing} px spacing — too few to fit a strain plane. "
+                f"{eff} px will be used instead.")
+            self._strain_warn.setVisible(True)
+            self._strain_warn.updateGeometry()
+        else:
+            self._strain_warn.setVisible(False)
 
     def _separator(self) -> QFrame:
         f = QFrame()
@@ -447,7 +543,9 @@ class ParamsPage(QWidget):
             return
         try:
             from src.core.shape_order import shape_order_report
-            r = shape_order_report(img, self._wizard.analysis.roi_mask,
+            mask = (self._preview_roi_mask if self._preview_roi_mask is not None
+                    else self._wizard.analysis.roi_mask)
+            r = shape_order_report(img, mask,
                                    radius=self._sp_radius.value(), verbose=False)
         except Exception as e:
             QMessageBox.warning(self, "Could not measure", str(e))
@@ -507,10 +605,15 @@ class ParamsPage(QWidget):
 
     def _on_run_clicked(self) -> None:
         """Save the GPU preference to the wizard, then proceed to the analysis screen."""
+        # Commit every visible control even if it was edited by keyboard and has
+        # not yet emitted editingFinished.
+        self._on_param_changed()
         if hasattr(self, '_gpu_chk'):
             self._wizard.use_gpu = self._gpu_chk.isChecked()
         else:
             self._wizard.use_gpu = False
+
+        self._wizard.analysis.prefer_gpu = self._wizard.use_gpu
 
         self._wizard.analysis.save_settings()
         self._wizard.go_analysis()

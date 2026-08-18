@@ -18,8 +18,10 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QLineEdit,
     QProgressBar, QFileDialog, QGroupBox, QSizePolicy,
-    QMessageBox, QFrame, QCheckBox,
+    QMessageBox, QFrame, QCheckBox, QComboBox,
 )
+
+from src.core.units import Calibration, LENGTH_UNIT_ORDER
 
 # Defer CV2 import to prevent UI freeze on startup
 if TYPE_CHECKING:
@@ -180,6 +182,7 @@ class VideoImporterDialog(QDialog):
         parent=None,
         initial_video: Optional[str] = None,
         start_dir: str = "", # ADDED START DIRECTORY TRACKING
+        initial_calibration: Optional[Calibration] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import Video Frames")
@@ -219,6 +222,8 @@ class VideoImporterDialog(QDialog):
         self._fps:          float = 25.0
         self.extracted_paths: List[str] = []
         self.reference_index: int = 0
+        self._initial_calibration = initial_calibration or Calibration()
+        self._auto_output_path = ""
 
         self._worker: Optional[ExtractionWorker] = None
         self._thread: Optional[QThread] = None
@@ -269,13 +274,12 @@ class VideoImporterDialog(QDialog):
         self._info_lbl.setStyleSheet(_LABEL_DIM)
         vlay.addWidget(self._info_lbl)
 
-        # ── True capture rate ──────────────────────────────────────────
-        # The container's fps is a playback hint, not physics. High-speed
-        # footage is almost always saved slowed-down, so trusting it makes
-        # dt too large and scales every velocity and strain rate down by
-        # exactly the slow-down factor.
+        # ── Source capture rate ────────────────────────────────────────
+        # This is the acquisition rate before the extraction step. The actual
+        # sample rate used by DIC is shown immediately below and is computed as
+        # source rate / extraction step.
         cap_row = QHBoxLayout()
-        cap_lbl = QLabel("True capture rate:")
+        cap_lbl = QLabel("Source capture rate:")
         cap_lbl.setStyleSheet(_LABEL_PRI)
         cap_row.addWidget(cap_lbl)
         self._capture_fps_spin = QDoubleSpinBox()
@@ -283,18 +287,25 @@ class VideoImporterDialog(QDialog):
         self._capture_fps_spin.setDecimals(2)
         self._capture_fps_spin.setValue(25.0)
         self._capture_fps_spin.setStyleSheet(_SPIN)
-        self._capture_fps_spin.setToolTip(
-            "Frames per second the camera actually recorded at.\n\n"
-            "Video files store a playback rate, which for high-speed footage is\n"
-            "deliberately much lower than the capture rate (e.g. 2000 Hz recorded,\n"
-            "50 fps written out so it plays back in slow motion).\n\n"
-            "Velocity and strain rate divide by Δt = 1 / this value, so leaving it\n"
-            "at the playback rate scales those results down by the slow-down factor."
+        capture_tip = (
+            "Frame rate of the source recording before frame extraction.\n\n"
+            "For an ordinary video, leave the detected value unchanged. Override it\n"
+            "only when the file metadata is wrong, or when high-speed footage was\n"
+            "saved with a different playback rate.\n\n"
+            "If Step is N, PyDIC analyses every Nth frame and uses:\n"
+            "effective sample rate = source capture rate / N\n"
+            "Δt = N / source capture rate.\n\n"
+            "The effective rate and Δt are shown below. They control velocity and\n"
+            "strain-rate calculations; this setting does not alter the video itself."
         )
-        self._capture_fps_spin.valueChanged.connect(self._update_capture_note)
+        cap_lbl.setToolTip(capture_tip)
+        self._capture_fps_spin.setToolTip(capture_tip)
+        self._capture_fps_spin.valueChanged.connect(self._on_capture_rate_changed)
         cap_row.addWidget(self._capture_fps_spin)
-        cap_row.addWidget(QLabel("Hz"))
-        cap_row.itemAt(cap_row.count() - 1).widget().setStyleSheet(_LABEL_DIM)
+        cap_unit = QLabel("Hz")
+        cap_unit.setStyleSheet(_LABEL_DIM)
+        cap_unit.setToolTip(capture_tip)
+        cap_row.addWidget(cap_unit)
         cap_row.addStretch()
         vlay.addLayout(cap_row)
 
@@ -302,6 +313,40 @@ class VideoImporterDialog(QDialog):
         self._capture_note.setStyleSheet(_LABEL_DIM)
         self._capture_note.setWordWrap(True)
         vlay.addWidget(self._capture_note)
+
+        # Spatial calibration belongs at extraction time beside temporal
+        # calibration. It is written into dic_metadata.json and handed directly
+        # back to the analysis, so video and image-sequence imports behave the
+        # same way and reopening the extracted folder restores the mapping.
+        scale_row = QHBoxLayout()
+        scale_lbl = QLabel("Pixel-to-length mapping:")
+        scale_lbl.setStyleSheet(_LABEL_PRI)
+        scale_row.addWidget(scale_lbl)
+        one_px = QLabel("1 px =")
+        one_px.setStyleSheet(_LABEL_DIM)
+        scale_row.addWidget(one_px)
+        self._px_size_spin = QDoubleSpinBox()
+        self._px_size_spin.setRange(0.0, 1e9)
+        self._px_size_spin.setDecimals(6)
+        self._px_size_spin.setSpecialValueText("— unknown —")
+        self._px_size_spin.setStyleSheet(_SPIN)
+        self._px_size_spin.setToolTip(
+            "Physical length represented by one source-video pixel.\n"
+            "Leave at 0 to report displacement in pixels.")
+        scale_row.addWidget(self._px_size_spin)
+        self._px_unit_combo = QComboBox()
+        self._px_unit_combo.addItems(LENGTH_UNIT_ORDER)
+        self._px_unit_combo.setStyleSheet(
+            "QComboBox { background:#21262d; color:#e6edf3; "
+            "border:1px solid #30363d; border-radius:5px; padding:3px 6px; }")
+        scale_row.addWidget(self._px_unit_combo)
+        scale_row.addStretch()
+        vlay.addLayout(scale_row)
+
+        initial_unit = self._initial_calibration.display_unit
+        self._px_unit_combo.setCurrentText(initial_unit)
+        self._px_size_spin.setValue(
+            self._initial_calibration.pixel_size_in(initial_unit) or 0.0)
 
         root.addWidget(vgrp)
 
@@ -500,9 +545,13 @@ class VideoImporterDialog(QDialog):
         self._preview_slider.setEnabled(True)
         self._preview_slider.setValue(0)
 
-        if not self._out_edit.text():
-            base = os.path.splitext(path)[0] + "_frames"
+        base = os.path.splitext(path)[0] + "_frames"
+        # If the user chooses a second video in the same dialog, follow it with
+        # a new automatic output folder. Preserve only a genuinely hand-edited
+        # destination; the old automatic path belonged to the previous video.
+        if not self._out_edit.text() or self._out_edit.text() == self._auto_output_path:
             self._out_edit.setText(base)
+        self._auto_output_path = base
 
         self._update_count_label()
         self._extract_btn.setEnabled(True)
@@ -583,6 +632,12 @@ class VideoImporterDialog(QDialog):
             elif ratio < 0.99:
                 txt += f"   (file reports {container:.2f} fps)"
         note.setText(txt)
+
+    def _on_capture_rate_changed(self, *_args) -> None:
+        """Keep both the derived-rate note and preview timestamp in sync."""
+        self._update_capture_note()
+        if self._cap is not None and self._preview_slider.isEnabled():
+            self._show_frame(self._preview_slider.value())
 
     def _browse_out(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.start_dir)
@@ -680,6 +735,7 @@ class VideoImporterDialog(QDialog):
                     "capture_fps": self._capture_fps_spin.value(),
                     "container_fps": self._fps,
                     "extraction_step": self._step_spin.value(),
+                    "calibration": self.get_calibration().to_dict(),
                 }, f)
         except Exception as e:
             print(f"Failed to save metadata: {e}")
@@ -704,6 +760,12 @@ class VideoImporterDialog(QDialog):
     @property
     def video_path(self) -> str:
         return self._video_path or ""
+
+    def get_calibration(self) -> Calibration:
+        value = float(self._px_size_spin.value())
+        unit = self._px_unit_combo.currentText()
+        return (Calibration.from_pixel_size(value, unit)
+                if value > 0 else Calibration(None, unit))
 
     # ------------------------------------------------------------------
     # Cleanup
