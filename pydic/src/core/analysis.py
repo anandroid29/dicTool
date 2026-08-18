@@ -26,7 +26,7 @@ except ImportError:
     _HAS_CUPY = False
 
 from .rg_dic import DICParams, DICResult, run_rg_dic
-from .strain_accum import StrainAccumulator, total_strain
+from .strain_accum import StrainAccumulator
 from .roi_loader import load_roi_mask
 from .units import Calibration
 
@@ -39,11 +39,48 @@ _FIELD_BASE_UNIT = {
     "u_inc": "px", "v_inc": "px", "mag_inc": "px",
     "Vx": "px/s", "Vy": "px/s", "Veff": "px/s",
     "Exx": "", "Exy": "", "Eyy": "", "Eeff": "",
-    "Exx_rate": "1/s", "Exy_rate": "1/s", "Eyy_rate": "1/s", "Eeff_rate": "1/s",
+    "Exx_inf": "", "Exy_inf": "", "Gxy_inf": "", "Eyy_inf": "", "Eeff_inf": "",
+    "Exx_gl": "", "Exy_gl": "", "Gxy_gl": "", "Eyy_gl": "", "Eeff_gl": "",
+    "Exx_rate": "1/s", "Exy_rate": "1/s", "Gxy_rate": "1/s",
+    "Eyy_rate": "1/s", "Eeff_rate": "1/s",
     "dVx_dx": "1/s", "dVx_dy": "1/s", "dVy_dx": "1/s", "dVy_dy": "1/s",
     "du_dx": "", "du_dy": "", "dv_dx": "", "dv_dy": "",
     "corr": "ZNSSD",
 }
+
+
+def _result_f32(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Compact a completed result field without changing solver precision.
+
+    Correlation, interpolation, gradient fitting and accumulation continue in
+    float64.  Once a frame is finished, keeping every display/export field in
+    float64 doubles long-sequence RAM for no useful precision: HDF5 already
+    writes float32, and the UI cannot display the extra digits.  ``asarray``
+    avoids a second copy when a field is already compact.
+    """
+    if arr is None:
+        return None
+    out = np.asarray(arr, dtype=np.float32)
+    infinite = np.isinf(out)
+    if infinite.any():
+        out = out.copy()
+        out[infinite] = np.nan
+    return out
+
+
+def _finite_measurement_mask(base: np.ndarray, *fields: np.ndarray) -> np.ndarray:
+    """One validity rule for solver output, derivatives, display and export."""
+    valid = np.asarray(base, dtype=bool).copy()
+    for field in fields:
+        valid &= np.isfinite(field)
+    return valid
+
+
+def _mask_invalid(valid: np.ndarray, *fields: np.ndarray) -> None:
+    """Replace every rejected or non-finite measurement with NaN in-place."""
+    for field in fields:
+        if field is not None:
+            field[~valid | ~np.isfinite(field)] = np.nan
 
 
 @dataclass
@@ -60,10 +97,8 @@ class PairResult:
     dv_dx: np.ndarray
     dv_dy: np.ndarray
     corr:  np.ndarray
-    # Frame-to-frame displacement: how far each material point moved since the
-    # PREVIOUS frame, as opposed to u/v which accumulate from the reference.
-    # Both are Lagrangian -- indexed by reference-frame material point -- so the
-    # increment is a plain difference at matching indices.
+    # u/v are immediate previous-frame -> current-frame displacement.  These
+    # aliases are retained for file/API compatibility and carry the same values.
     u_inc:   Optional[np.ndarray] = None
     v_inc:   Optional[np.ndarray] = None
     mag_inc: Optional[np.ndarray] = None
@@ -76,16 +111,27 @@ class PairResult:
     dVy_dy: Optional[np.ndarray] = None
     Exx_rate:  Optional[np.ndarray] = None
     Exy_rate:  Optional[np.ndarray] = None
+    Gxy_rate:  Optional[np.ndarray] = None
     Eyy_rate:  Optional[np.ndarray] = None
     Eeff_rate: Optional[np.ndarray] = None
-    # True where u/v/strain are live, trustworthy accumulated values for THIS
-    # frame. A point whose history broke (occlusion, dropout, ROI loss) is
-    # False here even though its arrays may still hold a frozen last-known
-    # number -- kept for backward compatibility with anything indexing the
-    # raw arrays, but display/export code should mask by this field, not by
-    # isnan(u) alone, since a frozen value is not NaN.
+    # True where the current interval displacement is trustworthy. Accumulated
+    # strain fields use the same current-frame visibility mask; retained private
+    # history is never published while a point is lost.
     valid: Optional[np.ndarray] = None
     elapsed: float = 0.0
+    # Explicit accumulated strain formulations. Exy is tensor shear; Gxy is
+    # engineering shear. Equivalent fields accumulate the positive magnitude
+    # of each frame's increment, as requested.
+    Exx_inf: Optional[np.ndarray] = None
+    Exy_inf: Optional[np.ndarray] = None
+    Gxy_inf: Optional[np.ndarray] = None
+    Eyy_inf: Optional[np.ndarray] = None
+    Eeff_inf: Optional[np.ndarray] = None
+    Exx_gl: Optional[np.ndarray] = None
+    Exy_gl: Optional[np.ndarray] = None
+    Gxy_gl: Optional[np.ndarray] = None
+    Eyy_gl: Optional[np.ndarray] = None
+    Eeff_gl: Optional[np.ndarray] = None
 
 
 class DICAnalysis:
@@ -100,6 +146,7 @@ class DICAnalysis:
         # Spatial calibration. Uncalibrated by default: the solver is pixel-native
         # and stays that way -- this only affects how results are presented.
         self.calibration: Calibration = Calibration()
+        self.prefer_gpu: bool = True
         self._cancel: list = [False]
 
         # Human-readable notes about anything load_settings had to correct. The
@@ -139,12 +186,37 @@ class DICAnalysis:
             fill_holes=getattr(self.params, "dynamic_roi_fill_holes", True),
         )
 
+    def reference_analysis_mask(self) -> Optional[np.ndarray]:
+        """Mask shown by the dynamic-ROI editor on the reference image.
+
+        This is also the authoritative preview mask for the parameters page and
+        analysis frame 1, so those screens cannot show three different ROIs for
+        the same configured reference frame.
+        """
+        if self._ref_image is None:
+            return None
+        static = (self._roi_mask if self._roi_mask is not None
+                  else np.ones(self._ref_image.shape, dtype=bool))
+        roi = self.make_dynamic_roi()
+        roi.calibrate(self._ref_image)
+        dynamic = roi.mask(self._ref_image)
+        return static.copy() if dynamic is None else np.asarray(dynamic, dtype=bool)
+
     def set_reference(self, path: str) -> None:
+        # A reference owns every spatially dependent state below it. Keeping an
+        # old ROI override or completed result after selecting new footage made
+        # later pages display a plausible mixture of two sessions.
+        self.results.clear()
         self.ref_path = path
         self._ref_image = _load_image(path)
         self._roi_mask = None
+        self.dynamic_include_mask = None
+        self.dynamic_exclude_mask = None
 
     def add_deformed(self, path: str) -> None:
+        # The existing result sequence no longer describes the input list once
+        # a frame is added.
+        self.results.clear()
         self.def_paths.append(path)
 
     def clear_deformed(self) -> None:
@@ -155,17 +227,25 @@ class DICAnalysis:
         if self._ref_image is not None and mask.shape != self._ref_image.shape:
             raise ValueError(f"ROI mask shape {mask.shape} != reference {self._ref_image.shape}")
         self._roi_mask = mask.astype(bool)
+        self.results.clear()
 
     def set_roi_from_file(self, path: str) -> None:
         if self._ref_image is None:
             raise RuntimeError("Load reference image before setting ROI from file.")
         mask = load_roi_mask(path, expected_shape=self._ref_image.shape)
-        self._roi_mask = mask
+        self.set_roi_mask(mask)
 
     def set_full_roi(self) -> None:
         if self._ref_image is None:
             raise RuntimeError("Load reference first.")
-        self._roi_mask = np.ones(self._ref_image.shape, dtype=bool)
+        self.set_roi_mask(np.ones(self._ref_image.shape, dtype=bool))
+
+    def clear_roi(self) -> None:
+        """Clear ROI state and every result/override that depends on it."""
+        self._roi_mask = None
+        self.dynamic_include_mask = None
+        self.dynamic_exclude_mask = None
+        self.results.clear()
 
     @property
     def reference_image(self) -> Optional[np.ndarray]:
@@ -205,6 +285,7 @@ class DICAnalysis:
             self.set_full_roi()
 
         ref = self._ref_image
+        prev_image = ref
         mask = self._roi_mask
         n = len(self.def_paths)
 
@@ -217,6 +298,10 @@ class DICAnalysis:
         # docstring, which the GPU path already follows.
         dyn_roi = self.make_dynamic_roi()
         dyn_roi.calibrate(ref)
+
+        accum = StrainAccumulator(
+            ref.shape, self.params.effective_strain_window(),
+            self.params.subset_spacing)
 
         for i, def_path in enumerate(self.def_paths):
             if self._cancel[0]:
@@ -233,66 +318,81 @@ class DICAnalysis:
 
             t0 = time.perf_counter()
             dic = run_rg_dic(
-                ref, cur, mask, self.params,
+                prev_image, cur, mask, self.params,
                 seed_xy=seed_xy, progress_cb=pair_cb, cancel_flag=self._cancel,
                 guess_u=guess_u, guess_v=guess_v,
                 use_gpu=use_gpu,
             )
             elapsed = time.perf_counter() - t0
 
-            valid = dic.analyzed & ~np.isnan(dic.u)
+            valid = _finite_measurement_mask(
+                dic.analyzed, dic.u, dic.v, dic.corr)
 
             d_mask = dyn_roi.mask(cur)
             if d_mask is not None and valid.any():
                 y_ref, x_ref = np.where(valid)
-                x_cur = np.round(x_ref + dic.u[valid]).astype(int)
-                y_cur = np.round(y_ref + dic.v[valid]).astype(int)
+                x_pos = x_ref + dic.u[valid]
+                y_pos = y_ref + dic.v[valid]
                 H_i, W_i = cur.shape
-                
-                kept = (x_cur >= 0) & (x_cur < W_i) & (y_cur >= 0) & (y_cur < H_i)
+                kept = (np.isfinite(x_pos) & np.isfinite(y_pos) &
+                        (x_pos >= 0) & (x_pos <= W_i - 1) &
+                        (y_pos >= 0) & (y_pos <= H_i - 1))
                 in_bnd_idx = np.where(kept)[0]
-                kept[in_bnd_idx] = d_mask[y_cur[in_bnd_idx], x_cur[in_bnd_idx]]
+                x_cur = np.rint(x_pos[in_bnd_idx]).astype(np.intp)
+                y_cur = np.rint(y_pos[in_bnd_idx]).astype(np.intp)
+                kept[in_bnd_idx] = d_mask[y_cur, x_cur]
                 
                 lost = ~kept
                 y_lost, x_lost = y_ref[lost], x_ref[lost]
                 
-                dic.u[y_lost, x_lost] = np.nan
-                dic.v[y_lost, x_lost] = np.nan
-                dic.du_dx[y_lost, x_lost] = np.nan
-                dic.du_dy[y_lost, x_lost] = np.nan
-                dic.dv_dx[y_lost, x_lost] = np.nan
-                dic.dv_dy[y_lost, x_lost] = np.nan
-                dic.corr[y_lost, x_lost] = np.nan
-                
                 valid[y_lost, x_lost] = False
+
+            _mask_invalid(valid, dic.u, dic.v, dic.du_dx, dic.du_dy,
+                          dic.dv_dx, dic.dv_dy, dic.corr)
 
             if valid.any():
                 guess_u = float(np.median(dic.u[valid]))
                 guess_v = float(np.median(dic.v[valid]))
 
-            # Strain was previously never computed on this path -- every strain
-            # field was handed out as an all-NaN placeholder, so selecting Exx /
-            # Eyy / Exy / Eeff in the results view showed nothing at all. This
-            # path correlates every frame directly against the fixed reference,
-            # so the displacement field IS the total field and finite strain
-            # follows from it directly.
-            st = total_strain(dic.u, dic.v, valid, self.params.effective_strain_window())
+            # The dynamic mask has already invalidated all rejected increments,
+            # so no off-frame or excluded affine gradient can enter accumulated
+            # strain before it is hidden from the UI.
+            accum.add_frame(dic.u, dic.v, dic.du_dx, dic.du_dy,
+                            dic.dv_dx, dic.dv_dy)
+            st = accum.results()
+
+            # Persist one compact copy of every unique field.  The ambiguous
+            # legacy strain names are aliases of the explicit infinitesimal
+            # fields, not four additional full-frame arrays.
+            u_out = _result_f32(np.where(valid, dic.u, np.nan))
+            v_out = _result_f32(np.where(valid, dic.v, np.nan))
+            exx_inf = _result_f32(st["Exx_inf"])
+            exy_inf = _result_f32(st["Exy_inf"])
+            eyy_inf = _result_f32(st["Eyy_inf"])
+            eeff_inf = _result_f32(st["Eeff_inf"])
 
             self.results.append(PairResult(
                 image_path=def_path,
-                u=dic.u, v=dic.v,
-                Exx=np.where(valid, st["Exx"], np.nan),
-                Exy=np.where(valid, st["Exy"], np.nan),
-                Eyy=np.where(valid, st["Eyy"], np.nan),
-                # Hencky equivalent strain. Green-Lagrange overstates badly past
-                # ~20%, which is routine here.
-                Eeff=np.where(valid, st["Eeff_log"], np.nan),
-                du_dx=np.where(valid, dic.du_dx, np.nan),
-                du_dy=np.where(valid, dic.du_dy, np.nan),
-                dv_dx=np.where(valid, dic.dv_dx, np.nan),
-                dv_dy=np.where(valid, dic.dv_dy, np.nan),
-                corr=dic.corr, valid=valid.copy(), elapsed=elapsed,
+                u=u_out, v=v_out,
+                Exx=exx_inf, Exy=exy_inf, Eyy=eyy_inf, Eeff=eeff_inf,
+                du_dx=_result_f32(st["du_dx"]),
+                du_dy=_result_f32(st["du_dy"]),
+                dv_dx=_result_f32(st["dv_dx"]),
+                dv_dy=_result_f32(st["dv_dy"]),
+                corr=_result_f32(dic.corr), valid=valid.copy(), elapsed=elapsed,
+                Exx_inf=exx_inf, Exy_inf=exy_inf,
+                Gxy_inf=_result_f32(st["Gxy_inf"]), Eyy_inf=eyy_inf,
+                Eeff_inf=eeff_inf,
+                Exx_gl=_result_f32(st["Exx_gl"]),
+                Exy_gl=_result_f32(st["Exy_gl"]),
+                Gxy_gl=_result_f32(st["Gxy_gl"]),
+                Eyy_gl=_result_f32(st["Eyy_gl"]),
+                Eeff_gl=_result_f32(st["Eeff_gl"]),
             ))
+
+            # Immediate-frame analysis: the current image becomes the next
+            # reference. Previous displacement is used only as a seed hint.
+            prev_image = cur
 
         if not self._cancel[0] and self.results:
             self._compute_incremental_displacements()
@@ -348,22 +448,14 @@ class DICAnalysis:
         warm_start_active = False
         guess_u, guess_v = 0.0, 0.0
 
-        # --- Updated Lagrangian: accumulate total displacement from incremental ---
-        # Always start from None. Keying this off hasattr(self, 'H_ref') meant a
-        # SECOND run on the same DICAnalysis began with a stale all-NaN array
-        # instead, so the first frame took a different code path than it did on
-        # the first run.
-        total_u = None
-        total_v = None
-        # Position hints handed to the solver: last-known offsets for every
-        # started point, including ones that dropped out. Distinct from
-        # total_u/total_v, which are masked to valid points for reporting.
+        # Private accumulated position hints are used by the temporal solver to
+        # keep following material. Public u/v remain immediate displacement.
         hint_u = None
         hint_v = None
-        total_du_dx = None; total_du_dy = None
-        total_dv_dx = None; total_dv_dy = None
         prev_image = self._ref_image  # first reference is frame 0
-        accum = None
+        accum = StrainAccumulator(
+            self._ref_image.shape, self.params.effective_strain_window(),
+            self.params.subset_spacing)
         dyn_roi = self.make_dynamic_roi()
         dyn_roi.calibrate(self._ref_image)
 
@@ -420,7 +512,10 @@ class DICAnalysis:
                     cur_image, warm_start=True, total_u=hint_u, total_v=hint_v
                 )
 
-                valid_count = np.count_nonzero(~np.isnan(inc_u[self._roi_mask]))
+                valid_count = np.count_nonzero(
+                    np.isfinite(inc_u[self._roi_mask]) &
+                    np.isfinite(inc_v[self._roi_mask]) &
+                    np.isfinite(corr_f[self._roi_mask]))
                 survival_rate = valid_count / max(1, expected_subsets)
 
                 if survival_rate < 0.60:
@@ -440,49 +535,44 @@ class DICAnalysis:
                         cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False, total_u=hint_u, total_v=hint_v
                     )
 
-            # --- Accumulate incremental -> total displacement and strain ---
-            # Delegated to StrainAccumulator, which (a) never replaces an
-            # existing accumulated total with a bare increment, and (b) re-bases
-            # a point that returns after a gap from its live neighbours instead
-            # of retiring it permanently.
-            if accum is None:
-                accum = StrainAccumulator((H_img, W_img), self.params.effective_strain_window())
-            accum.add_frame(inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy)
-
-            # Dynamic ROI uses TOTAL displacement for coordinate mapping. Applied
-            # BEFORE the frame's outputs are snapshotted -- doing it afterwards
-            # left PairResult.valid disagreeing with the strain arrays computed
-            # from accum.results() in the same iteration.
+            # Dynamic ROI rejection must happen BEFORE strain accumulation. In
+            # the old order, a subset that left the frame could contribute one
+            # huge affine increment permanently and was only hidden afterwards.
             d_mask = dyn_roi.mask(cur_image)
             if d_mask is not None:
-                vmask = accum.valid
+                vmask = _finite_measurement_mask(
+                    np.ones(inc_u.shape, dtype=bool), inc_u, inc_v, corr_f)
                 if vmask.any():
                     y_ref, x_ref = np.where(vmask)
-                    x_cur = np.round(x_ref + accum.u[vmask]).astype(int)
-                    y_cur = np.round(y_ref + accum.v[vmask]).astype(int)
+                    prior_u = (np.where(np.isfinite(hint_u), hint_u, 0.0)
+                               if hint_u is not None else 0.0)
+                    prior_v = (np.where(np.isfinite(hint_v), hint_v, 0.0)
+                               if hint_v is not None else 0.0)
+                    x_pos = (x_ref +
+                             (prior_u[vmask] if isinstance(prior_u, np.ndarray) else prior_u) +
+                             inc_u[vmask])
+                    y_pos = (y_ref +
+                             (prior_v[vmask] if isinstance(prior_v, np.ndarray) else prior_v) +
+                             inc_v[vmask])
                     H_i, W_i = cur_image.shape
-                    kept = (x_cur >= 0) & (x_cur < W_i) & (y_cur >= 0) & (y_cur < H_i)
+                    kept = (np.isfinite(x_pos) & np.isfinite(y_pos) &
+                            (x_pos >= 0) & (x_pos <= W_i - 1) &
+                            (y_pos >= 0) & (y_pos <= H_i - 1))
                     ib = np.where(kept)[0]
-                    kept[ib] = d_mask[y_cur[ib], x_cur[ib]]
-                    lost_mask = np.zeros((H_i, W_i), bool)
-                    lost_mask[y_ref[~kept], x_ref[~kept]] = True
-                    # Drops the point for THIS frame only. Its accumulated total
-                    # is retained so that if the mask picks it up again the
-                    # accumulator can resume it rather than start it over.
-                    accum.mark_lost(lost_mask)
+                    x_cur = np.rint(x_pos[ib]).astype(np.intp)
+                    y_cur = np.rint(y_pos[ib]).astype(np.intp)
+                    kept[ib] = d_mask[y_cur, x_cur]
+                    ly, lx = y_ref[~kept], x_ref[~kept]
+                    inc_u[ly, lx] = np.nan
 
-            # accum.u/v deliberately retain the last known total for points that
-            # dropped out this frame, so they are unsafe to publish as-is: a
-            # consumer (notably the frame-to-frame difference in
-            # _compute_velocities_and_rates) would see an ordinary-looking
-            # number that had quietly stopped updating. Mask on the way out.
-            frame_valid = accum.valid
-            total_u = np.where(frame_valid, accum.u, np.nan)
-            total_v = np.where(frame_valid, accum.v, np.nan)
-            total_du_dx = np.where(frame_valid, inc_du_dx, np.nan)
-            total_du_dy = np.where(frame_valid, inc_du_dy, np.nan)
-            total_dv_dx = np.where(frame_valid, inc_dv_dx, np.nan)
-            total_dv_dy = np.where(frame_valid, inc_dv_dy, np.nan)
+            measurement_valid = _finite_measurement_mask(
+                np.ones(inc_u.shape, dtype=bool), inc_u, inc_v, corr_f)
+            _mask_invalid(measurement_valid, inc_u, inc_v, inc_du_dx,
+                          inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f)
+
+            accum.add_frame(inc_u, inc_v, inc_du_dx, inc_du_dy,
+                            inc_dv_dx, inc_dv_dy)
+            frame_valid = accum.valid & measurement_valid
 
             # Unmasked last-known positions, for the next frame's search. Keep
             # these separate from the reported totals: feeding the masked (NaN)
@@ -491,7 +581,8 @@ class DICAnalysis:
             hint_u, hint_v = accum.position_hint()
 
             # Track seed displacement for NCC initial guess (incremental, small)
-            if np.isfinite(inc_u[actual_seed_y, actual_seed_x]):
+            if (np.isfinite(inc_u[actual_seed_y, actual_seed_x]) and
+                    np.isfinite(inc_v[actual_seed_y, actual_seed_x])):
                 guess_u = float(inc_u[actual_seed_y, actual_seed_x])
                 guess_v = float(inc_v[actual_seed_y, actual_seed_x])
 
@@ -502,19 +593,39 @@ class DICAnalysis:
             elapsed = time.perf_counter() - t0
 
             st = accum.results()
+            u_out = _result_f32(np.where(frame_valid, inc_u, np.nan))
+            v_out = _result_f32(np.where(frame_valid, inc_v, np.nan))
+            exx_inf = _result_f32(st["Exx_inf"])
+            exy_inf = _result_f32(st["Exy_inf"])
+            eyy_inf = _result_f32(st["Eyy_inf"])
+            eeff_inf = _result_f32(st["Eeff_inf"])
             self.results.append(PairResult(
                 image_path=def_path,
-                u=total_u.copy(), v=total_v.copy(),
-                # Accumulated finite strain. Eeff is the PATH-INTEGRATED
-                # equivalent strain -- the correct measure through a shear zone
-                # with large rotation, and the one comparable to the
-                # gamma/sqrt(3) figures quoted in the machining literature.
-                Exx=st["Exx"].copy(), Exy=st["Exy"].copy(),
-                Eyy=st["Eyy"].copy(), Eeff=st["Eeff_path"].copy(),
-                du_dx=total_du_dx.copy(), du_dy=total_du_dy.copy(),
-                dv_dx=total_dv_dx.copy(), dv_dy=total_dv_dy.copy(),
-                corr=corr_f, valid=frame_valid.copy(), elapsed=elapsed
+                u=u_out, v=v_out,
+                # Legacy aliases mean accumulated infinitesimal strain. Explicit
+                # formulation names below are what the UI presents.
+                Exx=exx_inf, Exy=exy_inf, Eyy=eyy_inf, Eeff=eeff_inf,
+                du_dx=_result_f32(st["du_dx"]),
+                du_dy=_result_f32(st["du_dy"]),
+                dv_dx=_result_f32(st["dv_dx"]),
+                dv_dy=_result_f32(st["dv_dy"]),
+                corr=_result_f32(corr_f), valid=frame_valid.copy(), elapsed=elapsed,
+                Exx_inf=exx_inf, Exy_inf=exy_inf,
+                Gxy_inf=_result_f32(st["Gxy_inf"]), Eyy_inf=eyy_inf,
+                Eeff_inf=eeff_inf,
+                Exx_gl=_result_f32(st["Exx_gl"]),
+                Exy_gl=_result_f32(st["Exy_gl"]),
+                Gxy_gl=_result_f32(st["Gxy_gl"]),
+                Eyy_gl=_result_f32(st["Eyy_gl"]),
+                Eeff_gl=_result_f32(st["Eeff_gl"]),
             ))
+
+            # CuPy's pool deliberately caches freed rescue/IC-GN workspaces.
+            # Their shapes vary with each frame's active subset count, so a
+            # long sequence can retain many large, unusable blocks and appear
+            # to leak gigabytes. Persistent solver arrays remain referenced;
+            # this releases only blocks that are no longer in use.
+            gpu_solver.release_temporary_memory()
 
         if not self._cancel[0] and self.results:
             self._compute_incremental_displacements()
@@ -524,102 +635,45 @@ class DICAnalysis:
             progress_cb(1.0, "Complete.")
 
     def _compute_incremental_displacements(self) -> None:
-        """Per-frame displacement increments, u_inc[i] = u[i] - u[i-1].
+        """Populate compatibility aliases for immediate displacement.
 
-        u/v accumulate against the fixed reference, so at frame 900 they report
-        the whole history rather than what happened between frames 899 and 900.
-        Both fields index the same reference-frame material points, which is what
-        makes the plain difference the correct material increment.
-
-        Frame 0 has no predecessor: its increment is its own displacement from
-        the reference, which is exactly the reference -> frame-0 step.
-
-        A point needs valid data at BOTH ends for its increment to mean anything.
-        Where it does not, the increment is NaN rather than a difference taken
-        against a frozen or missing value.
+        u/v already mean previous-frame -> current-frame motion.  Subtracting
+        adjacent result fields here would incorrectly produce acceleration-like
+        data, so u_inc/v_inc are direct copies.
         """
-        def _val(r) -> np.ndarray:
-            m = np.isfinite(r.u) & np.isfinite(r.v)
-            return (m & r.valid) if r.valid is not None else m
-
-        prev = None
-        prev_val = None
         for res in self.results:
-            here_val = _val(res)
-            if prev is None:
-                u_i = np.where(here_val, res.u, np.nan)
-                v_i = np.where(here_val, res.v, np.nan)
+            valid = np.isfinite(res.u) & np.isfinite(res.v)
+            if res.valid is not None:
+                valid &= res.valid
+            # u/v already carry the interval displacement. Normalise their mask
+            # once, then share the exact arrays with the compatibility aliases
+            # instead of retaining two additional full-frame copies per result.
+            if not np.all(valid == (np.isfinite(res.u) & np.isfinite(res.v))):
+                res.u = _result_f32(np.where(valid, res.u, np.nan))
+                res.v = _result_f32(np.where(valid, res.v, np.nan))
             else:
-                both = here_val & prev_val
-                u_i = np.where(both, res.u - prev.u, np.nan)
-                v_i = np.where(both, res.v - prev.v, np.nan)
-
-            res.u_inc, res.v_inc = u_i, v_i
+                res.u = _result_f32(res.u)
+                res.v = _result_f32(res.v)
+            res.u_inc = res.u
+            res.v_inc = res.v
             with np.errstate(invalid="ignore"):
-                res.mag_inc = np.sqrt(u_i ** 2 + v_i ** 2)
-
-            prev, prev_val = res, here_val
+                res.mag_inc = _result_f32(np.sqrt(res.u ** 2 + res.v ** 2))
 
     def _compute_velocities_and_rates(self, progress_cb: Optional[Callable[[float, str], None]] = None) -> None:
         N = len(self.results)
-        if N < 2: return
+        if N < 1: return
         dt = 1.0 / max(self.fps, 1e-9)
 
-        # A point can be valid at frames i-1 and i+1 but NaN at i (a single
-        # dropped frame that healed), or vice-versa. Differencing blindly
-        # propagates one bad/missing frame into its TWO neighbours' velocity.
-        # Use the same central/forward/backward difference as before, but pick
-        # it per-point from whichever neighbours are actually finite.
-        #
-        # Only a 3-frame sliding window is held. Stacking all N frames needed
-        # 2 * N * H * W * 8 bytes -- at 1280x720 that is ~15 MB per frame per
-        # component, so a 1700-frame sequence asked for ~50 GB up front and
-        # simply raised MemoryError before any velocity was produced.
-        def _val(k):
-            r = self.results[k]
-            m = np.isfinite(r.u) & np.isfinite(r.v)
-            return (m & r.valid) if r.valid is not None else m
-
-        prev_val = None
-        here_val = _val(0)
-        for i in range(N):
-            next_val = _val(i + 1) if i < N - 1 else None
-
-            u_here, v_here = self.results[i].u, self.results[i].v
-            Vx = np.full(u_here.shape, np.nan)
-            Vy = np.full(u_here.shape, np.nan)
-
-            zero = np.zeros_like(here_val)
-            has_prev = prev_val if prev_val is not None else zero
-            has_next = next_val if next_val is not None else zero
-
-            central = here_val & has_prev & has_next
-            fwd_only = here_val & ~central & has_next
-            bwd_only = here_val & ~central & ~fwd_only & has_prev
-
-            if central.any():
-                u_p, v_p = self.results[i - 1].u, self.results[i - 1].v
-                u_n, v_n = self.results[i + 1].u, self.results[i + 1].v
-                Vx[central] = (u_n[central] - u_p[central]) / (2 * dt)
-                Vy[central] = (v_n[central] - v_p[central]) / (2 * dt)
-            if fwd_only.any():
-                u_n, v_n = self.results[i + 1].u, self.results[i + 1].v
-                Vx[fwd_only] = (u_n[fwd_only] - u_here[fwd_only]) / dt
-                Vy[fwd_only] = (v_n[fwd_only] - v_here[fwd_only]) / dt
-            if bwd_only.any():
-                u_p, v_p = self.results[i - 1].u, self.results[i - 1].v
-                Vx[bwd_only] = (u_here[bwd_only] - u_p[bwd_only]) / dt
-                Vy[bwd_only] = (v_here[bwd_only] - v_p[bwd_only]) / dt
-            # A point valid only at frame i, with neither neighbour usable, has
-            # no basis for a velocity estimate -- left as NaN rather than 0.0,
-            # which previously looked like "material genuinely at rest".
-
-            res = self.results[i]
-            res.Vx, res.Vy = Vx, Vy
+        # Each result is one measured interval, so its instantaneous mean
+        # velocity is displacement divided by that interval's duration.
+        for res in self.results:
+            valid = np.isfinite(res.u) & np.isfinite(res.v)
+            if res.valid is not None:
+                valid &= res.valid
+            res.Vx = _result_f32(np.where(valid, res.u / dt, np.nan))
+            res.Vy = _result_f32(np.where(valid, res.v / dt, np.nan))
             with np.errstate(invalid="ignore"):
-                res.Veff = np.sqrt(Vx ** 2 + Vy ** 2)
-
-            prev_val, here_val = here_val, next_val
+                res.Veff = _result_f32(np.sqrt(res.Vx ** 2 + res.Vy ** 2))
 
         from .strain import compute_velocity_strains
         mask = self._roi_mask if self._roi_mask is not None else np.ones_like(self.results[0].u, dtype=bool)
@@ -629,17 +683,22 @@ class DICAnalysis:
                 p = 0.90 + 0.07 * (i / max(1, N))
                 progress_cb(p, f"[{i + 1}/{N}] Computing strain rates…")
 
-            valid = mask & ~np.isnan(res.Vx) & ~np.isnan(res.Vy)
-            rates = compute_velocity_strains(res.Vx, res.Vy, valid, self.params.effective_strain_window())
+            valid = mask & np.isfinite(res.Vx) & np.isfinite(res.Vy)
+            rates = compute_velocity_strains(
+                res.Vx, res.Vy, valid, self.params.effective_strain_window(),
+                self.params.subset_spacing)
 
-            res.dVx_dx = rates["dVx_dx"]
-            res.dVx_dy = rates["dVx_dy"]
-            res.dVy_dx = rates["dVy_dx"]
-            res.dVy_dy = rates["dVy_dy"]
-            res.Exx_rate = rates["Exx_rate"]
-            res.Exy_rate = rates["Exy_rate"]
-            res.Eyy_rate = rates["Eyy_rate"]
-            res.Eeff_rate = rates["Eeff_rate"]
+            # Exx_rate and Eyy_rate are exactly the corresponding diagonal
+            # velocity gradients, so share those arrays too.
+            res.dVx_dx = _result_f32(rates["dVx_dx"])
+            res.dVx_dy = _result_f32(rates["dVx_dy"])
+            res.dVy_dx = _result_f32(rates["dVy_dx"])
+            res.dVy_dy = _result_f32(rates["dVy_dy"])
+            res.Exx_rate = res.dVx_dx
+            res.Exy_rate = _result_f32(rates["Exy_rate"])
+            res.Gxy_rate = _result_f32(rates["Gxy_rate"])
+            res.Eyy_rate = res.dVy_dy
+            res.Eeff_rate = _result_f32(rates["Eeff_rate"])
 
     def get_trajectories(self, max_frame: int, step: int = 10) -> list[list[tuple[float, float]]]:
         if not self.results or max_frame < 0:
@@ -665,6 +724,8 @@ class DICAnalysis:
         active = np.ones(N_particles, dtype=bool)
 
         paths = [[(float(x), float(y))] for x, y in zip(x0, y0)]
+        cum_u = np.zeros(N_particles, dtype=float)
+        cum_v = np.zeros(N_particles, dtype=float)
 
         for i in range(0, max_frame + 1):
             if i >= len(self.results):
@@ -675,9 +736,12 @@ class DICAnalysis:
 
             lost = ~np.isfinite(u_i) | ~np.isfinite(v_i)
             active[lost] = False
+            cum_u[active] += u_i[active]
+            cum_v[active] += v_i[active]
 
             for p_idx in np.where(active)[0]:
-                paths[p_idx].append((float(x0[p_idx] + u_i[p_idx]), float(y0[p_idx] + v_i[p_idx])))
+                paths[p_idx].append((float(x0[p_idx] + cum_u[p_idx]),
+                                     float(y0[p_idx] + cum_v[p_idx])))
 
         return [p for p in paths if len(p) > 1]
 
@@ -731,13 +795,21 @@ class DICAnalysis:
         if not self.results:
             return None
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
-        res = self.results[idx]
-        v = np.isfinite(res.u) & np.isfinite(res.v)
+        u_total = np.zeros_like(self.results[0].u, dtype=float)
+        v_total = np.zeros_like(self.results[0].v, dtype=float)
+        v = np.ones_like(self.results[0].u, dtype=bool)
+        for res in self.results[:idx + 1]:
+            here = np.isfinite(res.u) & np.isfinite(res.v)
+            if res.valid is not None:
+                here &= res.valid
+            v &= here
+            u_total[here] += res.u[here]
+            v_total[here] += res.v[here]
         if not v.any():
             return None
         ys, xs = np.nonzero(v)
-        cx = xs + res.u[ys, xs]
-        cy = ys + res.v[ys, xs]
+        cx = xs + u_total[ys, xs]
+        cy = ys + v_total[ys, xs]
         d2 = (cx - x) ** 2 + (cy - y) ** 2
         i = int(np.argmin(d2))
         return (float(xs[i]), float(ys[i])), float(np.sqrt(d2[i]))
@@ -747,13 +819,19 @@ class DICAnalysis:
         if not self.results or not seeds:
             return [None] * len(seeds)
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
-        res = self.results[idx]
         out = []
         for (sx, sy) in seeds:
-            u = self._sample_sparse(res.u, sx, sy)
-            v = self._sample_sparse(res.v, sx, sy)
-            out.append(None if not (np.isfinite(u) and np.isfinite(v))
-                       else (float(sx + u), float(sy + v)))
+            u_total = v_total = 0.0
+            valid = True
+            for res in self.results[:idx + 1]:
+                u = self._sample_sparse(res.u, sx, sy)
+                v = self._sample_sparse(res.v, sx, sy)
+                if not (np.isfinite(u) and np.isfinite(v)):
+                    valid = False
+                    break
+                u_total += u
+                v_total += v
+            out.append((float(sx + u_total), float(sy + v_total)) if valid else None)
         return out
 
     def get_trajectories_from_seeds(self, seeds, max_frame: int, trail: int = 0
@@ -777,13 +855,16 @@ class DICAnalysis:
         for (sx, sy) in seeds:
             pts: list[tuple[float, float]] = [(float(sx), float(sy))]
             lost_at = None
+            u_total = v_total = 0.0
             for i in range(0, last + 1):
                 u = self._sample_sparse(self.results[i].u, sx, sy)
                 v = self._sample_sparse(self.results[i].v, sx, sy)
                 if not (np.isfinite(u) and np.isfinite(v)):
                     lost_at = i
                     break
-                pts.append((float(sx + u), float(sy + v)))
+                u_total += u
+                v_total += v
+                pts.append((float(sx + u_total), float(sy + v_total)))
             if trail and trail > 0 and len(pts) > trail + 1:
                 pts = pts[-(trail + 1):]
             out.append({"points": pts, "lost_at": lost_at,
@@ -797,16 +878,14 @@ class DICAnalysis:
     # quantity below is derived from that interval alone, so several pairs drawn
     # from different parts of a sequence can be averaged into one field.
     #
-    # Cumulative strain is deliberately absent. Exx/Eyy/Exy/Eeff measure total
-    # deformation since the reference, so they carry the whole history before
-    # the pair even begins -- averaging them across pairs would average that
-    # shared history, not the pairs. Rates and displacements are interval
-    # quantities and average correctly.
+    # Accumulated strain is deliberately absent. A selected interval can combine
+    # immediate displacements and rates, but its accumulated history is not an
+    # independent measurement that can be averaged across arbitrary pairs.
 
     PAIR_FIELDS = ("u", "v", "u_inc", "v_inc", "mag_inc",
                    "Vx", "Vy", "Veff",
                    "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
-                   "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate")
+                   "Exx_rate", "Exy_rate", "Gxy_rate", "Eyy_rate", "Eeff_rate")
 
     def pair_interval(self, i: int, j: int) -> float:
         """Elapsed time between two frames, in seconds."""
@@ -826,15 +905,23 @@ class DICAnalysis:
         if j < i:
             i, j = j, i
 
-        a, b = self.results[i], self.results[j]
-
-        def _val(r):
-            m = np.isfinite(r.u) & np.isfinite(r.v)
-            return (m & r.valid) if r.valid is not None else m
-
-        ok = _val(a) & _val(b)
-        du = np.where(ok, b.u - a.u, np.nan)
-        dv = np.where(ok, b.v - a.v, np.nan)
+        # Result k is the interval entering displayed frame k. Therefore the
+        # displacement from displayed frame i to j is the sum of intervals
+        # i+1..j, not the difference between two already-incremental fields.
+        interval_results = self.results[i + 1:j + 1]
+        u_stack = np.stack([np.where(np.isfinite(r.u), r.u, np.nan)
+                            for r in interval_results])
+        v_stack = np.stack([np.where(np.isfinite(r.v), r.v, np.nan)
+                            for r in interval_results])
+        valid_stack = []
+        for r in interval_results:
+            rv = np.isfinite(r.u) & np.isfinite(r.v)
+            if r.valid is not None:
+                rv &= r.valid
+            valid_stack.append(rv)
+        ok = np.all(np.stack(valid_stack), axis=0)
+        du = np.where(ok, np.sum(u_stack, axis=0), np.nan)
+        dv = np.where(ok, np.sum(v_stack, axis=0), np.nan)
         with np.errstate(invalid="ignore"):
             mag = np.sqrt(du ** 2 + dv ** 2)
 
@@ -849,7 +936,8 @@ class DICAnalysis:
         roi = self._roi_mask if self._roi_mask is not None else np.ones(du.shape, dtype=bool)
         rate_valid = roi & np.isfinite(Vx) & np.isfinite(Vy)
         rates = compute_velocity_strains(
-            Vx, Vy, rate_valid, self.params.effective_strain_window())
+            Vx, Vy, rate_valid, self.params.effective_strain_window(),
+            self.params.subset_spacing)
 
         nan = np.full(du.shape, np.nan)
         return PairResult(
@@ -859,11 +947,12 @@ class DICAnalysis:
             Exx=nan.copy(), Exy=nan.copy(), Eyy=nan.copy(), Eeff=nan.copy(),
             du_dx=nan.copy(), du_dy=nan.copy(),
             dv_dx=nan.copy(), dv_dy=nan.copy(),
-            corr=np.where(ok, b.corr, np.nan),
+            corr=np.where(ok, self.results[j].corr, np.nan),
             Vx=Vx, Vy=Vy, Veff=Veff,
             dVx_dx=rates["dVx_dx"], dVx_dy=rates["dVx_dy"],
             dVy_dx=rates["dVy_dx"], dVy_dy=rates["dVy_dy"],
             Exx_rate=rates["Exx_rate"], Exy_rate=rates["Exy_rate"],
+            Gxy_rate=rates["Gxy_rate"],
             Eyy_rate=rates["Eyy_rate"], Eeff_rate=rates["Eeff_rate"],
             valid=ok, elapsed=dt,
         )
@@ -892,6 +981,7 @@ class DICAnalysis:
                     # all-NaN pixels warn under plain nanmean; they are expected
                     # here and must stay NaN.
                     arr = np.stack(stack)
+                    arr = np.where(np.isfinite(arr), arr, np.nan)
                     counts = np.sum(np.isfinite(arr), axis=0)
                     summed = np.nansum(arr, axis=0)
                     mean = np.where(counts > 0, summed / np.maximum(counts, 1), np.nan)
@@ -928,10 +1018,11 @@ class DICAnalysis:
         base = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in base).strip("_")
         base = base or "export"
         fields = ("u", "v", "u_inc", "v_inc", "mag_inc",
-                  "Exx", "Exy", "Eyy", "Eeff",
+                  "Exx_inf", "Eyy_inf", "Exy_inf", "Gxy_inf", "Eeff_inf",
+                  "Exx_gl", "Eyy_gl", "Exy_gl", "Gxy_gl", "Eeff_gl",
                   "Vx", "Vy", "Veff",
                   "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
-                  "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate", "corr")
+                  "Exx_rate", "Exy_rate", "Gxy_rate", "Eyy_rate", "Eeff_rate", "corr")
         # CSV is a one-way export, so write the values as displayed and state the
         # unit in the header. (HDF5 is different: it must round-trip, so it keeps
         # raw pixels plus the calibration as metadata.) With no calibration set
@@ -948,6 +1039,7 @@ class DICAnalysis:
                 continue
             base_unit = _FIELD_BASE_UNIT.get(name, "")
             out, unit = self.calibration.convert(name, arr, base_unit)
+            out = np.where(np.isfinite(out), out, np.nan)
             header = f"{name} [{unit}]" if unit else name
             if self.calibration.calibrated:
                 header += f"  ({self.calibration.describe()})"
@@ -959,6 +1051,10 @@ class DICAnalysis:
         with h5py.File(path, "w") as f:
             # 1. Save Global Attributes
             f.attrs.update(dict(
+                result_schema=3,
+                displacement_semantics="immediate_previous_frame",
+                strain_semantics="componentwise_accumulated_incremental",
+                equivalent_semantics="sum_of_incremental_magnitudes",
                 reference_image=self.ref_path or "",
                 subset_radius=self.params.subset_radius,
                 subset_spacing=self.params.subset_spacing,
@@ -991,14 +1087,19 @@ class DICAnalysis:
                 g.attrs["elapsed_s"] = res.elapsed
                 fields = ("u", "v", "u_inc", "v_inc", "mag_inc",
                           "Exx", "Exy", "Eyy", "Eeff",
+                          "Exx_inf", "Eyy_inf", "Exy_inf", "Gxy_inf", "Eeff_inf",
+                          "Exx_gl", "Eyy_gl", "Exy_gl", "Gxy_gl", "Eeff_gl",
                           "Vx", "Vy", "Veff",
                           "du_dx", "du_dy", "dv_dx", "dv_dy",
                           "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
-                          "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate", "corr")
+                          "Exx_rate", "Exy_rate", "Gxy_rate", "Eyy_rate", "Eeff_rate",
+                          "corr", "valid")
                 for name in fields:
                     arr = getattr(res, name, None)
                     if arr is not None:
-                        g.create_dataset(name, data=arr.astype(np.float32),
+                        data = (arr.astype(bool) if name == "valid" else
+                                _result_f32(arr))
+                        g.create_dataset(name, data=data,
                                          compression="gzip", compression_opts=4)
 
     def load_hdf5(self, path: str) -> None:
@@ -1008,6 +1109,7 @@ class DICAnalysis:
 
         with h5py.File(path, "r") as f:
             # 1. Restore Global Attributes
+            result_schema = int(f.attrs.get("result_schema", 1))
             self.ref_path = f.attrs.get("reference_image", "")
             try:
                 if self.ref_path and os.path.exists(self.ref_path):
@@ -1050,20 +1152,71 @@ class DICAnalysis:
                     dv_dx=g["dv_dx"][:] if "dv_dx" in g else np.zeros(0),
                     dv_dy=g["dv_dy"][:] if "dv_dy" in g else np.zeros(0),
                     corr=g["corr"][:] if "corr" in g else np.zeros(0),
+                    valid=g["valid"][:].astype(bool) if "valid" in g else None,
                     elapsed=float(g.attrs.get("elapsed_s", 0.0))
                 )
                 extra_fields = ("u_inc", "v_inc", "mag_inc",
                                 "Vx", "Vy", "Veff", "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
-                                "Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate")
+                                "Exx_rate", "Exy_rate", "Gxy_rate", "Eyy_rate", "Eeff_rate",
+                                "Exx_inf", "Eyy_inf", "Exy_inf", "Gxy_inf", "Eeff_inf",
+                                "Exx_gl", "Eyy_gl", "Exy_gl", "Gxy_gl", "Eeff_gl")
                 for rate in extra_fields:
                     if rate in g:
-                        setattr(res, rate, g[rate][:])
+                        setattr(res, rate, _result_f32(g[rate][:]))
+
+                # Loaded files use the same compact in-memory representation as
+                # a fresh run. Schema-3 u_inc/v_inc and the legacy strain names
+                # are exact aliases by definition; reading their duplicate HDF5
+                # datasets into separate arrays used nearly twice the necessary
+                # memory when reopening a long result file.
+                for name in ("u", "v", "Exx", "Exy", "Eyy", "Eeff",
+                             "du_dx", "du_dy", "dv_dx", "dv_dy", "corr"):
+                    setattr(res, name, _result_f32(getattr(res, name)))
+                if result_schema >= 3:
+                    res.u_inc = res.u
+                    res.v_inc = res.v
+                if res.Exx_inf is not None:
+                    res.Exx = res.Exx_inf
+                    res.Exy = res.Exy_inf
+                    res.Eyy = res.Eyy_inf
+                    res.Eeff = res.Eeff_inf
+                if res.Exx_rate is not None:
+                    res.dVx_dx = res.Exx_rate
+                if res.Eyy_rate is not None:
+                    res.dVy_dy = res.Eyy_rate
                 self.results.append(res)
 
-        # Files written before incremental displacement existed carry only the
-        # cumulative fields. Deriving them here costs one subtraction per frame
-        # and spares the user a full re-run to see the new view.
-        if self.results and any(r.u_inc is None for r in self.results):
+                # Backward-compatible interpretation for files that predate
+                # explicit formulation names. Their legacy strain is exposed as
+                # infinitesimal only; Green-Lagrange remains unavailable rather
+                # than being silently fabricated.
+                if res.Exx_inf is None:
+                    res.Exx_inf = res.Exx
+                    res.Eyy_inf = res.Eyy
+                    res.Exy_inf = res.Exy
+                    res.Gxy_inf = 2.0 * res.Exy
+                    res.Eeff_inf = res.Eeff
+
+        # Files written before schema 3 stored cumulative u/v. Convert their
+        # display fields to frame increments once; schema-3 files already store
+        # immediate displacement and only need direct aliases.
+        if self.results and result_schema < 3:
+            prev_u = prev_v = prev_valid = None
+            for res in self.results:
+                here = np.isfinite(res.u) & np.isfinite(res.v)
+                if prev_u is None:
+                    u_i = np.where(here, res.u, np.nan)
+                    v_i = np.where(here, res.v, np.nan)
+                else:
+                    both = here & prev_valid
+                    u_i = np.where(both, res.u - prev_u, np.nan)
+                    v_i = np.where(both, res.v - prev_v, np.nan)
+                prev_u, prev_v, prev_valid = res.u.copy(), res.v.copy(), here
+                res.u, res.v = u_i, v_i
+                res.valid = np.isfinite(u_i) & np.isfinite(v_i)
+            self._compute_incremental_displacements()
+            self._compute_velocities_and_rates()
+        elif self.results and any(r.u_inc is None for r in self.results):
             self._compute_incremental_displacements()
 
     def _get_settings_path(self) -> str:
@@ -1104,9 +1257,10 @@ class DICAnalysis:
                 migrated = []
                 if "calibration" in data:
                     self.calibration = Calibration.from_dict(data.get("calibration"))
+                self.prefer_gpu = bool(data.get("prefer_gpu", self.prefer_gpu))
 
                 for k, v in data.items():
-                    if k in ("schema_version", "calibration"):
+                    if k in ("schema_version", "calibration", "prefer_gpu"):
                         continue
                     if stale and k in DROP_ON_MIGRATE:
                         migrated.append(k)
@@ -1182,11 +1336,13 @@ class DICAnalysis:
                 "conv_tol": self.params.conv_tol,
                 "corr_cutoff": self.params.corr_cutoff,
                 "search_radius": self.params.search_radius,
+                "rescue_radius": getattr(self.params, "rescue_radius", 12),
                 "dynamic_roi": getattr(self.params, "dynamic_roi", "None"),
                 "dynamic_roi_threshold": getattr(self.params, "dynamic_roi_threshold", None),
                 "dynamic_roi_min_area_frac": getattr(self.params, "dynamic_roi_min_area_frac", 0.02),
                 "dynamic_roi_fill_holes": getattr(self.params, "dynamic_roi_fill_holes", True),
                 "calibration": self.calibration.to_dict(),
+                "prefer_gpu": bool(getattr(self, "prefer_gpu", True)),
                 "shape_order": getattr(self.params, "shape_order", 1),
                 "mask_subsets_to_roi": getattr(self.params, "mask_subsets_to_roi", True),
 
@@ -1195,8 +1351,26 @@ class DICAnalysis:
                 "last_image_directory": getattr(self, "last_image_directory", os.path.expanduser("~")),
                 "last_hdf5_directory": getattr(self, "last_hdf5_directory", os.path.expanduser("~")),
             }
-            with open(path, "w") as f:
-                json.dump(data, f, indent=4)
+            # Atomic replacement: a crash or forced close during json.dump must
+            # not leave a half-written settings file that disconnects every UI
+            # control from its cached value on the next launch.
+            import tempfile
+            parent = os.path.dirname(os.path.abspath(path))
+            os.makedirs(parent, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".pydic_settings_", suffix=".tmp", dir=parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             print(f"[Error] Failed to save settings to {path}: {e}")
 
