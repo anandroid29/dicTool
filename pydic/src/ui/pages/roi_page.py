@@ -223,7 +223,14 @@ class ROIPage(QWidget):
 
     # ------------------------------------------------------------------
     def _on_dynamic_changed(self, text: str) -> None:
-        self._wizard.analysis.params.dynamic_roi = text
+        analysis = self._wizard.analysis
+        old = getattr(analysis.params, "dynamic_roi", "None")
+        analysis.params.dynamic_roi = text
+        if old != text:
+            analysis.results.clear()
+            # The choice lives on this page, so cache it here rather than
+            # relying on a later Parameters/Run action the user may never reach.
+            analysis.save_settings()
         self._next_btn.setText("Dynamic ROI  →" if text not in ("None", "")
                                else "Parameters  →")
 
@@ -254,6 +261,9 @@ class ROIPage(QWidget):
             self._roi_lbl.setStyleSheet("color:#10b981; font-size:11px;")
             self._next_btn.setEnabled(n > 0)
         else:
+            # Do not leave the previous video's outline painted over a new
+            # reference when the model correctly has no ROI yet.
+            self._canvas.clear_roi()
             self._roi_lbl.setText("No ROI drawn")
             self._roi_lbl.setStyleSheet("color:#94a3b8; font-size:11px;")
             self._next_btn.setEnabled(False)
@@ -275,6 +285,7 @@ class ROIPage(QWidget):
     def _clear_roi(self) -> None:
         """Reset the ROI and drop any existing seed."""
         self._canvas.clear_roi()
+        self._wizard.analysis.clear_roi()
         self._wizard.seed_xy = None
         self._seed_status.setText("No seed — will default to ROI centroid")
         self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")

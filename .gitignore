@@ -7,3 +7,7 @@
 *.mp4
 __pycache__/
 *.py[cod]
+/output/
+sample video_frames
+tmp/
+tests/

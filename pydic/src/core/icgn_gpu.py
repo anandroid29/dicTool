@@ -104,6 +104,21 @@ class GPUWavefrontDIC:
         intensity data is replaced with the new (previous) frame."""
         self.ref_coeff = self._spline_coeff(new_ref_image)
 
+    @staticmethod
+    def release_temporary_memory() -> None:
+        """Return unused per-frame workspaces to the CUDA driver.
+
+        CuPy's default allocator is a caching pool.  That is normally good for
+        repeated equal-size operations, but wavefront and rescue batches vary
+        with tracking survival, leaving differently sized multi-hundred-MB
+        blocks cached across frames.  ``free_all_blocks`` never frees live
+        arrays (reference coefficients, grid state, warm starts); it only drops
+        blocks whose owning temporaries have already gone out of scope.
+        """
+        cp.cuda.get_current_stream().synchronize()
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+
     def _out_of_bounds(self, xs: "cp.ndarray", ys: "cp.ndarray") -> "cp.ndarray":
         """Per-subset flag: does any pixel of this subset fall outside the image?
 

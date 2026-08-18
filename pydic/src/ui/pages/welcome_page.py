@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox
 )
 
-from src.core.units import LENGTH_UNIT_ORDER
+from src.core.units import Calibration, LENGTH_UNIT_ORDER
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
@@ -102,10 +102,14 @@ class _ImportCard(QFrame):
 
 
 class ImageLoadSettingsDialog(QDialog):
-    def __init__(self, image_files: List[str], folder: str, fps_from_meta: Optional[float] = None, parent=None):
+    def __init__(self, image_files: List[str], folder: str,
+                 fps_from_meta: Optional[float] = None,
+                 initial_calibration: Optional[Calibration] = None,
+                 parent=None):
         super().__init__(parent)
         self._folder = folder
         self._fps_from_meta = fps_from_meta
+        self._initial_calibration = initial_calibration or Calibration()
         self.setWindowTitle("Image Loading Settings")
         self.setMinimumWidth(500)
         self.setStyleSheet(f"""
@@ -164,10 +168,12 @@ class ImageLoadSettingsDialog(QDialog):
             self._fps_from_meta if self._fps_from_meta is not None else 1.0)
         self.fps_spin.setStyleSheet(f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px;")
         self.fps_spin.setToolTip(
-            "True rate the camera captured at, in Hz.\n\n"
-            "For high-speed footage this is not the video's playback rate — a\n"
-            "2000 Hz recording is often written out as a 50 fps slow-motion file.\n"
-            "Δt = 1 / this value drives velocity and strain rate."
+            "Sample rate of this already-extracted image sequence, in Hz.\n\n"
+            "This is the number of analysed images per second, after any frame\n"
+            "skipping performed during video extraction. PyDIC uses Δt = 1 / rate\n"
+            "for velocity and strain-rate calculations.\n\n"
+            "A value detected from dic_metadata.json is pre-filled but remains\n"
+            "editable if the metadata is incorrect."
         )
         fps_lay.addWidget(self.fps_spin)
 
@@ -190,7 +196,9 @@ class ImageLoadSettingsDialog(QDialog):
         self.px_size_spin = QDoubleSpinBox()
         self.px_size_spin.setRange(0.0, 1e9)
         self.px_size_spin.setDecimals(6)
-        self.px_size_spin.setValue(0.0)
+        initial_unit = self._initial_calibration.display_unit
+        self.px_size_spin.setValue(
+            self._initial_calibration.pixel_size_in(initial_unit) or 0.0)
         self.px_size_spin.setSpecialValueText("— unknown —")
         self.px_size_spin.setToolTip(
             "Physical size of one pixel, so results read in real units.\n"
@@ -203,7 +211,7 @@ class ImageLoadSettingsDialog(QDialog):
 
         self.px_unit_combo = QComboBox()
         self.px_unit_combo.addItems(LENGTH_UNIT_ORDER)
-        self.px_unit_combo.setCurrentText("mm")
+        self.px_unit_combo.setCurrentText(initial_unit)
         self.px_unit_combo.setStyleSheet(
             f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; "
             f"padding:4px 8px; border-radius:4px;")
@@ -279,7 +287,6 @@ class ImageLoadSettingsDialog(QDialog):
 
     def get_calibration(self):
         """Calibration chosen in this dialog (uncalibrated when pixel size is 0)."""
-        from src.core.units import Calibration
         val = float(self.px_size_spin.value())
         unit = self.px_unit_combo.currentText()
         return Calibration.from_pixel_size(val, unit) if val > 0 else Calibration(None, unit)
@@ -412,7 +419,9 @@ class WelcomePage(QWidget):
         from src.ui.video_importer import VideoImporterDialog
 
         start_dir = self._get_safe_start_dir("last_video_directory")
-        dlg = VideoImporterDialog(self, start_dir=start_dir)
+        dlg = VideoImporterDialog(
+            self, start_dir=start_dir,
+            initial_calibration=self._wizard.analysis.calibration)
 
         if dlg.exec() == 0 or not dlg.extracted_paths:
             return
@@ -428,6 +437,8 @@ class WelcomePage(QWidget):
 
         def_paths = [p for i, p in enumerate(paths) if i != ref_idx]
         analysis = self._wizard.analysis
+        analysis.calibration = dlg.get_calibration()
+        analysis.save_settings()
 
         original_fps = 1.0
         out_dir = os.path.dirname(paths[0])
@@ -445,6 +456,7 @@ class WelcomePage(QWidget):
 
         analysis.set_reference(ref_path)
         analysis.clear_deformed()
+        self._wizard.seed_xy = None
         for p in def_paths:
             analysis.add_deformed(p)
 
@@ -485,6 +497,7 @@ class WelcomePage(QWidget):
 
         # Attempt to read metadata
         original_fps = None
+        metadata_calibration = None
         meta_path = os.path.join(folder, "dic_metadata.json")
         if os.path.exists(meta_path):
             try:
@@ -492,12 +505,18 @@ class WelcomePage(QWidget):
                     meta = json.load(f)
                     if "fps" in meta:
                         original_fps = float(meta["fps"])
+                    if "calibration" in meta:
+                        metadata_calibration = Calibration.from_dict(meta["calibration"])
             except Exception:
                 pass
 
         try:
             # We pass the auto-detected path to the dialog so it's pre-filled
-            dlg = ImageLoadSettingsDialog(img_files, folder, original_fps, self)
+            dlg = ImageLoadSettingsDialog(
+                img_files, folder, original_fps,
+                initial_calibration=(metadata_calibration or
+                                     self._wizard.analysis.calibration),
+                parent=self)
             if roi_auto_path:
                 dlg.roi_edit.setText(roi_auto_path)
 
@@ -544,6 +563,7 @@ class WelcomePage(QWidget):
 
         analysis.set_reference(ref)
         analysis.clear_deformed()
+        self._wizard.seed_xy = None
         for p in defs:
             analysis.add_deformed(p)
 
@@ -576,8 +596,11 @@ class WelcomePage(QWidget):
         self._status_def.setText(f"{len(defs)} deformed frame{'s' if len(defs)!=1 else ''} loaded")
         self._status_def.setStyleSheet(f"color:{_C_SUCCESS}; font-size:12px; border:none;")
         if fps > 1.0:
-            self._status_fps.setText(f"   Effective sample rate: {fps:.2f} fps  ·  Δt = {1000/fps:.1f} ms per frame")
+            time_text = (f"Effective sample rate: {fps:.2f} fps  ·  "
+                         f"Δt = {1000/fps:.1f} ms per frame")
         else:
-            self._status_fps.setText("   No fps metadata — strain rate will use Δt = 1 s")
+            time_text = "No fps metadata — strain rate will use Δt = 1 s"
+        scale_text = self._wizard.analysis.calibration.describe()
+        self._status_fps.setText(f"   {time_text}  ·  {scale_text}")
         self._status_box.setVisible(True)
         self._next_btn.setEnabled(len(defs) > 0)

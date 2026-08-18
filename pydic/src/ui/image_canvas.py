@@ -297,7 +297,7 @@ class ImageCanvas(QWidget):
         self._result_arr = field
         import matplotlib, matplotlib.cm as mcm
         cmap = mcm.get_cmap(colormap)
-        valid = mask & ~np.isnan(field)
+        valid = np.asarray(mask, dtype=bool) & np.isfinite(field)
 
         if valid.any():
             valid_data = field[valid]

@@ -2,6 +2,7 @@
 theme.py — PyDIC professional dark theme
 Color palette: deep navy background, electric blue accent, slate text.
 """
+from pathlib import Path
 
 # Raw color tokens
 C_BG       = "#08111d"
@@ -20,6 +21,8 @@ C_TEXT2    = "#94a3b8"
 C_TEXT3    = "#475569"
 C_RUN      = "#10b981"
 C_RUN_H    = "#059669"
+
+_CHECKMARK = (Path(__file__).resolve().parent / "assets" / "checkmark.svg").as_posix()
 
 STYLESHEET = f"""
 /* ── Base ──────────────────────────────────────────────────────────── */
@@ -211,6 +214,7 @@ QCheckBox::indicator {{
 QCheckBox::indicator:checked {{
     background: {C_ACCENT};
     border-color: {C_ACCENT};
+    image: url("{_CHECKMARK}");
 }}
 QCheckBox:hover {{ color: {C_TEXT}; }}
 QCheckBox:disabled {{ color: {C_TEXT3}; }}

@@ -267,50 +267,49 @@ class AnalysisPage(QWidget):
 
             # --- Draw live ROI overlay ---
             try:
-                if idx < len(analysis.results):
-                    result = analysis.results[idx]
-                    if result is not None and hasattr(result, 'u'):
-                        valid_mask = np.isfinite(result.u)
-                        if valid_mask.any():
-                            s = max(1, analysis.params.subset_spacing)
+                dense_mask = None
+                source_mask = self._thumbnail_source_mask(idx)
+                if idx == 0:
+                    # Keep frame 1 identical to the mask approved on the
+                    # Dynamic ROI page. Later thumbnails continue to show the
+                    # measured per-frame validity as before.
+                    if source_mask is not None:
+                        dense_mask = source_mask.astype(np.uint8) * 255
+                elif source_mask is not None:
+                    valid_mask = source_mask
+                    if valid_mask.any():
+                        s = max(1, analysis.params.subset_spacing)
 
-                            # Dilate the sparse subset grid into a solid mask
-                            kernel = np.ones((s + 1, s + 1), np.uint8)
-                            dense_mask = cv2.dilate(
-                                valid_mask.astype(np.uint8), kernel
-                            )
+                        # Dilate the sparse subset grid into a solid mask
+                        kernel = np.ones((s + 1, s + 1), np.uint8)
+                        dense_mask = cv2.dilate(
+                            valid_mask.astype(np.uint8), kernel
+                        )
 
-                            # Fill enclosed holes using flood-fill from borders:
-                            # 1. Pad with a 1px border of zeros
-                            # 2. Flood-fill from (0,0) to find exterior background
-                            # 3. Everything NOT exterior is ROI (fills interior holes)
-                            padded = np.zeros(
-                                (dense_mask.shape[0] + 2, dense_mask.shape[1] + 2),
-                                dtype=np.uint8,
-                            )
-                            padded[1:-1, 1:-1] = dense_mask
-                            flood = padded.copy()
-                            cv2.floodFill(flood, None, (0, 0), 255)
-                            # Invert: exterior=0, interior holes=255
-                            interior_holes = 255 - flood[1:-1, 1:-1]
-                            # Merge: original ROI + filled holes
-                            filled_mask = np.maximum(dense_mask * 255, interior_holes)
+                        # Fill enclosed holes using flood-fill from borders.
+                        padded = np.zeros(
+                            (dense_mask.shape[0] + 2, dense_mask.shape[1] + 2),
+                            dtype=np.uint8,
+                        )
+                        padded[1:-1, 1:-1] = dense_mask
+                        flood = padded.copy()
+                        cv2.floodFill(flood, None, (0, 0), 255)
+                        interior_holes = 255 - flood[1:-1, 1:-1]
+                        dense_mask = np.maximum(
+                            dense_mask * 255, interior_holes)
 
-                            # Resize to thumbnail dimensions
-                            thumb_mask = cv2.resize(
-                                filled_mask, (thumb_w, thumb_h),
-                                interpolation=cv2.INTER_NEAREST,
-                            )
-
-                            # Blend cyan tint onto valid pixels
-                            roi_pixels = thumb_mask > 0
-                            if roi_pixels.any():
-                                # Direct alpha blend (no cv2.addWeighted needed)
-                                cyan = np.array([0, 150, 255], dtype=np.float32)
-                                rgb[roi_pixels] = (
-                                    rgb[roi_pixels].astype(np.float32) * 0.55
-                                    + cyan * 0.45
-                                ).astype(np.uint8)
+                if dense_mask is not None and dense_mask.any():
+                    thumb_mask = cv2.resize(
+                        dense_mask, (thumb_w, thumb_h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    roi_pixels = thumb_mask > 0
+                    if roi_pixels.any():
+                        cyan = np.array([0, 150, 255], dtype=np.float32)
+                        rgb[roi_pixels] = (
+                            rgb[roi_pixels].astype(np.float32) * 0.55
+                            + cyan * 0.45
+                        ).astype(np.uint8)
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -326,6 +325,21 @@ class AnalysisPage(QWidget):
         except Exception:
             import traceback
             traceback.print_exc()
+
+    def _thumbnail_source_mask(self, idx: int) -> Optional[np.ndarray]:
+        """Authoritative mask before thumbnail-only densification."""
+        analysis = self._wizard.analysis
+        if idx == 0:
+            return analysis.reference_analysis_mask()
+        if idx < 0 or idx >= len(analysis.results):
+            return None
+        result = analysis.results[idx]
+        if result is None or not hasattr(result, "u"):
+            return None
+        valid = np.isfinite(result.u) & np.isfinite(result.v)
+        if result.valid is not None:
+            valid &= result.valid
+        return valid
 
     @pyqtSlot()
     def _on_finished(self) -> None:
