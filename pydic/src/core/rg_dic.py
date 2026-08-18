@@ -55,21 +55,30 @@ class DICParams:
 
     # strain_window is a half-width in PIXELS, but the least-squares plane fit
     # behind every strain field only ever sees correlation GRID points, which
-    # sit subset_spacing apart. The number of points actually feeding the fit is
-    # therefore (2*strain_window/subset_spacing + 1)^2, and strain.py needs at
-    # least 6 of them. Small window + large spacing silently produced an
-    # all-NaN strain field with no error anywhere -- the strain views just came
-    # up blank. Clamp instead, and say so.
-    MIN_STRAIN_PTS_PER_AXIS = 5
+    # sit subset_spacing apart. For a centred, symmetric window the exact number
+    # per axis is 2*floor(strain_window/subset_spacing) + 1.  A 3-by-3 regular
+    # neighbourhood supplies nine nominal samples, enough for strain.py's
+    # six-sample plane fit. Smaller windows can silently produce an all-NaN
+    # strain field, so clamp those and report the adjustment.
+    MIN_STRAIN_PTS_PER_AXIS = 3
 
-    def effective_strain_window(self, warn: bool = True) -> int:
-        need = int(np.ceil((self.MIN_STRAIN_PTS_PER_AXIS - 1) / 2.0)) * max(1, int(self.subset_spacing))
-        sw = int(self.strain_window)
-        if sw >= need:
+    def strain_points_per_axis(self, window: Optional[int] = None) -> int:
+        """Return the exact regular-grid support inside a symmetric window."""
+        sw = max(0, int(self.strain_window if window is None else window))
+        spacing = max(1, int(self.subset_spacing))
+        return 2 * (sw // spacing) + 1
+
+    def effective_strain_window(
+        self, warn: bool = True, window: Optional[int] = None
+    ) -> int:
+        spacing = max(1, int(self.subset_spacing))
+        need = int(np.ceil((self.MIN_STRAIN_PTS_PER_AXIS - 1) / 2.0)) * spacing
+        sw = int(self.strain_window if window is None else window)
+        if self.strain_points_per_axis(sw) >= self.MIN_STRAIN_PTS_PER_AXIS:
             return sw
         if warn and not getattr(self, "_strain_window_warned", False):
             print(f"[Params] strain_window={sw} px spans only "
-                  f"{2 * sw // max(1, self.subset_spacing) + 1} grid points at "
+                  f"{self.strain_points_per_axis(sw)} grid points at "
                   f"subset_spacing={self.subset_spacing}; too few for a strain fit. "
                   f"Using {need} px instead.")
             object.__setattr__(self, "_strain_window_warned", True)

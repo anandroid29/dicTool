@@ -30,6 +30,9 @@ LENGTH_UNIT_ORDER = ["m", "mm", "µm", "nm"]
 FIELD_DIMENSION = {
     "u": "length",
     "v": "length",
+    "u_inc": "length",
+    "v_inc": "length",
+    "mag_inc": "length",
     "Vx": "velocity",
     "Vy": "velocity",
     "Veff": "velocity",

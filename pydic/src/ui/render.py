@@ -112,11 +112,11 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
     """
     if arr is None or not _HAVE_CV2:
         return None
-    from scipy.ndimage import gaussian_filter
-    from scipy.interpolate import griddata
     import matplotlib.colors as mc
 
     valid = np.isfinite(arr)
+    if roi_mask is not None:
+        valid &= np.asarray(roi_mask, dtype=bool)
     if not valid.any():
         return None
 
@@ -131,32 +131,43 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
     small = cropped[0::s, 0::s]
     small_mask = cropped_mask[0::s, 0::s]
 
-    if not small_mask.all():
-        if not small_mask.any():
-            return None
-        sy, sx = np.where(small_mask)
-        gy, gx = np.mgrid[0:small.shape[0], 0:small.shape[1]]
-        small = griddata((sy, sx), small[small_mask], (gy, gx), method="nearest")
-        small = np.nan_to_num(small)
+    if not small_mask.any():
+        return None
 
     norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
     cmap_obj = get_cmap(cmap_name, 256)
 
-    rgba_small = cmap_obj(norm(small), bytes=True).astype(np.float32)
+    safe_small = np.where(small_mask, small, vmin)
+    rgba_small = cmap_obj(norm(safe_small), bytes=True).astype(np.float32)
     # Mild contrast lift so the field reads clearly over a grey background.
     rgba_small[..., :3] = np.clip(
         0.5 + (rgba_small[..., :3] / 255.0 - 0.5) * 1.35, 0.0, 1.0) * 255.0
-    rgba_small[..., 3] = float(alpha)
-    rgba_small[~small_mask, 3] = 0.0
+    # Resize premultiplied colour and coverage separately. Interpolating raw RGB
+    # lets arbitrary colours stored at transparent/invalid pixels bleed into a
+    # specimen edge; premultiplication makes invalid pixels contribute exactly
+    # zero to both display and export.
+    coverage_small = small_mask.astype(np.float32)
+    premult_small = rgba_small[..., :3] * coverage_small[..., None]
 
     th, tw = ymax - ymin + 1, xmax - xmin + 1
-    big = cv2.resize(rgba_small, (tw, th), interpolation=cv2.INTER_LINEAR)
+    coverage = cv2.resize(
+        coverage_small, (tw, th), interpolation=cv2.INTER_LINEAR)
+    premult = cv2.resize(
+        premult_small, (tw, th), interpolation=cv2.INTER_LINEAR)
+    if premult.ndim == 2:
+        premult = premult[..., None]
+    rgb = np.zeros_like(premult, dtype=np.float32)
+    np.divide(premult, coverage[..., None], out=rgb,
+              where=coverage[..., None] > 1e-6)
+    big = np.zeros((th, tw, 4), dtype=np.float32)
+    big[..., :3] = rgb
+    big[..., 3] = coverage * float(alpha)
 
     out = np.zeros((arr.shape[0], arr.shape[1], 4), np.float32)
     out[ymin:ymax + 1, xmin:xmax + 1] = big
     if roi_mask is not None:
         out[~roi_mask, 3] = 0.0
-    out[..., 3] = gaussian_filter(out[..., 3], sigma=0.5)
+    out[~np.isfinite(out)] = 0.0
     return np.ascontiguousarray(out.astype(np.uint8))
 
 
@@ -169,7 +180,8 @@ def gray_to_rgb(img: np.ndarray) -> np.ndarray:
     a = np.asarray(img, np.float64)
     if a.size and np.nanmax(a) <= 1.5:
         a = a * 255.0
-    a = np.clip(np.nan_to_num(a), 0, 255).astype(np.uint8)
+    a = np.clip(np.nan_to_num(a, nan=0.0, posinf=255.0, neginf=0.0),
+                0, 255).astype(np.uint8)
     return np.dstack([a, a, a])
 
 
