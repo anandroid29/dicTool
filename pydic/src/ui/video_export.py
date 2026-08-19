@@ -130,6 +130,7 @@ class ViewRenderer:
 
         unit = ""
         vmin = vmax = None
+        clip_low = clip_high = False
         if spec.content == "field":
             arr, unit = self.field_array(idx, spec.field)
             rng = spec.range_spec.resolve(
@@ -139,8 +140,14 @@ class ViewRenderer:
                 rgba = R.field_to_rgba(
                     arr, vmin, vmax, spec.cmap,
                     roi_mask=self.analysis.roi_mask,
-                    spacing=getattr(self.analysis.params, "subset_spacing", 3))
+                    spacing=getattr(self.analysis.params, "subset_spacing", 3),
+                    mark_out_of_range=spec.mark_out_of_range)
                 rgb = R.alpha_over(rgb, rgba)
+                # An exported figure leaves the tool and gets read on its own,
+                # so a trimmed scale has to declare itself on the colourbar.
+                finite = arr[np.isfinite(arr)]
+                clip_low = bool(np.any(finite < vmin))
+                clip_high = bool(np.any(finite > vmax))
 
         if spec.wants_streaklines and self.markers:
             # Trajectory only. The marker circle used to be stamped on the
@@ -149,7 +156,8 @@ class ViewRenderer:
             rgb = R.draw_streaklines(rgb, self._trajectories(idx), MARKER_RGB)
 
         if spec.content == "field" and spec.show_colorbar and vmin is not None:
-            rgb = R.draw_colorbar(rgb, spec.cmap, vmin, vmax, unit)
+            rgb = R.draw_colorbar(rgb, spec.cmap, vmin, vmax, unit,
+                                  clipped_low=clip_low, clipped_high=clip_high)
 
         if spec.show_label:
             label = spec.label or self._default_label(spec)
