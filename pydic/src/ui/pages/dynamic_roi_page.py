@@ -441,7 +441,9 @@ class DynamicROIPage(QWidget):
             self._updating = False
         self._thr_lbl.setText(f"{self._slider.value()}%")
 
-        m = roi.mask(ref)
+        # This editor is the one place where static ROI, overrides and texture
+        # mask are all in the same (reference-image) coordinate system.
+        m = roi.mask(ref, reference_frame=True)
         if m is None:
             self._canvas.clear_result_overlay()
             return

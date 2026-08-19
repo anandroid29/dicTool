@@ -33,11 +33,6 @@ if TYPE_CHECKING:
 
 from src.ui.image_canvas import ImageCanvas, marker_color
 
-try:
-    import cv2; _CV2 = True
-except ImportError:
-    _CV2 = False
-
 _C_BG      = "#08111d"
 _C_SURFACE = "#0e1c2e"
 _C_CARD    = "#132035"
@@ -110,6 +105,54 @@ def _group_of(field: str) -> str:
         if field in keys:
             return g
     return next(iter(FIELD_GROUPS))
+
+
+def _interpolate_between_subset_centres(
+        arr: np.ndarray, x: int, y: int, spacing: int, origin: int
+        ) -> Optional[float]:
+    """Bilinearly interpolate a sparse regular-grid field at ``(x, y)``.
+
+    Every contributing subset centre must contain a finite value.  This is
+    deliberately stricter than nearest-neighbour filling: a failed correlation,
+    dynamic-ROI hole, or specimen boundary must not be painted over with an
+    apparently trustworthy number.
+    """
+    if arr is None or arr.ndim != 2:
+        return None
+    h, w = arr.shape
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+
+    s = max(1, int(spacing))
+    o = int(origin)
+    gx = (x - o) / s
+    gy = (y - o) / s
+    ix0, ix1 = int(np.floor(gx)), int(np.ceil(gx))
+    iy0, iy1 = int(np.floor(gy)), int(np.ceil(gy))
+
+    # A missing value at an actual subset centre is a failed/unsupported
+    # measurement, not a gap that interpolation is allowed to conceal.
+    if ix0 == ix1 and iy0 == iy1:
+        return None
+
+    x0, x1 = o + ix0 * s, o + ix1 * s
+    y0, y1 = o + iy0 * s, o + iy1 * s
+    if x0 < 0 or x1 >= w or y0 < 0 or y1 >= h:
+        return None
+
+    x_terms = [(x0, 1.0)] if x0 == x1 else [
+        (x0, (x1 - x) / s), (x1, (x - x0) / s)]
+    y_terms = [(y0, 1.0)] if y0 == y1 else [
+        (y0, (y1 - y) / s), (y1, (y - y0) / s)]
+
+    value = 0.0
+    for sy, wy in y_terms:
+        for sx, wx in x_terms:
+            sample = arr[sy, sx]
+            if not np.isfinite(sample):
+                return None
+            value += float(sample) * wx * wy
+    return value if np.isfinite(value) else None
 
 
 # FEA-style rainbow ramps first: blue (low) through cyan/green/yellow to red
@@ -263,6 +306,7 @@ class ResultsPage(QWidget):
         self._wizard = wizard
         self._frame  = 0
         self._field  = "Eeff_rate"
+        self._unit_scale_cache: dict = {}
         # Frame-pair average. When set, the viewer shows this instead of a
         # single frame and the scrubber is inert -- the average has no position
         # in the sequence to scrub to.
@@ -803,6 +847,9 @@ class ResultsPage(QWidget):
         self._unit_combo.addItems(LENGTH_UNIT_ORDER)
         self._unit_combo.setCurrentText("mm")
         self._unit_combo.setFixedWidth(66)
+        self._unit_combo.setToolTip(
+            "Unit used to enter the pixel size. Result values automatically "
+            "promote to a larger engineering unit when they reach 100.")
         self._unit_combo.currentTextChanged.connect(self._on_calibration_changed)
         bot_lay.addWidget(self._unit_combo)
 
@@ -816,6 +863,7 @@ class ResultsPage(QWidget):
         val = float(self._px_size_spin.value())
         self._wizard.analysis.calibration = (
             Calibration.from_pixel_size(val, unit) if val > 0 else Calibration(None, unit))
+        self._unit_scale_cache.clear()
         try:
             self._wizard.analysis.save_settings()
         except Exception:
@@ -963,6 +1011,7 @@ class ResultsPage(QWidget):
     def on_enter(self) -> None:
         """Refresh after analysis completes."""
         n = len(self._wizard.analysis.results)
+        self._unit_scale_cache.clear()
         # Markers are indexed against the previous run's displacement fields, so
         # they are meaningless for a new sequence.
         self._canvas.clear_markers()
@@ -1170,15 +1219,49 @@ class ResultsPage(QWidget):
     # overlay range, colourbar, statistics -- goes through this one conversion
     # so the number and its unit can never disagree.
 
-    def _unit_factor(self) -> tuple:
-        cal = self._wizard.analysis.calibration
+    def _unit_factor(self, result=None, native_arr=None) -> tuple:
+        analysis = self._wizard.analysis
+        cal = analysis.calibration
         base = FIELDS.get(self._field, ("", ""))[1]
-        return cal.factor_and_unit(self._field, base)
+        results = analysis.results
+        lazy = bool(getattr(analysis, "hdf5_lazy", False))
+        if result is None and lazy and results:
+            result = (self._pair_avg if self._pair_avg is not None else
+                      results[max(0, min(self._frame, len(results) - 1))])
+        key = (
+            self._field, cal.metres_per_pixel, cal.display_unit, len(results),
+            id(result) if lazy else (id(results[0]) if results else None),
+            None if lazy else (id(results[-1]) if results else None),
+        )
+        cached = self._unit_scale_cache.get(key)
+        if cached is not None:
+            return cached
+
+        factor_unit = cal.factor_and_unit(self._field, base)
+        if cal.calibrated and results:
+            if lazy and result is not None:
+                values = (np.asarray(native_arr) if native_arr is not None else
+                          np.asarray(getattr(result, self._field, np.zeros(0))))
+                finite = np.abs(values[np.isfinite(values)])
+                magnitude = (float(np.percentile(finite, 99.0))
+                             if finite.size else 0.0)
+            else:
+                lo, hi = analysis.get_global_range(self._field, 99.0)
+                magnitude = max(abs(float(lo)), abs(float(hi)))
+            factor_unit = cal.compact_factor_and_unit(
+                self._field, magnitude, base)
+        self._unit_scale_cache.clear()
+        self._unit_scale_cache[key] = factor_unit
+        return factor_unit
 
     def _display_array(self, result):
         """The selected field in display units, plus its unit label."""
         arr = getattr(result, self._field, None)
-        factor, unit = self._unit_factor()
+        if (arr is not None and
+                bool(getattr(self._wizard.analysis, "hdf5_lazy", False)) and
+                not isinstance(arr, np.ndarray)):
+            arr = np.asarray(arr)
+        factor, unit = self._unit_factor(result, arr)
         if arr is None or factor == 1.0:
             return arr, unit
         return arr * factor, unit
@@ -1238,10 +1321,11 @@ class ResultsPage(QWidget):
     # ------------------------------------------------------------------
 
     def _on_cursor_moved(self, x: int, y: int, _v: float) -> None:
-        """Report the stored field value at the pixel under the cursor.
+        """Report the field value at the pixel under the cursor.
 
-        Reads the array directly rather than inverting the colour, so the
-        number is the computed value and not an estimate off the colourbar.
+        Stored subset-centre values are reported exactly. Pixels between subset
+        centres use bilinear interpolation and are visibly marked approximate;
+        values are never inferred by inverting the rendered colour.
         """
         result = self._pair_avg
         if result is None:
@@ -1258,23 +1342,41 @@ class ResultsPage(QWidget):
             self._probe_lbl.setText(f"x={x}  y={y}\noutside field")
             return
 
+        analysis = self._wizard.analysis
+        roi = analysis.roi_mask
+        if roi is not None and roi.shape == arr.shape and not roi[y, x]:
+            self._probe_lbl.setText(f"x={x}  y={y}\noutside ROI")
+            return
+
         val = arr[y, x]
         short = _field_short(self._field)
+        suffix = f" {unit}" if unit else ""
         if np.isfinite(val):
-            suffix = f" {unit}" if unit else ""
             self._probe_lbl.setText(f"x={x}  y={y}\n{short} = {val:.6g}{suffix}")
         else:
-            # A gap between subset centres is not the same as a correlation
-            # that failed, and the distinction matters when judging coverage.
-            spacing = max(1, int(getattr(
-                self._wizard.analysis.params, "subset_spacing", 1)))
-            on_grid = np.any(np.isfinite(
-                arr[max(0, y - spacing):y + spacing + 1,
-                    max(0, x - spacing):x + spacing + 1]))
+            params = analysis.params
+            spacing = max(1, int(getattr(params, "subset_spacing", 1)))
+            origin = int(getattr(params, "subset_radius", 0))
+            estimate = _interpolate_between_subset_centres(
+                arr, x, y, spacing, origin)
+            if estimate is not None:
+                self._probe_lbl.setText(
+                    f"x={x}  y={y}\n{short} ≈ {estimate:.6g}{suffix}"
+                    "\n(interpolated between subset centres)")
+                return
+
+            on_grid = ((x - origin) % spacing == 0 and
+                       (y - origin) % spacing == 0)
+            if on_grid:
+                valid = getattr(result, "valid", None)
+                failed = (valid is not None and valid.shape == arr.shape and
+                          not bool(valid[y, x]))
+                reason = ("not correlated here" if failed else
+                          "no valid field value at this subset centre")
+            else:
+                reason = "insufficient surrounding subset data"
             self._probe_lbl.setText(
-                f"x={x}  y={y}\n{short} = no data"
-                + ("\n(between subset centres)" if on_grid else
-                   "\n(not correlated here)"))
+                f"x={x}  y={y}\n{short} = no data\n({reason})")
 
     # ------------------------------------------------------------------
     # Slots
@@ -1602,23 +1704,3 @@ class ResultsPage(QWidget):
             f"QToolButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }}"
         )
         return btn
-
-
-# ---------------------------------------------------------------------------
-# Image loading helper (frame-level, fast path)
-# ---------------------------------------------------------------------------
-
-def _load_gray(path: str) -> Optional[np.ndarray]:
-    """Return float64 greyscale [0,1] or None on error."""
-    try:
-        if _CV2:
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                return None
-            mx = float(np.iinfo(img.dtype).max) if img.dtype.kind == "u" else 1.0
-            return img.astype(np.float64) / mx
-        else:
-            from PIL import Image as PILImage
-            return np.asarray(PILImage.open(path).convert("L"), np.float64) / 255.0
-    except Exception:
-        return None

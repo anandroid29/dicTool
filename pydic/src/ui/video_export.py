@@ -79,6 +79,7 @@ class ViewRenderer:
         self.trail = int(trail)
         self._img_cache: dict = {}
         self._traj_cache: dict = {}
+        self._unit_cache: dict = {}
 
     # -- data access ------------------------------------------------------
     def _deformed(self, idx: int) -> Optional[np.ndarray]:
@@ -102,13 +103,40 @@ class ViewRenderer:
         res = self.analysis.results[idx]
         arr = getattr(res, field, None)
         base = FIELDS.get(field, ("", ""))[1]
+        if (arr is not None and bool(getattr(self.analysis, "hdf5_lazy", False))
+                and not isinstance(arr, np.ndarray)):
+            arr = np.asarray(arr)
+        factor, unit = self._field_factor_and_unit(field, base, arr)
+        if arr is None or factor == 1.0:
+            return arr, unit
+        return arr * factor, unit
+
+    def _field_factor_and_unit(
+            self, field: str, base: str, native_arr=None) -> Tuple[float, str]:
+        """Use the same sequence-stable compact units as the results viewer."""
         cal: Calibration = self.analysis.calibration
-        return cal.convert(field, arr, base)
+        key = (field, cal.metres_per_pixel, cal.display_unit)
+        cached = self._unit_cache.get(key)
+        if cached is not None:
+            return cached
+        factor_unit = cal.factor_and_unit(field, base)
+        if cal.calibrated and self.analysis.results:
+            if bool(getattr(self.analysis, "hdf5_lazy", False)) and native_arr is not None:
+                values = np.asarray(native_arr)
+                finite = np.abs(values[np.isfinite(values)])
+                magnitude = (float(np.percentile(finite, 99.0))
+                             if finite.size else 0.0)
+            else:
+                lo, hi = self.analysis.get_global_range(field, 99.0)
+                magnitude = max(abs(float(lo)), abs(float(hi)))
+            factor_unit = cal.compact_factor_and_unit(field, magnitude, base)
+        self._unit_cache[key] = factor_unit
+        return factor_unit
 
     def global_range(self, field: str) -> Tuple[float, float]:
         lo, hi = self.analysis.get_global_range(field)
         from src.ui.pages.results_page import FIELDS
-        factor, _ = self.analysis.calibration.factor_and_unit(
+        factor, _ = self._field_factor_and_unit(
             field, FIELDS.get(field, ("", ""))[1])
         return lo * factor, hi * factor
 

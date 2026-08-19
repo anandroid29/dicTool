@@ -3,7 +3,6 @@ image_canvas.py
 ---------------
 Enhanced canvas with:
   - Memory-safe PyQt6/NumPy array bindings (resolves 0xC0000409 segmentation faults)
-  - Proper irregular-polygon icon via make_polygon_tool_icon()
   - ROI edit mode: after committing a polygon or rectangle, switch to
     ROITool.NONE and click inside the shape to enter edit mode.
   - Snap-to-close for polygon (green ring + one click to finish)
@@ -17,13 +16,12 @@ from enum import Enum, auto
 from typing import Optional, List, Tuple
 
 import numpy as np
-from PyQt6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QPixmap,
-    QPolygonF, QPainterPath, QImage, QCursor,
-    QTransform, QIcon, QFont,
+    QPolygonF, QPainterPath, QImage, QTransform, QFont,
 )
-from PyQt6.QtWidgets import QWidget, QSizePolicy, QPushButton
+from PyQt6.QtWidgets import QWidget, QSizePolicy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,25 +70,8 @@ TOOL_TOOLTIPS: dict = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Icon & Geometry Helpers
+# Geometry helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def make_polygon_tool_icon(size: int = 24, color: QColor = None) -> QIcon:
-    if color is None: color = QColor("#2f81f7")
-    px = QPixmap(size, size); px.fill(Qt.GlobalColor.transparent)
-    p = QPainter(px); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    s = size - 2  
-    raw = [(0.48, 0.03), (0.90, 0.22), (0.97, 0.64), (0.68, 0.97), (0.19, 0.88), (0.04, 0.46)]
-    pts = [QPointF(x * s + 1, y * s + 1) for x, y in raw]
-    fill = QColor(color); fill.setAlpha(38)
-    p.setBrush(QBrush(fill)); p.setPen(QPen(color, max(1.1, size / 16.0)))
-    p.drawPolygon(QPolygonF(pts))
-    dc = QColor(color); dc.setAlpha(230)
-    p.setBrush(QBrush(dc)); p.setPen(Qt.PenStyle.NoPen)
-    dot_r = max(1.3, size / 13.0)
-    for pt in pts: p.drawEllipse(pt, dot_r, dot_r)
-    p.end()
-    return QIcon(px)
 
 def _dist(ax, ay, bx, by) -> float:
     return math.hypot(ax - bx, ay - by)
@@ -292,31 +273,6 @@ class ImageCanvas(QWidget):
         self._result_px = QPixmap.fromImage(self._result_qimg)
         self.update()
 
-    def set_result_overlay(self, field, mask, colormap="RdYlBu_r", vmin=None, vmax=None, alpha=0.75) -> None:
-        if self._image_arr is None: return
-        self._result_arr = field
-        import matplotlib, matplotlib.cm as mcm
-        cmap = mcm.get_cmap(colormap)
-        valid = np.asarray(mask, dtype=bool) & np.isfinite(field)
-
-        if valid.any():
-            valid_data = field[valid]
-            # Robust scaling: ignore top/bottom 2% of extreme outliers
-            if vmin is None: vmin = float(np.nanpercentile(valid_data, 2))
-            if vmax is None: vmax = float(np.nanpercentile(valid_data, 98))
-        else:
-            if vmin is None: vmin = 0.0
-            if vmax is None: vmax = 1.0
-
-        if vmax == vmin: vmax = vmin + 1e-12
-        norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
-        H, W = field.shape
-        rgba = np.zeros((H, W, 4), dtype=np.uint8)
-        colors = cmap(norm(np.where(valid, field, 0.0)))
-        rgba[..., :3] = (colors[..., :3] * 255).astype(np.uint8)
-        rgba[..., 3] = np.where(valid, int(alpha * 255), 0).astype(np.uint8)
-        self.set_result_overlay_rgba(rgba)
-
     def _rebuild_roi_pixmap(self) -> None:
         if self._roi_mask is None or self._image_arr is None:
             self._roi_px = None; self._roi_rgba = None; self._roi_qimg = None; return
@@ -374,21 +330,11 @@ class ImageCanvas(QWidget):
     @property
     def roi_mask(self) -> Optional[np.ndarray]: return self._roi_mask
 
-    def set_base_image(self, arr): self.set_image(arr)
     def zoom_fit(self): self.fit_image()
     def set_roi_tool(self, t): self.set_tool(t)
 
     def fit_image(self) -> None:
         self._fit_to_window(); self.update()
-
-    def set_zoom(self, factor: float) -> None:
-        if self._image_px is None: return
-        self._zoom = max(0.1, min(factor, 40.0))
-        ww, wh = max(1, self.width()), max(1, self.height())
-        iw, ih = self._image_px.width(), self._image_px.height()
-        self._pan_x = (ww - iw * self._zoom) / 2.0
-        self._pan_y = (wh - ih * self._zoom) / 2.0
-        self.update()
 
     # ─────────────────────────────────────────────────────────────────────
     # Mouse events

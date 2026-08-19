@@ -6,13 +6,13 @@ import os
 import json
 from typing import TYPE_CHECKING, List, Optional
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QEvent
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QObject, QEvent, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QFrame, QSizePolicy,
     QGroupBox, QSpinBox, QRadioButton, QDialog,
     QDialogButtonBox, QComboBox, QMessageBox, QLineEdit,
-    QDoubleSpinBox
+    QDoubleSpinBox, QProgressDialog
 )
 
 from src.core.units import Calibration, LENGTH_UNIT_ORDER
@@ -31,6 +31,31 @@ _C_TEXT    = "#e2e8f0"
 _C_TEXT2   = "#94a3b8"
 _C_TEXT3   = "#475569"
 _C_SUCCESS = "#10b981"
+
+
+class _HDF5LoadWorker(QObject):
+    """Load a complete session without blocking Qt's GUI thread."""
+
+    progress = pyqtSignal(int, str)
+    loaded = pyqtSignal(object, str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.path = path
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            from src.core.analysis import DICAnalysis
+            analysis = DICAnalysis()
+            analysis.load_hdf5(
+                self.path,
+                progress_cb=lambda frac, message: self.progress.emit(
+                    int(round(frac * 100.0)), message))
+            self.loaded.emit(analysis, self.path)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class _FocusFilter(QObject):
@@ -298,6 +323,9 @@ class WelcomePage(QWidget):
     def __init__(self, wizard: "Wizard") -> None:
         super().__init__()
         self._wizard = wizard
+        self._hdf5_thread: Optional[QThread] = None
+        self._hdf5_worker: Optional[_HDF5LoadWorker] = None
+        self._hdf5_progress: Optional[QProgressDialog] = None
         self._build_ui()
 
     def _get_safe_start_dir(self, attr_name: str) -> str:
@@ -576,19 +604,79 @@ class WelcomePage(QWidget):
         self._update_status(ref, defs, analysis.fps)
 
     def _load_hdf5(self) -> None:
+        if self._hdf5_thread is not None and self._hdf5_thread.isRunning():
+            return
         start_dir = self._get_safe_start_dir("last_hdf5_directory")
         path, _ = QFileDialog.getOpenFileName(self, "Load HDF5 Session", start_dir, "HDF5 Files (*.h5 *.hdf5)")
         if not path:
             return
 
-        self._wizard.analysis.last_hdf5_directory = os.path.dirname(path)
-        self._wizard.analysis.save_settings()
+        progress = QProgressDialog(
+            f"Opening {os.path.basename(path)}…", "", 0, 100, self)
+        progress.setWindowTitle("Loading HDF5 session")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.setMinimumWidth(430)
+        progress.show()
 
+        thread = QThread(self)
+        worker = _HDF5LoadWorker(path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_hdf5_progress)
+        worker.loaded.connect(self._on_hdf5_loaded)
+        worker.failed.connect(self._on_hdf5_failed)
+        worker.loaded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.loaded.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_hdf5_loader)
+
+        self._hdf5_progress = progress
+        self._hdf5_thread = thread
+        self._hdf5_worker = worker
+        thread.start()
+
+    def _on_hdf5_progress(self, value: int, message: str) -> None:
+        if self._hdf5_progress is not None:
+            self._hdf5_progress.setLabelText(message)
+            self._hdf5_progress.setValue(max(0, min(100, int(value))))
+
+    def _close_hdf5_progress(self) -> None:
+        if self._hdf5_progress is not None:
+            self._hdf5_progress.setValue(100)
+            self._hdf5_progress.close()
+            self._hdf5_progress.deleteLater()
+            self._hdf5_progress = None
+
+    def _on_hdf5_loaded(self, analysis, path: str) -> None:
+        self._close_hdf5_progress()
+        analysis.last_hdf5_directory = os.path.dirname(path)
         try:
-            self._wizard.analysis.load_hdf5(path)
-            self._wizard.go_results()
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Failed to load session:\n{e}")
+            analysis.save_settings()
+        except Exception:
+            pass
+
+        # Swap only after the new session is complete. If loading fails, the
+        # currently open analysis remains untouched and usable.
+        self._wizard.analysis = analysis
+        self._wizard.seed_xy = None
+        self._wizard.use_gpu = bool(getattr(analysis, "prefer_gpu", True))
+        self._wizard.go_results()
+
+    def _on_hdf5_failed(self, message: str) -> None:
+        self._close_hdf5_progress()
+        QMessageBox.critical(
+            self, "Load Error", f"Failed to load session:\n{message}")
+
+    def _clear_hdf5_loader(self) -> None:
+        self._hdf5_worker = None
+        self._hdf5_thread = None
 
     def _update_status(self, ref: str, defs: list, fps: float) -> None:
         self._status_ref.setText(f"Reference: {os.path.basename(ref)}")
