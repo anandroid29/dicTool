@@ -28,6 +28,7 @@ except ImportError:
 from .rg_dic import DICParams, DICResult, run_rg_dic
 from .strain_accum import StrainAccumulator
 from .roi_loader import load_roi_mask
+from .stats import field_summary, robust_limits
 from .units import Calibration
 
 
@@ -920,8 +921,13 @@ class DICAnalysis:
                 rv &= r.valid
             valid_stack.append(rv)
         ok = np.all(np.stack(valid_stack), axis=0)
-        du = np.where(ok, np.sum(u_stack, axis=0), np.nan)
-        dv = np.where(ok, np.sum(v_stack, axis=0), np.nan)
+        # Accumulate in float64 even though the stored fields are float32.
+        # A pair spanning hundreds of intervals adds hundreds of float32 values
+        # per pixel, and that error compounds with the number of intervals;
+        # widening the accumulator costs one temporary and removes it. The
+        # result is stored back at the field precision.
+        du = np.where(ok, np.sum(u_stack, axis=0, dtype=np.float64), np.nan)
+        dv = np.where(ok, np.sum(v_stack, axis=0, dtype=np.float64), np.nan)
         with np.errstate(invalid="ignore"):
             mag = np.sqrt(du ** 2 + dv ** 2)
 
@@ -980,10 +986,13 @@ class DICAnalysis:
                 with np.errstate(invalid="ignore"):
                     # all-NaN pixels warn under plain nanmean; they are expected
                     # here and must stay NaN.
-                    arr = np.stack(stack)
+                    # float64 accumulator, as in pair_kinematics: averaging is
+                    # the step meant to reduce noise, so it must not introduce
+                    # its own at the precision of the stored fields.
+                    arr = np.stack(stack).astype(np.float64, copy=False)
                     arr = np.where(np.isfinite(arr), arr, np.nan)
                     counts = np.sum(np.isfinite(arr), axis=0)
-                    summed = np.nansum(arr, axis=0)
+                    summed = np.nansum(arr, axis=0, dtype=np.float64)
                     mean = np.where(counts > 0, summed / np.maximum(counts, 1), np.nan)
                 setattr(out, name, mean)
             out.valid = np.any(np.stack([p.valid for p in per_pair]), axis=0)
@@ -994,16 +1003,53 @@ class DICAnalysis:
                           if len(pairs) > 1 else f"pair {label}")
         return out
 
-    def get_global_range(self, field: str) -> tuple[float, float]:
-        vmin, vmax = float('inf'), float('-inf')
-        for res in self.results:
+    def get_global_range(self, field: str,
+                         coverage: float = 100.0) -> tuple[float, float]:
+        """Colour limits spanning the whole sequence, for a fixed scale.
+
+        `coverage` is the central share of the pooled values to span, matching
+        the per-frame robust scaling. At 100 a single failed correlation
+        anywhere in the sequence sets the limits for every frame, which is the
+        common way a fixed scale ends up showing nothing.
+
+        Values are pooled across frames rather than each frame's own
+        percentiles being averaged: a percentile of percentiles is not a
+        percentile, and would understate the true spread.
+        """
+        cov = float(np.clip(coverage, 1.0, 100.0))
+
+        if cov >= 100.0:
+            vmin, vmax = float('inf'), float('-inf')
+            for res in self.results:
+                arr = getattr(res, field, None)
+                if arr is not None and arr.size:
+                    valid = arr[np.isfinite(arr)]
+                    if valid.size > 0:
+                        vmin = min(vmin, float(valid.min()))
+                        vmax = max(vmax, float(valid.max()))
+            return (vmin, vmax) if vmin != float('inf') else (0.0, 1.0)
+
+        # Subsample long sequences: pooling every finite value across a
+        # thousand full-resolution frames is gigabytes for a number that a
+        # sample estimates to well within its own display precision.
+        stride = max(1, len(self.results) // 200)
+        pooled = []
+        for res in self.results[::stride]:
             arr = getattr(res, field, None)
-            if arr is not None:
-                valid = arr[np.isfinite(arr)]
-                if valid.size > 0:
-                    vmin = min(vmin, float(valid.min()))
-                    vmax = max(vmax, float(valid.max()))
-        return (vmin, vmax) if vmin != float('inf') else (0.0, 1.0)
+            if arr is None or not arr.size:
+                continue
+            valid = arr[np.isfinite(arr)]
+            if valid.size == 0:
+                continue
+            if valid.size > 50_000:
+                step = valid.size // 50_000 + 1
+                valid = valid[::step]
+            pooled.append(valid)
+
+        if not pooled:
+            return (0.0, 1.0)
+        limits = robust_limits(np.concatenate(pooled), cov)
+        return limits if limits is not None else (0.0, 1.0)
 
     def export_csv(self, result_index, directory: str) -> None:
         """Write the selected frame's fields as CSV.

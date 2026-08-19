@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup,
 )
 
+from src.core.stats import field_summary
 from src.core.units import LENGTH_UNIT_ORDER
 from src.ui import render
 from src.ui.render import RangeSpec
@@ -47,6 +48,7 @@ _C_TEXT    = "#e2e8f0"
 _C_TEXT2   = "#94a3b8"
 _C_TEXT3   = "#475569"
 _C_SUCCESS = "#10b981"
+_C_WARN    = "#f59e0b"
 
 FIELDS = {
     # Displacement is always the current previous-frame -> current-frame
@@ -122,6 +124,12 @@ CMAPS = ["turbo","jet","rainbow","nipy_spectral",
 
 DEFAULT_CMAP = "turbo"
 
+# Default colour-scale coverage. Not 100%: DIC fields reliably contain a few
+# subsets that converged onto noise, and a raw min/max scale hands the entire
+# colourbar to them. 99% keeps essentially all real signal while ignoring the
+# extreme 0.5% at each tail.
+DEFAULT_COVERAGE_TEXT = "99%"
+
 
 class ExportWorker(QThread):
     finished_export = pyqtSignal(bool, str)
@@ -172,47 +180,78 @@ class _VideoWorker(QThread):
 
 
 class _ColorBar(QWidget):
-    """A thin horizontal gradient bar with vmin/vmax labels."""
+    """A thin horizontal gradient bar with vmin/vmax labels.
+
+    Caps appear at either end when the scale does not span the whole field.
+    Silent clipping is the failure this guards against: values beyond the
+    limits would otherwise render in the end colour and read as the true
+    extreme, which is how a trimmed scale gets mistaken for the real range.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(32)
+        self.setFixedHeight(46)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._colors = [(8,17,29)] * 2
         self._vmin = self._vmax = 0.0
         self._unit = ""
+        self._below = self._above = self._total = 0
 
-    def update_bar(self, vmin, vmax, unit, colors):
+    def update_bar(self, vmin, vmax, unit, colors,
+                   below: int = 0, above: int = 0, total: int = 0):
         self._vmin, self._vmax, self._unit = vmin, vmax, unit
         self._colors = colors
+        self._below, self._above, self._total = below, above, total
         self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         lm, rm, th = 6, 6, 12
+        cap = 7
+        lo_cap = self._below > 0
+        hi_cap = self._above > 0
 
-        w = self.width() - lm - rm
-        grad = QLinearGradient(lm, 0, lm + w, 0)
+        w = self.width() - lm - rm - (cap if lo_cap else 0) - (cap if hi_cap else 0)
+        x0 = lm + (cap if lo_cap else 0)
+
+        grad = QLinearGradient(x0, 0, x0 + w, 0)
         n = len(self._colors)
         for i, (r, g, b) in enumerate(self._colors):
             grad.setColorAt(i / max(n - 1, 1), QColor(r, g, b))
 
         p.setBrush(grad)
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(lm, 4, w, th, 3, 3)
+        p.drawRoundedRect(x0, 4, w, th, 3, 3)
+
+        # Same colours the overlay uses for out-of-range values.
+        if lo_cap:
+            p.setBrush(QColor(*render.UNDER_RANGE_RGB))
+            p.drawRect(lm, 4, cap, th)
+        if hi_cap:
+            p.setBrush(QColor(*render.OVER_RANGE_RGB))
+            p.drawRect(x0 + w, 4, cap, th)
 
         p.setPen(QColor(_C_TEXT2))
-        font = QFont("Fira Code, Consolas, monospace", 9)
-        p.setFont(font)
-        vmin_s = f"{self._vmin:.4g}"
+        p.setFont(QFont("Fira Code, Consolas, monospace", 9))
         # The unit is shown once in the sidebar section heading. Repeating a
         # long unit such as "dimensionless" here made the right endpoint grow
         # into the left endpoint in the deliberately compact sidebar.
-        vmax_s = f"{self._vmax:.4g}"
-        p.drawText(lm, 4 + th + 13, vmin_s)
+        vmin_s, vmax_s = f"{self._vmin:.4g}", f"{self._vmax:.4g}"
+        base = 4 + th + 13
         fm = p.fontMetrics()
-        p.drawText(lm + w - fm.horizontalAdvance(vmax_s), 4 + th + 13, vmax_s)
+        p.drawText(lm, base, vmin_s)
+        p.drawText(self.width() - rm - fm.horizontalAdvance(vmax_s), base, vmax_s)
+
+        # One line stating exactly how much of the field lies outside the scale.
+        if (lo_cap or hi_cap) and self._total:
+            pct = 100.0 * (self._below + self._above) / self._total
+            note = f"{pct:.2g}% outside range"
+            p.setFont(QFont("Fira Code, Consolas, monospace", 8))
+            p.setPen(QColor(_C_WARN))
+            fm2 = p.fontMetrics()
+            p.drawText((self.width() - fm2.horizontalAdvance(note)) // 2,
+                       base + 12, note)
         p.end()
 
 
@@ -417,6 +456,41 @@ class ResultsPage(QWidget):
         self._range_fit_btn.clicked.connect(self._fit_range_to_frame)
         top_lay.addWidget(self._range_fit_btn)
 
+        # ── Robust scaling ────────────────────────────────────────────
+        # A few subsets always converge onto noise at an edge or a dropout, and
+        # their values can be orders of magnitude outside the real range. On a
+        # raw min/max scale those pixels own the whole colourbar and the actual
+        # field flattens to one colour, so the default trims the tails.
+        cov_lbl = QLabel("Coverage:")
+        cov_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        top_lay.addWidget(cov_lbl)
+
+        self._coverage_combo = QComboBox()
+        for text, val in (("100%", 100.0), ("99.5%", 99.5), ("99%", 99.0),
+                          ("98%", 98.0), ("95%", 95.0), ("90%", 90.0)):
+            self._coverage_combo.addItem(text, val)
+        self._coverage_combo.setCurrentText(DEFAULT_COVERAGE_TEXT)
+        self._coverage_combo.setFixedWidth(74)
+        self._coverage_combo.setToolTip(
+            "Share of the data the colour scale must span.\n\n"
+            "100% uses the true min and max, so one bad correlation can flatten\n"
+            "the whole map. Lower values trim that much from each tail — 98%\n"
+            "ignores the most extreme 1% at each end.\n\n"
+            "This only changes the colour mapping. Statistics and every export\n"
+            "still report the true values."
+        )
+        self._coverage_combo.currentIndexChanged.connect(self._refresh_overlay)
+        top_lay.addWidget(self._coverage_combo)
+
+        self._clip_chk = QCheckBox("Flag clipped")
+        self._clip_chk.setChecked(True)
+        self._clip_chk.setToolTip(
+            "Draw values outside the colour range in magenta (above) and\n"
+            "cyan (below), instead of letting them sit at the end colour\n"
+            "where they look like legitimate extremes.")
+        self._clip_chk.stateChanged.connect(self._refresh_overlay)
+        top_lay.addWidget(self._clip_chk)
+
         root.addWidget(top)
 
         # ── Body: canvas + right sidebar ──────────────────────────────
@@ -431,6 +505,7 @@ class ResultsPage(QWidget):
         self._canvas.marker_requested.connect(self._on_marker_requested)
         self._canvas.markers_changed.connect(self._on_markers_changed)
         self._canvas.marker_selected.connect(self._on_marker_selected)
+        self._canvas.cursor_moved.connect(self._on_cursor_moved)
         self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
                                    QSizePolicy.Policy.Expanding)
         body_lay.addWidget(self._canvas, 1)
@@ -461,22 +536,54 @@ class ResultsPage(QWidget):
         stats_head_row.addWidget(self._stats_unit_lbl)
         sb_lay.addLayout(stats_head_row)
 
+        # Robust and non-robust statistics side by side. Mean/std are what
+        # people expect; median and IQR are what survive a decorrelated subset.
+        # Showing both means a disagreement between them is visible, and that
+        # disagreement is the signal that the field contains outliers.
         self._stat_labels: dict[str, QLabel] = {}
-        for stat in ("Mean", "Std Dev", "Min", "Max", "Valid px"):
+        for stat, tip in (
+            ("Mean",    "Arithmetic mean. Shifts without bound if even one "
+                        "subset decorrelates."),
+            ("Median",  "Middle value. Unaffected by a minority of bad points —\n"
+                        "if this differs markedly from the mean, trust this one."),
+            ("Std Dev", "Standard deviation. Like the mean, sensitive to outliers."),
+            ("IQR",     "Interquartile range: the spread of the middle 50%.\n"
+                        "A robust alternative to standard deviation."),
+            ("P1–P99",  "1st to 99th percentile — the practical extremes,\n"
+                        "with the most extreme 1% at each end set aside."),
+            ("Min/Max", "True extremes, including any failed correlations.\n"
+                        "Compare with P1–P99 to see how far the tails reach."),
+            ("Points",  "Number of correlated subsets contributing to these\n"
+                        "statistics."),
+        ):
             row = QHBoxLayout()
             k_lbl = QLabel(stat + ":")
             k_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
-            k_lbl.setFixedWidth(64)
+            k_lbl.setFixedWidth(58)
+            k_lbl.setToolTip(tip)
             row.addWidget(k_lbl)
             v_lbl = QLabel("—")
             v_lbl.setStyleSheet(
                 f"color:{_C_TEXT}; font-size:11px; "
                 f"font-family:'Fira Code','Cascadia Code',monospace;"
             )
+            v_lbl.setToolTip(tip)
             v_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             row.addWidget(v_lbl, 1)
             sb_lay.addLayout(row)
             self._stat_labels[stat] = v_lbl
+
+        # ── Value probe ───────────────────────────────────────────────
+        # Reading a number off a colourbar is an estimate. This reports the
+        # stored value at the pixel under the cursor, which is the only way to
+        # get the actual number at a point without exporting the whole field.
+        self._probe_lbl = QLabel("Hover the image to read a value")
+        self._probe_lbl.setWordWrap(True)
+        self._probe_lbl.setStyleSheet(
+            f"color:{_C_TEXT2}; font-size:10px; background:{_C_CARD};"
+            f" border:1px solid {_C_BORDER}; border-radius:4px; padding:6px;"
+            f" font-family:'Fira Code','Cascadia Code',monospace;")
+        sb_lay.addWidget(self._probe_lbl)
 
         sb_lay.addWidget(self._sep())
 
@@ -994,7 +1101,13 @@ class ResultsPage(QWidget):
         elif self._scale_global_rb.isChecked():
             mode = "global"
         return RangeSpec(mode=mode, vmin=vmin, vmax=vmax,
-                         symmetric=self._sym_chk.isChecked())
+                         symmetric=self._sym_chk.isChecked(),
+                         percentile=self.current_coverage())
+
+    def current_coverage(self) -> float:
+        """Central share of the data the colour scale must span, in percent."""
+        val = self._coverage_combo.currentData()
+        return 100.0 if val is None else float(val)
 
     def _apply_overlay(self, arr: np.ndarray) -> None:
         """Colour-map the selected field onto the canvas.
@@ -1011,7 +1124,7 @@ class ResultsPage(QWidget):
         global_rng = None
         if spec.mode == "global" and self._pair_avg is None:
             factor, _ = self._unit_factor()
-            lo, hi = analysis.get_global_range(self._field)
+            lo, hi = analysis.get_global_range(self._field, spec.percentile)
             global_rng = (lo * factor, hi * factor)
         elif spec.mode == "global":
             # The sequence-wide range is measured on per-frame fields, whose
@@ -1019,7 +1132,8 @@ class ResultsPage(QWidget):
             # Applying it here can flatten the image to one colour, so the
             # averaged field scales to itself.
             spec = RangeSpec(mode="auto", vmin=None, vmax=None,
-                             symmetric=spec.symmetric)
+                             symmetric=spec.symmetric,
+                             percentile=spec.percentile)
 
         rng = spec.resolve(arr, global_rng)
         if rng is None:
@@ -1032,9 +1146,18 @@ class ResultsPage(QWidget):
             rgba = render.field_to_rgba(
                 arr, vmin, vmax, cmap_name,
                 roi_mask=analysis.roi_mask,
-                spacing=analysis.params.subset_spacing)
+                spacing=analysis.params.subset_spacing,
+                mark_out_of_range=self._clip_chk.isChecked())
             self._canvas.set_result_overlay_rgba(rgba)
-            self._update_colorbar(render.get_cmap(cmap_name, 256), vmin, vmax)
+
+            # How much of the field the scale is actually showing. Reported
+            # rather than inferred, so a trimmed scale is never mistaken for
+            # the full data range.
+            finite = arr[np.isfinite(arr)]
+            below = int(np.count_nonzero(finite < vmin))
+            above = int(np.count_nonzero(finite > vmax))
+            self._update_colorbar(render.get_cmap(cmap_name, 256), vmin, vmax,
+                                  below=below, above=above, total=finite.size)
             self._update_range_placeholders(vmin, vmax)
         except Exception as exc:
             print(f"Overlay error: {exc}")
@@ -1060,7 +1183,8 @@ class ResultsPage(QWidget):
             return arr, unit
         return arr * factor, unit
 
-    def _update_colorbar(self, cmap, vmin, vmax):
+    def _update_colorbar(self, cmap, vmin, vmax,
+                         below: int = 0, above: int = 0, total: int = 0):
         n_bar = 64
         bar_colors = []
         for i in range(n_bar):
@@ -1068,18 +1192,14 @@ class ResultsPage(QWidget):
             bar_colors.append((int(r * 255), int(g * 255), int(b * 255)))
         _, unit = self._unit_factor()
         self._colorbar_unit_lbl.setText(unit)
-        self._colorbar.update_bar(vmin, vmax, unit, bar_colors)
+        self._colorbar.update_bar(vmin, vmax, unit, bar_colors,
+                                  below=below, above=above, total=total)
 
     def _update_stats(self, result) -> None:
         arr, unit = self._display_array(result)
         self._stats_unit_lbl.setText(unit)
-        if arr is None:
-            for v in self._stat_labels.values():
-                v.setText("—")
-            return
-
-        valid = arr[np.isfinite(arr)]
-        if valid.size == 0:
+        summary = field_summary(arr) if arr is not None else None
+        if summary is None:
             for v in self._stat_labels.values():
                 v.setText("—")
             return
@@ -1087,11 +1207,74 @@ class ResultsPage(QWidget):
         # Units are section metadata, not part of every value. Keeping the
         # values numeric prevents the label/value collision seen for the long
         # word "dimensionless" and makes the rows easier to scan.
-        self._stat_labels["Mean"].setText(f"{valid.mean():.4g}")
-        self._stat_labels["Std Dev"].setText(f"{valid.std():.4g}")
-        self._stat_labels["Min"].setText(f"{valid.min():.4g}")
-        self._stat_labels["Max"].setText(f"{valid.max():.4g}")
-        self._stat_labels["Valid px"].setText(f"{valid.size:,}")
+        self._stat_labels["Mean"].setText(f"{summary['mean']:.4g}")
+        self._stat_labels["Median"].setText(f"{summary['median']:.4g}")
+        self._stat_labels["Std Dev"].setText(f"{summary['std']:.4g}")
+        self._stat_labels["IQR"].setText(f"{summary['iqr']:.4g}")
+        self._stat_labels["P1–P99"].setText(
+            f"{summary['p_low']:.3g} … {summary['p_high']:.3g}")
+        self._stat_labels["Min/Max"].setText(
+            f"{summary['minimum']:.3g} … {summary['maximum']:.3g}")
+        self._stat_labels["Points"].setText(f"{summary['count']:,}")
+
+        # Flag a mean the outliers have run away with. The threshold compares
+        # the mean-median gap against the robust spread, so it fires on genuine
+        # skew rather than on any field that merely is not symmetric.
+        iqr = summary["iqr"]
+        skewed = (np.isfinite(iqr) and iqr > 0 and
+                  abs(summary["mean"] - summary["median"]) > 0.5 * iqr)
+        self._stat_labels["Mean"].setStyleSheet(
+            f"color:{_C_WARN if skewed else _C_TEXT}; font-size:11px; "
+            f"font-family:'Fira Code','Cascadia Code',monospace;")
+        self._stat_labels["Mean"].setToolTip(
+            "Mean and median disagree by more than half the interquartile "
+            "range —\noutliers are pulling the mean. Prefer the median."
+            if skewed else
+            "Arithmetic mean. Shifts without bound if even one subset "
+            "decorrelates.")
+
+    # ------------------------------------------------------------------
+    # Value probe
+    # ------------------------------------------------------------------
+
+    def _on_cursor_moved(self, x: int, y: int, _v: float) -> None:
+        """Report the stored field value at the pixel under the cursor.
+
+        Reads the array directly rather than inverting the colour, so the
+        number is the computed value and not an estimate off the colourbar.
+        """
+        result = self._pair_avg
+        if result is None:
+            results = self._wizard.analysis.results
+            if not results or not (0 <= self._frame < len(results)):
+                return
+            result = results[self._frame]
+
+        arr, unit = self._display_array(result)
+        if arr is None or arr.ndim != 2:
+            return
+        h, w = arr.shape
+        if not (0 <= y < h and 0 <= x < w):
+            self._probe_lbl.setText(f"x={x}  y={y}\noutside field")
+            return
+
+        val = arr[y, x]
+        short = _field_short(self._field)
+        if np.isfinite(val):
+            suffix = f" {unit}" if unit else ""
+            self._probe_lbl.setText(f"x={x}  y={y}\n{short} = {val:.6g}{suffix}")
+        else:
+            # A gap between subset centres is not the same as a correlation
+            # that failed, and the distinction matters when judging coverage.
+            spacing = max(1, int(getattr(
+                self._wizard.analysis.params, "subset_spacing", 1)))
+            on_grid = np.any(np.isfinite(
+                arr[max(0, y - spacing):y + spacing + 1,
+                    max(0, x - spacing):x + spacing + 1]))
+            self._probe_lbl.setText(
+                f"x={x}  y={y}\n{short} = no data"
+                + ("\n(between subset centres)" if on_grid else
+                   "\n(not correlated here)"))
 
     # ------------------------------------------------------------------
     # Slots
@@ -1300,6 +1483,14 @@ class ResultsPage(QWidget):
         if dlg.exec() == 0:
             return
         spec = dlg.spec()
+
+        # Coverage and clip-flagging have no per-panel control in the export
+        # dialog, so they inherit the viewer's settings. Without this an export
+        # would silently fall back to raw min/max and look nothing like the
+        # frame the user was looking at when they hit Export.
+        for panel in spec.panels:
+            panel.range_spec.percentile = rng.percentile
+            panel.mark_out_of_range = self._clip_chk.isChecked()
 
         ext = CODECS.get(spec.codec, (".mp4", None))[0]
         start = getattr(analysis, "last_hdf5_directory", os.path.expanduser("~"))
