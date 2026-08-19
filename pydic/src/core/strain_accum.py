@@ -9,7 +9,8 @@ same material in the next frame.  That history must never leak into the public
 from __future__ import annotations
 import numpy as np
 from scipy.ndimage import uniform_filter
-from .strain import compute_velocity_strains, connected_support_labels
+from .strain import (compute_velocity_strains, connected_support_labels,
+                     von_mises_equivalent)
 
 # Minimum number of currently-live neighbours required before a re-appearing
 # point's accumulated total may be re-baselined from them.
@@ -67,9 +68,13 @@ def _principal_2x2(Axx, Ayy, Axy):
 
 
 def _equivalent_from_principal(e1, e2):
-    """von Mises equivalent strain, plane strain + plastic incompressibility."""
-    e3 = -(e1 + e2)
-    return np.sqrt((2.0 / 3.0) * (e1 ** 2 + e2 ** 2 + e3 ** 2))
+    """von Mises equivalent strain from the in-plane principal values.
+
+    Shear vanishes in the principal frame, so this is the shared definition
+    evaluated there. Routing through it keeps accumulated strain and strain
+    rate on one formula.
+    """
+    return von_mises_equivalent(e1, e2, 0.0)
 
 
 def incremental_strains(du_dx, du_dy, dv_dx, dv_dy):

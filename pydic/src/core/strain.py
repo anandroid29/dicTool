@@ -10,6 +10,31 @@ import numpy as np
 from scipy.ndimage import binary_dilation, correlate1d, label
 
 
+def von_mises_equivalent(exx, eyy, exy):
+    """von Mises equivalent of a symmetric 2-D strain (or strain-rate) tensor.
+
+    Plastic incompressibility fixes the out-of-plane term, e_zz = -(e_xx+e_yy),
+    and the equivalent measure is sqrt(2/3 * e_ij e_ij) over the restored 3-D
+    tensor. Restoring e_zz is the part that is easy to drop, and dropping it is
+    not a small error: it leaves equibiaxial strain reading 59 % low, because
+    equibiaxial deformation is carried almost entirely by the thickness change
+    the 2-D tensor cannot see.
+
+    Reduces to the textbook results:
+      uniaxial (e_yy = -e_xx/2) -> e_xx
+      pure shear                -> 2*e_xy/sqrt(3)
+      equibiaxial (e_xx = e_yy) -> 2*e_xx
+
+    This is the single definition of "equivalent" in the codebase. Accumulated
+    strain and strain rate both route through it so the two cannot disagree --
+    they previously used different expressions, and the rate was the wrong one.
+    """
+    ezz = -(exx + eyy)
+    contraction = exx ** 2 + eyy ** 2 + ezz ** 2 + 2.0 * exy ** 2
+    with np.errstate(invalid="ignore"):
+        return np.sqrt(np.maximum((2.0 / 3.0) * contraction, 0.0))
+
+
 def connected_support_labels(valid: np.ndarray, grid_spacing: int = 1):
     """Label material regions without treating sparse grid gaps as physical cuts.
 
@@ -110,9 +135,7 @@ def compute_velocity_strains(
     Exy_rate  = 0.5 * (dVx_dy + dVy_dx)
     Gxy_rate  = 2.0 * Exy_rate
 
-    with np.errstate(invalid='ignore'):
-        Eeff_rate = np.sqrt(np.maximum(
-            (2.0/3.0)*(Exx_rate**2 + Eyy_rate**2 + 2.0*Exy_rate**2 - Exx_rate*Eyy_rate), 0.0))
+    Eeff_rate = von_mises_equivalent(Exx_rate, Eyy_rate, Exy_rate)
 
     result = dict(Exx_rate=Exx_rate, Exy_rate=Exy_rate, Gxy_rate=Gxy_rate,
                   Eyy_rate=Eyy_rate, Eeff_rate=Eeff_rate,
