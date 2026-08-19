@@ -257,22 +257,6 @@ def draw_streaklines(rgb: np.ndarray, trajectories: Sequence[dict],
     return out
 
 
-def draw_markers(rgb: np.ndarray, points, colors, radius: int = 6) -> np.ndarray:
-    if not _HAVE_CV2 or not points:
-        return rgb
-    for i, p in enumerate(points):
-        if p is None:
-            continue
-        x, y = p
-        if not (np.isfinite(x) and np.isfinite(y)):
-            continue
-        c = tuple(int(v) for v in colors[i % len(colors)]) if colors else (255, 80, 80)
-        cv2.circle(rgb, (int(round(x)), int(round(y))), radius, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.circle(rgb, (int(round(x)), int(round(y))), radius, c, 2, cv2.LINE_AA)
-        cv2.circle(rgb, (int(round(x)), int(round(y))), 2, c, -1, cv2.LINE_AA)
-    return rgb
-
-
 def draw_colorbar(rgb: np.ndarray, cmap_name: str, vmin: float, vmax: float,
                   unit: str = "", height: int = 12, margin: int = 12,
                   clipped_low: bool = False, clipped_high: bool = False

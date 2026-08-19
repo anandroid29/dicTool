@@ -10,6 +10,7 @@ is a ratio per second, so both are already independent of how big a pixel is --
 scaling them by a calibration would be flatly wrong.
 """
 from __future__ import annotations
+import math
 from typing import Optional, Tuple
 
 # Metres per unit.
@@ -90,6 +91,33 @@ class Calibration:
         if dim == "length":
             return factor, self.display_unit
         return factor, f"{self.display_unit}/s"      # velocity
+
+    def compact_factor_and_unit(
+            self, field_key: str, magnitude: float, base_unit: str = "",
+            threshold: float = 100.0) -> Tuple[float, str]:
+        """Display a calibrated length field in a readable engineering unit.
+
+        ``display_unit`` remains the unit in which pixel size was entered and
+        persisted.  For presentation only, values at or above ``threshold``
+        are promoted toward the next larger available unit.  For example,
+        100 µm/s is shown as 0.1 mm/s instead of a three-digit µm/s value.
+        """
+        factor, unit = self.factor_and_unit(field_key, base_unit)
+        dim = FIELD_DIMENSION.get(field_key)
+        if (dim is None or not self.calibrated or
+                not math.isfinite(float(magnitude)) or threshold <= 0):
+            return factor, unit
+
+        index = LENGTH_UNIT_ORDER.index(self.display_unit)
+        shown = abs(float(magnitude)) * factor
+        while shown >= threshold and index > 0:
+            index -= 1
+            promoted = LENGTH_UNIT_ORDER[index]
+            factor = self.metres_per_pixel / LENGTH_UNITS[promoted]
+            shown = abs(float(magnitude)) * factor
+
+        promoted = LENGTH_UNIT_ORDER[index]
+        return factor, (promoted if dim == "length" else f"{promoted}/s")
 
     def convert(self, field_key: str, arr, base_unit: str = ""):
         """(scaled_array, unit_label). The array is returned as-is when no

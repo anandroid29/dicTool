@@ -154,14 +154,6 @@ class StrainAccumulator:
     def broken(self):
         return self.started & ~self.tracked
 
-    def mark_lost(self, lost: np.ndarray) -> None:
-        """Drop points out of the live set for this frame (e.g. dynamic-ROI loss).
-
-        Their accumulated totals are retained, so if they come back the repair
-        path can use them; they are simply not reported as valid right now.
-        """
-        self.tracked &= ~lost
-
     def add_frame(self, inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy):
         ok = np.isfinite(inc_u) & np.isfinite(inc_v)
 

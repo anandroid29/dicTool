@@ -1,199 +1,374 @@
-# StrainX — Python Digital Image Correlation
+# PyDIC
 
-StrainX is a 2D Digital Image Correlation tool written in Python. We built it as part of our work at IIT Kanpur to replicate the algorithmic core of Ncorr (Blaber, Adair & Antoniou, 2015) in a freely available, fully automated package and to add one capability Ncorr doesn't have: direct full-field strain rate computation.
+PyDIC is a desktop application for two-dimensional, full-field Digital Image
+Correlation (DIC). It tracks a speckled surface through an image sequence and
+reports displacement, velocity, strain, and strain-rate fields through a PyQt6
+workflow. CPU analysis is always available; an optional CuPy backend accelerates
+supported analyses on NVIDIA CUDA GPUs.
 
-The algorithms follow the Ncorr paper closely enough that we validated StrainX against Ncorr on a real CFRP tensile dataset and got R² = 0.991 on vertical displacement across ten loading frames, with Bland–Altman agreement within ±1.34 px. The strain rates are a new addition and are described at the bottom of this file.
+The application is intended for planar, in-plane measurements. It does not
+perform stereo DIC or reconstruct out-of-plane motion.
 
----
+## Current result semantics
 
-## What it does
+PyDIC uses an updated-Lagrangian sequence: every image is correlated against the
+immediately previous image. This distinction is important when interpreting the
+results.
 
-- Tracks speckle patterns between a reference image and one or more deformed images
-- Outputs full-field displacement (u, v) and Green–Lagrangian strain (Exx, Exy, Eyy) maps
-- Computes strain rates dExx/dt, dExy/dt, dEyy/dt directly from the image sequence
-- Runs the whole pipeline through a five-step GUI no scripting needed
+| Result family | Meaning |
+|---|---|
+| Displacement `u`, `v`, magnitude | Motion from the immediately previous frame to the current frame; it is not accumulated |
+| Velocity `Vx`, `Vy`, effective velocity | Immediate displacement divided by the frame interval |
+| Strain `Exx`, `Eyy`, `Exy` | Green–Lagrange strain increments accumulated frame by frame |
+| Equivalent strain | Sum of the non-negative equivalent magnitude of each strain increment |
+| Strain rate | Instantaneous symmetric spatial gradient of the velocity field; it is not obtained by differentiating accumulated strain in time |
 
----
+`Exy` is tensor shear strain, not engineering shear (`Gxy = 2 Exy`). The
+equivalent strain and strain-rate fields use the same von Mises-style magnitude,
+with the out-of-plane term inferred from plastic incompressibility.
 
-## Installation
+## Features
+
+- Import an ordered image folder, extract frames from a video, or reopen an HDF5
+  analysis session.
+- Draw or load a static ROI using rectangle, circle, polygon, eraser, and full-ROI
+  tools, then place the propagation seed.
+- Optionally refine the static ROI on every frame with Contrast, Edge Detection,
+  or Hybrid dynamic ROI masking.
+- Run reliability-guided IC-GN DIC on the CPU or use optional CuPy acceleration.
+- Choose first-order affine or second-order quadratic shape functions. The GPU
+  solver currently uses first order; select CPU for a true second-order run.
+- Recover points after temporary dynamic-ROI or tracking dropout instead of
+  making every loss permanent.
+- Display calibrated displacement and velocity in `m`, `mm`, `µm`, or `nm`.
+- Inspect fields with an FEA-style `turbo` colourmap by default, plus alternative
+  sequential and diverging maps.
+- Use per-frame, sequence-global, symmetric, or manually entered colour limits.
+- Place trajectory markers, display streaklines, and average selected frame
+  pairs for displacement, velocity, and strain rate.
+- Export the current frame to CSV, save/load HDF5 result sessions, or render a
+  configurable multi-panel video or PNG image sequence.
+
+## Requirements and installation
+
+Python 3.10 or newer is required.
 
 ```bash
-git clone https://github.com/anandroid29/StrainX.git
-python -m venv venv
-source venv/bin/activate        # on Windows: venv\Scripts\activate.bat
-pip install -r requirements.txt
-cd StrainX
-python main.py
+git clone https://github.com/anandroid29/PyDIC.git
+cd PyDIC
+python -m venv .venv
 ```
 
-Dependencies are NumPy, SciPy, PyQt6, OpenCV, and Matplotlib. No MATLAB required.
+Activate the environment on Windows PowerShell:
 
----
-
-## How to use it
-
-The GUI walks you through five steps in order.
-
-**Step 1 — Load images.** Add your reference image first, then your deformed images in temporal order. Colour images are converted to greyscale automatically.
-
-**Step 2 — Draw the ROI.** Use the polygon, rectangle, or circle tools to mark the region you want to analyse. You can also erase parts of the mask, or load a binary mask directly if you already have one. Hit "Preview Mask" to check it before moving on.
-
-**Step 3 — Set parameters.** The main ones to think about are:
-
-| Parameter | What it controls | Typical values used in our validation |
-|---|---|---|
-| Subset radius r (px) | Size of the correlation window | 21 |
-| Subset spacing s (px) | Distance between subset centres | 1 |
-| Strain window radius r_E (px) | Neighbourhood for least-squares plane fit | 15 |
-| IC-GN max iterations | Convergence limit | 50 |
-| Convergence tolerance ‖Δp‖ | Exit criterion for IC-GN | 1×10⁻⁶ |
-| ZNSSD cutoff C_LS | Maximum acceptable correlation cost | 2.0 |
-
-There is a trade-off between spatial resolution and noise that is worth being aware of: a larger subset radius smooths out noise but blurs sharp gradients. A larger strain window has the same effect on the strain fields. We used r = 21 px and r_E = 15 px for the CFRP validation, reasonable starting points for most quasi-static tests.
-
-**Step 4 — Run.** Click "Run Analysis". A progress bar shows completion per image. You can cancel at any time without losing work already done on earlier frames.
-
-**Step 5 — View results.** The results viewer opens automatically. Tabs switch between u, v, Exx, Exy, Eyy, and strain rate fields. A slider lets you step through the deformed image sequence. Export to CSV, PNG, or HDF5 from there.
-
----
-
-## How the algorithms work
-
-We tried to stay as close to the Ncorr implementation as possible. Here is what is happening under the hood.
-
-### B-spline interpolation
-
-Before anything else, the grayscale values of both the reference and deformed images are prefiltered into quintic (5th-order) B-spline coefficient arrays. We use `scipy.ndimage.spline_filter` for this, which applies an IIR recursive filter that is numerically equivalent to the FFT-based deconvolution Ncorr uses. Once the coefficients are computed, any sub-pixel intensity value g(x̃, ỹ) is evaluated as:
-
-```
-g(x̃, ỹ) = [1  Δx  Δx²  Δx³  Δx⁴  Δx⁵] · [QK] · C[xf-2:xf+3, yf-2:yf+3] · [QK]ᵀ · [1  Δy  ...]ᵀ
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
 
-where [QK] is the 6×6 quintic kernel matrix, C is the B-spline coefficient array, xf = floor(x̃), and Δx = x̃ − xf. The spatial gradients ∂g/∂x and ∂g/∂y needed for the Hessian are computed analytically from the same coefficient array and not by finite-differencing the raw pixel values, which would introduce a systematic bias.
+Or on macOS/Linux:
 
-### Initial guess via NCC
-
-For the seed subset, an integer-pixel initial displacement is found by Normalized Cross-Correlation (NCC): the reference subset is padded to full image size, convolved with the deformed image, and the peak of the resulting correlation map gives the integer-pixel (u⁽ᵍ⁾, v⁽ᵍ⁾) initial guess. All other subsets get their initial guess from a neighbour (see RG-DIC below) and skip the NCC step entirely.
-
-### IC-GN optimiser
-
-The sub-pixel displacement is refined by minimising the Zero-mean Normalised Sum of Squared Differences (ZNSSD) cost:
-
-```
-C_LS = Σ_{(i,j)∈S} [ f̃(x_ref,i, y_ref,j) / ‖f̃‖  −  g̃(x_cur,i, y_cur,j) / ‖g̃‖ ]²
+```bash
+source .venv/bin/activate
 ```
 
-where f̃ and g̃ are the zero-mean reference and deformed subset intensities, and the summation is over all points (i,j) in the circular subset S.
+Install the required packages and start the application from the repository
+root:
 
-The deformation is parameterised by a six-element vector **p** = [u, v, ∂u/∂x, ∂u/∂y, ∂v/∂x, ∂v/∂y]ᵀ. The warp function maps reference subset coordinates to current ones:
-
-```
-x_cur = x_ref + u + (∂u/∂x)(x_ref − x_c) + (∂u/∂y)(y_ref − y_c)
-y_cur = y_ref + v + (∂v/∂x)(x_ref − x_c) + (∂v/∂y)(y_ref − y_c)
-```
-
-The IC-GN method solves for a small incremental warp Δ**p** that minimises C_LS in the reference image frame (which lets the Hessian be precomputed and reused across iterations). Each iteration:
-
-1. Precompute steepest-descent images: **SD**_k = [f_x, f_y, f_x·Δx, f_x·Δy, f_y·Δx, f_y·Δy] at each pixel k — done once per subset
-2. Precompute Hessian **H** = **SD**ᵀ **SD** — also done once per subset  
-3. Warp the deformed image with the current **p**_old to get g̃
-4. Compute the gradient ∇C_LS and solve **H** Δ**p** = **SD**ᵀ(g̃ − f̃) via Cholesky decomposition
-5. Apply the compositional warp update: **M**(**p**) ← **M**(**p**) ∘ **M**(Δ**p**)⁻¹
-6. Exit when ‖Δ**p**‖ < 10⁻⁶
-
-The compositional update in step 5 is what makes IC-GN different from a standard Gauss-Newton solver. It applies the correction in the reference frame, keeping the Hessian valid across iterations. This is the same update Ncorr uses.
-
-### Reliability-Guided DIC (RG-DIC)
-
-Rather than analysing every subset independently, RG-DIC propagates solutions outward from a single seed point, using each converged subset's result to warm-start its neighbours. The seed is the only point that uses NCC for an initial guess. All other subsets inherit the initial guess from whichever of their processed neighbours has the lowest C_LS value.
-
-Crucially, the initial guess is not just copied verbatim — it is extrapolated using a first-order Taylor expansion. If the parent subset at (x_p, y_p) has converged to **p**_p = [u_p, v_p, ∂u/∂x, ∂u/∂y, ∂v/∂x, ∂v/∂y]ᵀ, the initial displacement given to a neighbour at (x_n, y_n) is:
-
-```
-u_init = u_p + (∂u/∂x)(x_n − x_p) + (∂u/∂y)(y_n − y_p)
-v_init = v_p + (∂v/∂x)(x_n − x_p) + (∂v/∂y)(y_n − y_p)
+```bash
+python -m pip install -r requirements.txt
+python pydic/main.py
 ```
 
-Skipping this Taylor correction (just copying u_p, v_p) introduces an O(s) px error in the initial guess — large enough to send IC-GN into the wrong local minimum in high-gradient regions. We implement it exactly as Ncorr does.
+The required packages are NumPy, SciPy, OpenCV, Matplotlib, PyQt6, Pillow,
+scikit-image, and h5py. MATLAB is not required.
 
-A processed subset is added to a min-heap keyed by its C_LS value. At each step the best (lowest C_LS) point is popped and its four neighbours are queued for analysis. This ordering means high-quality results propagate first and bad subsets near the stress concentration are processed last, preventing them from poisoning their neighbours' initial guesses.
+### Optional GPU acceleration
 
-If a neighbour's IC-GN solution produces a displacement jump of more than s + 1 px relative to the parent, it is rejected as spurious rather than added to the heap.
+GPU analysis requires an NVIDIA CUDA-capable GPU, a compatible CUDA driver, and
+a CuPy package matching the installed CUDA version. CuPy is deliberately not in
+`requirements.txt`, because the correct package depends on the local CUDA
+installation. Install it using the official CuPy instructions, then select
+**Use GPU Acceleration (CuPy)** on the Parameters page.
 
-### Green–Lagrangian strains
+The GPU is an acceleration backend, not a different measurement convention.
+Both backends feed the same validity, gradient, strain accumulation, velocity,
+and strain-rate post-processing. Very small floating-point differences are
+normal.
 
-The displacement gradients coming directly out of IC-GN are noisy (they are computed per-subset and sensitive to any per-subset error). Instead, we follow the strain window approach from Ncorr: for each subset centre (x_c, y_c), we collect all valid displacement points within a circular neighbourhood of radius r_E and fit a least-squares plane to u(x,y) and v(x,y) separately:
+## Application workflow
 
+The wizard contains six labelled stages. The Dynamic ROI stage is automatically
+skipped when its mode is **None**.
+
+### 1. Import
+
+Choose one of the following sources:
+
+- **Video:** select a video, choose frame extraction settings and the reference
+  frame, and optionally set the physical size represented by one pixel.
+- **Image folder:** images are sorted by filename. Configure sampling, frame
+  rate, an optional ROI-mask file, and pixel-to-length calibration. A file with
+  `roi` in its name is offered as the ROI mask rather than as a specimen frame.
+- **HDF5:** reopen a previously saved analysis directly in Results.
+
+The effective frame rate determines the interval used for velocity and strain
+rate. When no reliable rate is available, PyDIC uses an interval of one second.
+
+### 2. Static ROI
+
+Draw the material region that is eligible for analysis, load a binary mask, or
+use the complete image. Place the seed in a well-textured part of that ROI.
+Subset centres outside the static ROI are never admitted by Dynamic ROI.
+
+Choose the Dynamic ROI mode here:
+
+- **None:** use the static ROI on every frame and skip the next stage.
+- **Contrast:** retain locally textured regions using local intensity variation.
+- **Edge Detection:** retain regions using Sobel gradient magnitude.
+- **Hybrid:** combine normalized contrast and edge scores.
+
+### 3. Dynamic ROI (optional)
+
+Dynamic ROI is a per-frame texture filter for the material points selected by the
+static ROI. Its scoring normalization and automatic Otsu threshold are calibrated
+on the reference frame, then the same rule is applied at each point's advected
+position on later frames; the original ROI is not reused as a stationary image
+crop. The threshold does not drift to fit each image independently.
+
+Available controls are:
+
+- **Automatic (Otsu):** derive the normalized threshold from the reference
+  image. Turn it off to set the threshold manually.
+- **Texture threshold:** a higher value keeps only stronger texture or edges.
+- **Minimum region size:** remove connected regions smaller than this fraction
+  of the largest retained region.
+- **Fill enclosed holes:** restore rejected islands completely enclosed by a
+  retained material region.
+- **Include / Exclude overrides:** draw persistent, material-attached rectangle,
+  polygon, or circle overrides. Include wins if both channels overlap.
+
+The reference preview shown here is also used by the Parameters preview and by
+the first Analysis-page ROI display. Later Analysis frames show their own
+measured dynamic masks. A point hidden or lost on one frame may become valid
+again later.
+
+### 4. Parameters
+
+The current defaults are:
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| Subset radius | 21 px | Half-size of the correlation subset |
+| Grid spacing | 3 px | Distance between neighbouring subset centres |
+| Strain window | 15 px | Half-width of the local displacement/velocity plane fit |
+| Maximum iterations | 50 | IC-GN iteration limit per subset |
+| Convergence tolerance | 0.001 px | Subset-edge motion threshold for stopping IC-GN |
+| Correlation cutoff | 0.30 | Maximum accepted ZNSSD cost |
+| Shape order | 1 | First-order affine, six-parameter warp |
+| NCC search radius | 50 px | Half-width of the integer-pixel seed search |
+
+For unit-normalized subsets, ZNSSD lies in `[0, 4]` and equals
+`2 × (1 − ZNCC)`. The default cutoff `0.30` therefore corresponds to
+`ZNCC >= 0.85`; lower cutoffs are stricter.
+
+The strain window is measured in image pixels while samples occur only at DIC
+grid points. Its regular support per axis is:
+
+```text
+2 * floor(strain_window / grid_spacing) + 1
 ```
-u_plane(x, y) = a_u + (∂u/∂x)_plane · x + (∂u/∂y)_plane · y
-v_plane(x, y) = a_v + (∂v/∂x)_plane · x + (∂v/∂y)_plane · y
+
+At least three grid points per axis are required. The UI warns when the entered
+window is too small, and the analysis uses the minimum valid window rather than
+silently producing an all-NaN strain field.
+
+Larger subsets are usually more robust and less noisy but reduce spatial
+resolution. A wider strain window reduces gradient noise but smooths local strain
+features. Parameters must be selected for the specimen texture, expected motion,
+and feature scale; the defaults are starting points, not universal settings.
+
+### 5. Analysis
+
+PyDIC tracks each current frame from the immediately previous one. Integer-pixel
+NCC provides or repairs an initial guess, IC-GN refines it to sub-pixel precision,
+and a reliability-guided wavefront propagates good solutions through the ROI.
+The previous interval also supplies temporal warm starts.
+
+Before gradients or strain accumulation, measurements that are outside the
+current frame, rejected by Dynamic ROI, non-finite, or otherwise invalid are
+converted to missing values. Gradient fitting and dropout recovery are restricted
+to connected valid material regions so smoothing does not bridge cuts or bleed
+background values into the specimen.
+
+Analysis may be cancelled. Completed frames remain available in the current
+session.
+
+### 6. Results
+
+Select a result family and field, scrub or play the sequence, inspect statistics,
+reset the view, and control overlay opacity. Available families are:
+
+- **Displacement:** `u`, `v`, and magnitude.
+- **Velocity:** `Vx`, `Vy`, and effective velocity.
+- **Strain rate:** `Exx`, `Eyy`, tensor shear `Exy`, and effective rate.
+- **Strain:** accumulated Green–Lagrange `Exx`, `Eyy`, tensor shear `Exy`, and
+  equivalent strain magnitude.
+
+The display range can be automatic per frame, global across the sequence, or
+manual. A symmetric-about-zero option is useful for signed component fields.
+Statistics, colourbar values, plots, and exports ignore invalid and non-finite
+pixels rather than treating them as zeros.
+
+## Spatial and temporal calibration
+
+The solver always works in pixels. Pixel-to-length calibration changes only
+presentation and export units:
+
+- displacement: `px` becomes the selected length unit;
+- velocity: `px/s` becomes the selected length unit per second;
+- strain remains dimensionless;
+- strain rate remains `s^-1`.
+
+Enter the physical size of one pixel during video extraction, while importing an
+image folder, or on the Results page. The calibration is cached in application
+settings, written to extracted-frame metadata, and stored in HDF5 sessions.
+Entering `0` leaves the analysis uncalibrated.
+
+## Export
+
+### CSV
+
+**CSV (this frame)** exports the fields for the selected result frame. Values are
+written with their applicable calibrated units.
+
+### HDF5
+
+**HDF5 (all frames)** stores the complete result sequence, ROI, Dynamic ROI
+configuration and overrides, analysis backend, core grid/strain parameters,
+frame-rate information, calibration, and result-semantics metadata.
+HDF5 files can be loaded from the Import page without rerunning correlation.
+Source images are referenced by path rather than embedded, so keep them available
+if image backdrops are needed after moving the HDF5 file. Compatibility aliases
+are retained for older sessions and integrations, but the UI presents only the
+current result convention.
+
+### Video and image-sequence export
+
+The exporter can create a `1 x 1` through `4 x 4` panel layout. Each cell can be
+configured independently as a result field, raw frame, streaklines only, or an
+empty panel. Applicable field panels can choose their field, colourmap, colour
+range, symmetric scale, colourbar, label, background, and optional streakline
+overlay. Controls that do not apply to raw-frame, streakline-only, or empty
+panels are hidden.
+
+Supported outputs are MP4 (`mp4v`), AVI (`XVID`, `MJPG`, or lossless `FFV1`), and
+a numbered PNG image sequence. Backgrounds may use the deformed frame, reference
+frame, a solid colour, or transparency. True alpha transparency is preserved
+only by the PNG image-sequence output; transparent pixels become black in the
+available video codecs.
+
+## Algorithm overview
+
+1. Input images are converted to grayscale and normalized.
+2. The CPU path constructs quintic B-spline coefficients for sub-pixel intensity
+   interpolation. The GPU backend uses its CUDA/CuPy interpolation path.
+3. NCC finds an integer-pixel seed estimate when a global or rescue search is
+   needed.
+4. Inverse-compositional Gauss–Newton minimizes ZNSSD for each circular subset.
+5. Reliability-guided propagation prioritizes the best converged subsets and
+   warm-starts neighbouring points.
+6. Local least-squares plane fits are applied to immediate displacement and
+   velocity fields. Invalid pixels are excluded, and separate material
+   components are fitted independently.
+7. Green–Lagrange strain increments are accumulated. Velocity and strain rate
+   remain interval quantities.
+
+For an immediate displacement gradient, the accumulated increment uses:
+
+```text
+Exx = du/dx + 0.5 * ((du/dx)^2 + (dv/dx)^2)
+Eyy = dv/dy + 0.5 * ((du/dy)^2 + (dv/dy)^2)
+Exy = 0.5 * (du/dy + dv/dx + du/dx*du/dy + dv/dx*dv/dy)
 ```
 
-This is solved as an over-determined linear system. The smoothed gradients (∂u/∂x, ∂u/∂y, ∂v/∂x, ∂v/∂y) from the plane fit are then used to compute the Green–Lagrangian strain components:
+This implementation adds these component increments through time. It does not
+currently compose a total deformation gradient multiplicatively across frames.
 
-```
-E_xx = ∂u/∂x + ½[(∂u/∂x)² + (∂v/∂x)²]
-E_yy = ∂v/∂y + ½[(∂u/∂y)² + (∂v/∂y)²]
-E_xy = ½[∂u/∂y + ∂v/∂x + (∂u/∂x)(∂u/∂y) + (∂v/∂x)(∂v/∂y)]
-```
+## Testing
 
-These are the full Green–Lagrangian (finite-strain) expressions, not the linearised engineering strains, important if your specimen undergoes large deformations.
+Run the automated test suite from the repository root:
 
-### Strain rates
-
-This is the main thing StrainX does that Ncorr does not. Once strain fields are computed for all N frames, we differentiate them in time using a finite-difference scheme. For an image sequence acquired at frame rate f_ps (frames per second), Δt = 1/f_ps, and:
-
-```
-dE_ij/dt at frame 0:       (E_ij,1 − E_ij,0) / Δt
-dE_ij/dt at frame n (interior):  (E_ij,n+1 − E_ij,n-1) / (2Δt)
-dE_ij/dt at frame N-1:     (E_ij,N-1 − E_ij,N-2) / Δt
+```bash
+python -m unittest discover -s tests -v
 ```
 
-Central differences in the interior, one-sided at the boundaries. The result is a full-field strain rate map at every frame, output alongside the displacement and strain fields.
+The `tests/` directory also contains manual and hardware-dependent verification
+scripts for off-screen UI/export checks, real image sequences, GPU behaviour,
+memory use, CPU/GPU consistency, and HDF5 compatibility. GPU checks require a
+working CuPy/CUDA installation; data-dependent checks require their local sample
+frames.
 
-We validated this against rates derived by applying the same scheme to Ncorr's per-frame strain means. For the dominant E_yy component, the two agreed within 0.2 × 10⁻³ s⁻¹ over the middle loading frames. Integrating the computed rates back via the trapezoidal rule recovers the original strain time history to within about 12–13% over ten steps, which is what you would expect from accumulated truncation error.
+## Important limitations
 
----
+- PyDIC is 2D DIC. Out-of-plane displacement, perspective change, defocus, and
+  major illumination changes can appear as false in-plane motion or correlation
+  loss.
+- Reliable measurement requires a suitable random, high-contrast speckle pattern
+  and enough subset support inside the ROI.
+- Dynamic ROI is a texture heuristic, not material segmentation. Inspect its
+  reference preview and use manual overrides where needed.
+- A point that appears late or returns without enough intact neighbouring history
+  may be rebased. It can contribute again, but its accumulated history may not
+  represent an unbroken path from the original reference frame.
+- Second-order shape functions are CPU-only in the current implementation.
+- Long, high-resolution sequences retain result fields for every completed frame
+  and can still require substantial system memory. GPU temporary-memory pools are
+  released between frames, but GPU hardware and driver limits still apply.
+- Scientific results should be validated for the camera, optics, calibration,
+  specimen, loading mode, and expected deformation range before use in critical
+  decisions.
 
-## File structure
+## Project structure
 
+```text
+PyDIC/
+|-- README.md
+|-- requirements.txt
+|-- tests/
+`-- pydic/
+    |-- main.py
+    `-- src/
+        |-- core/
+        |   |-- analysis.py       Sequence orchestration, results, and persistence
+        |   |-- bspline.py        CPU B-spline interpolation
+        |   |-- icgn.py           CPU IC-GN solver
+        |   |-- icgn_gpu.py       CuPy GPU solver
+        |   |-- ncc.py            Integer-pixel initial search
+        |   |-- rg_dic.py         CPU reliability-guided DIC and parameters
+        |   |-- strain.py         Gradient fitting and strain-rate calculation
+        |   |-- strain_accum.py   Immediate-frame tracking and strain accumulation
+        |   `-- units.py          Spatial calibration and unit conversion
+        `-- ui/
+            |-- wizard.py         Six-stage application workflow
+            |-- image_canvas.py   ROI, zoom, marker, and overlay canvas
+            |-- render.py         Shared results/export rendering
+            |-- video_export.py   Headless multi-panel rendering and encoding
+            `-- pages/            Import, ROI, Dynamic ROI, Parameters, Analysis,
+                                 Results, frame-pair, and export screens
 ```
-StrainX/
-├── main.py
-├── requirements.txt
-├── README.md
-└── src/
-    ├── core/
-    │   ├── bspline.py       B-spline coefficient computation and sub-pixel interpolation
-    │   ├── ncc.py           Normalised cross-correlation for integer-pixel seed guess
-    │   ├── icgn.py          IC-GN optimiser (precomputed Hessian, compositional update)
-    │   ├── rg_dic.py        Reliability-guided propagation with Taylor extrapolation
-    │   ├── strain.py        Least-squares plane fit and Green–Lagrangian strains
-    │   └── analysis.py      Top-level DICAnalysis class, DICParams, strain rate computation
-    └── ui/
-        ├── theme.py         Dark stylesheet
-        ├── main_window.py   Main window and step navigation
-        ├── image_canvas.py  Interactive image canvas with ROI drawing tools
-        ├── param_panel.py   Parameter input panel
-        └── results_panel.py Colourmap viewer, temporal scrubber, export
-```
-
----
 
 ## References
 
-Blaber, J., Adair, B., & Antoniou, A. (2015). Ncorr: Open-Source 2D Digital Image Correlation Matlab Software. *Experimental Mechanics*, 55(6), 1105–1122. https://doi.org/10.1007/s11340-015-0009-1
-
-Pan, B., Li, K., & Tong, W. (2013). Fast, robust and accurate digital image correlation calculation without redundant computation. *Experimental Mechanics*, 53, 1277–1289.
-
-Pan, B., Qian, K., Xie, H., & Asundi, A. (2009). Two-dimensional digital image correlation for in-plane displacement and strain measurement: a review. *Measurement Science and Technology*, 20, 062001.
-
-Baker, S., & Matthews, I. (2004). Lucas-Kanade 20 Years On: A Unifying Framework. *International Journal of Computer Vision*, 56(3), 221–255.
-
-Sutton, M. A., Orteu, J. J., & Schreier, H. W. (2009). *Image Correlation for Shape, Motion and Deformation Measurements*. Springer, New York.
-
-Pan, B. (2016). Recent progress in digital image correlation. *Experimental Mechanics*, 56, 67–73.
-
-Dong, Y. C., & Pan, B. (2017). A review of speckle pattern fabrication and assessment for digital image correlation. *Experimental Mechanics*, 57, 1161–1181.
-
-Bland, J. M., & Altman, D. G. (1986). Statistical methods for assessing agreement between two methods of clinical measurement. *The Lancet*, 327(8476), 307–310.
+- Blaber, J., Adair, B., & Antoniou, A. (2015). Ncorr: Open-Source 2D Digital
+  Image Correlation Matlab Software. *Experimental Mechanics*, 55(6), 1105–1122.
+  https://doi.org/10.1007/s11340-015-0009-1
+- Pan, B., Li, K., & Tong, W. (2013). Fast, robust and accurate digital image
+  correlation calculation without redundant computation. *Experimental
+  Mechanics*, 53, 1277–1289.
+- Pan, B., Qian, K., Xie, H., & Asundi, A. (2009). Two-dimensional digital image
+  correlation for in-plane displacement and strain measurement: a review.
+  *Measurement Science and Technology*, 20, 062001.
+- Baker, S., & Matthews, I. (2004). Lucas-Kanade 20 Years On: A Unifying
+  Framework. *International Journal of Computer Vision*, 56(3), 221–255.
+- Sutton, M. A., Orteu, J. J., & Schreier, H. W. (2009). *Image Correlation for
+  Shape, Motion and Deformation Measurements*. Springer.

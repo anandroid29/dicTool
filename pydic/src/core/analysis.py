@@ -49,6 +49,11 @@ _FIELD_BASE_UNIT = {
     "corr": "ZNSSD",
 }
 
+# Keep ordinary result files self-contained in memory, but avoid expanding long
+# compressed sessions into many gigabytes of RAM merely to open the viewer.
+# This threshold is based on the datasets' logical (uncompressed) size.
+HDF5_LAZY_THRESHOLD_BYTES = 512 * 1024 * 1024
+
 
 def _result_f32(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
     """Compact a completed result field without changing solver precision.
@@ -82,6 +87,90 @@ def _mask_invalid(valid: np.ndarray, *fields: np.ndarray) -> None:
     for field in fields:
         if field is not None:
             field[~valid | ~np.isfinite(field)] = np.nan
+
+
+def _dynamic_measurement_mask(
+    base_valid: np.ndarray,
+    current_mask: Optional[np.ndarray],
+    inc_u: np.ndarray,
+    inc_v: np.ndarray,
+    prior_u: Optional[np.ndarray] = None,
+    prior_v: Optional[np.ndarray] = None,
+    include_mask: Optional[np.ndarray] = None,
+    exclude_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Filter reference-grid measurements using a current-frame texture mask.
+
+    ``base_valid`` and the override masks are material labels in reference-frame
+    coordinates. ``current_mask`` is an image-space decision on the current
+    frame. The two coordinate systems meet only after the reference point has
+    been advected by its retained position history plus this frame's increment.
+
+    Keeping this transform in one backend-neutral helper prevents the CPU and
+    GPU paths from quietly using different ROI semantics. Include overrides win
+    over excludes and the automatic texture decision, but cannot resurrect a
+    failed or off-frame correlation.
+    """
+    valid = np.asarray(base_valid, dtype=bool).copy()
+    if current_mask is None or not valid.any():
+        return valid
+
+    current = np.asarray(current_mask, dtype=bool)
+    if current.shape != valid.shape:
+        raise ValueError(
+            f"Dynamic ROI shape {current.shape} does not match result shape "
+            f"{valid.shape}.")
+
+    y_ref, x_ref = np.where(valid)
+    du = np.asarray(inc_u)[y_ref, x_ref]
+    dv = np.asarray(inc_v)[y_ref, x_ref]
+
+    def _prior_at(points: Optional[np.ndarray]) -> np.ndarray:
+        if points is None:
+            return np.zeros(len(x_ref), dtype=np.float64)
+        arr = np.asarray(points)
+        if arr.shape != valid.shape:
+            raise ValueError(
+                f"Position-history shape {arr.shape} does not match result "
+                f"shape {valid.shape}.")
+        values = np.asarray(arr[y_ref, x_ref], dtype=np.float64)
+        # A point that has not previously been tracked has no accumulated
+        # offset yet. Its current increment still locates it correctly.
+        return np.where(np.isfinite(values), values, 0.0)
+
+    x_pos = x_ref + _prior_at(prior_u) + du
+    y_pos = y_ref + _prior_at(prior_v) + dv
+    h, w = current.shape
+    in_bounds = (np.isfinite(x_pos) & np.isfinite(y_pos) &
+                 (x_pos >= 0) & (x_pos <= w - 1) &
+                 (y_pos >= 0) & (y_pos <= h - 1))
+
+    kept = np.zeros(len(x_ref), dtype=bool)
+    ib = np.where(in_bounds)[0]
+    if ib.size:
+        x_cur = np.rint(x_pos[ib]).astype(np.intp)
+        y_cur = np.rint(y_pos[ib]).astype(np.intp)
+        kept[ib] = current[y_cur, x_cur]
+
+    def _reference_override(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if mask is None:
+            return None
+        arr = np.asarray(mask, dtype=bool)
+        if arr.shape != valid.shape:
+            raise ValueError(
+                f"Dynamic ROI override shape {arr.shape} does not match result "
+                f"shape {valid.shape}.")
+        return arr[y_ref, x_ref]
+
+    excluded = _reference_override(exclude_mask)
+    included = _reference_override(include_mask)
+    if excluded is not None:
+        kept &= ~excluded
+    if included is not None:
+        kept = in_bounds & (kept | included)
+
+    valid[y_ref[~kept], x_ref[~kept]] = False
+    return valid
 
 
 @dataclass
@@ -148,7 +237,13 @@ class DICAnalysis:
         # and stays that way -- this only affects how results are presented.
         self.calibration: Calibration = Calibration()
         self.prefer_gpu: bool = True
+        self.last_backend: str = "unknown"
         self._cancel: list = [False]
+        # Schema-3 sessions keep datasets on disk and materialise only fields
+        # that are actually viewed or exported. These proxies require the file
+        # handle to remain open for the lifetime of the loaded session.
+        self._hdf5_handle = None
+        self.hdf5_lazy: bool = False
 
         # Human-readable notes about anything load_settings had to correct. The
         # console print alone was too easy to miss -- a silently repaired
@@ -170,6 +265,19 @@ class DICAnalysis:
         self.last_hdf5_directory: str = os.path.expanduser("~")
 
         self.load_settings()
+
+    def _release_loaded_hdf5(self) -> None:
+        handle = getattr(self, "_hdf5_handle", None)
+        self._hdf5_handle = None
+        self.hdf5_lazy = False
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    def __del__(self):
+        self._release_loaded_hdf5()
 
     def make_dynamic_roi(self) -> "DynamicROI":
         """Build the dynamic ROI from params + operator overrides.
@@ -200,7 +308,7 @@ class DICAnalysis:
                   else np.ones(self._ref_image.shape, dtype=bool))
         roi = self.make_dynamic_roi()
         roi.calibrate(self._ref_image)
-        dynamic = roi.mask(self._ref_image)
+        dynamic = roi.mask(self._ref_image, reference_frame=True)
         return static.copy() if dynamic is None else np.asarray(dynamic, dtype=bool)
 
     def set_reference(self, path: str) -> None:
@@ -217,16 +325,19 @@ class DICAnalysis:
     def add_deformed(self, path: str) -> None:
         # The existing result sequence no longer describes the input list once
         # a frame is added.
+        self._release_loaded_hdf5()
         self.results.clear()
         self.def_paths.append(path)
 
     def clear_deformed(self) -> None:
+        self._release_loaded_hdf5()
         self.def_paths.clear()
         self.results.clear()
 
     def set_roi_mask(self, mask: np.ndarray) -> None:
         if self._ref_image is not None and mask.shape != self._ref_image.shape:
             raise ValueError(f"ROI mask shape {mask.shape} != reference {self._ref_image.shape}")
+        self._release_loaded_hdf5()
         self._roi_mask = mask.astype(bool)
         self.results.clear()
 
@@ -243,6 +354,7 @@ class DICAnalysis:
 
     def clear_roi(self) -> None:
         """Clear ROI state and every result/override that depends on it."""
+        self._release_loaded_hdf5()
         self._roi_mask = None
         self.dynamic_include_mask = None
         self.dynamic_exclude_mask = None
@@ -255,10 +367,6 @@ class DICAnalysis:
     @property
     def roi_mask(self) -> Optional[np.ndarray]:
         return self._roi_mask
-
-    @property
-    def deformed_paths(self) -> List[str]:
-        return self.def_paths
 
     def cancel(self) -> None:
         self._cancel[0] = True
@@ -273,10 +381,13 @@ class DICAnalysis:
         if use_gpu:
             if not _HAS_CUPY:
                 raise RuntimeError("GPU acceleration requested but CuPy is not installed or NVIDIA drivers are missing.")
+            self.last_backend = "gpu"
             self._run_gpu(progress_cb, seed_xy)
             return
 
+        self.last_backend = "cpu"
         self._cancel[0] = False
+        self._release_loaded_hdf5()
         self.results.clear()
         if self._ref_image is None:
             raise RuntimeError("No reference image.")
@@ -329,24 +440,18 @@ class DICAnalysis:
             valid = _finite_measurement_mask(
                 dic.analyzed, dic.u, dic.v, dic.corr)
 
-            d_mask = dyn_roi.mask(cur)
-            if d_mask is not None and valid.any():
-                y_ref, x_ref = np.where(valid)
-                x_pos = x_ref + dic.u[valid]
-                y_pos = y_ref + dic.v[valid]
-                H_i, W_i = cur.shape
-                kept = (np.isfinite(x_pos) & np.isfinite(y_pos) &
-                        (x_pos >= 0) & (x_pos <= W_i - 1) &
-                        (y_pos >= 0) & (y_pos <= H_i - 1))
-                in_bnd_idx = np.where(kept)[0]
-                x_cur = np.rint(x_pos[in_bnd_idx]).astype(np.intp)
-                y_cur = np.rint(y_pos[in_bnd_idx]).astype(np.intp)
-                kept[in_bnd_idx] = d_mask[y_cur, x_cur]
-                
-                lost = ~kept
-                y_lost, x_lost = y_ref[lost], x_ref[lost]
-                
-                valid[y_lost, x_lost] = False
+            # The static ROI and overrides label material points on the
+            # reference frame; the texture mask lives on the current image.
+            # Advect the points before sampling it. Intersecting the current
+            # mask with the unwarped static ROI makes a translating specimen
+            # lose a strip on every frame until almost nothing remains.
+            prior_u, prior_v = accum.position_hint()
+            d_mask = dyn_roi.mask(cur, reference_frame=False)
+            valid = _dynamic_measurement_mask(
+                valid, d_mask, dic.u, dic.v,
+                prior_u=prior_u, prior_v=prior_v,
+                include_mask=self.dynamic_include_mask,
+                exclude_mask=self.dynamic_exclude_mask)
 
             _mask_invalid(valid, dic.u, dic.v, dic.du_dx, dic.du_dy,
                           dic.dv_dx, dic.dv_dy, dic.corr)
@@ -411,6 +516,7 @@ class DICAnalysis:
         Executes the Wavefront GPU pipeline with intelligent Global Seed Tracking and Auto-Fallback.
         """
         self._cancel[0] = False
+        self._release_loaded_hdf5()
         self.results.clear()
 
         if self._ref_image is None or not self.def_paths:
@@ -539,35 +645,15 @@ class DICAnalysis:
             # Dynamic ROI rejection must happen BEFORE strain accumulation. In
             # the old order, a subset that left the frame could contribute one
             # huge affine increment permanently and was only hidden afterwards.
-            d_mask = dyn_roi.mask(cur_image)
-            if d_mask is not None:
-                vmask = _finite_measurement_mask(
-                    np.ones(inc_u.shape, dtype=bool), inc_u, inc_v, corr_f)
-                if vmask.any():
-                    y_ref, x_ref = np.where(vmask)
-                    prior_u = (np.where(np.isfinite(hint_u), hint_u, 0.0)
-                               if hint_u is not None else 0.0)
-                    prior_v = (np.where(np.isfinite(hint_v), hint_v, 0.0)
-                               if hint_v is not None else 0.0)
-                    x_pos = (x_ref +
-                             (prior_u[vmask] if isinstance(prior_u, np.ndarray) else prior_u) +
-                             inc_u[vmask])
-                    y_pos = (y_ref +
-                             (prior_v[vmask] if isinstance(prior_v, np.ndarray) else prior_v) +
-                             inc_v[vmask])
-                    H_i, W_i = cur_image.shape
-                    kept = (np.isfinite(x_pos) & np.isfinite(y_pos) &
-                            (x_pos >= 0) & (x_pos <= W_i - 1) &
-                            (y_pos >= 0) & (y_pos <= H_i - 1))
-                    ib = np.where(kept)[0]
-                    x_cur = np.rint(x_pos[ib]).astype(np.intp)
-                    y_cur = np.rint(y_pos[ib]).astype(np.intp)
-                    kept[ib] = d_mask[y_cur, x_cur]
-                    ly, lx = y_ref[~kept], x_ref[~kept]
-                    inc_u[ly, lx] = np.nan
-
+            d_mask = dyn_roi.mask(cur_image, reference_frame=False)
             measurement_valid = _finite_measurement_mask(
                 np.ones(inc_u.shape, dtype=bool), inc_u, inc_v, corr_f)
+            measurement_valid = _dynamic_measurement_mask(
+                measurement_valid, d_mask, inc_u, inc_v,
+                prior_u=hint_u, prior_v=hint_v,
+                include_mask=self.dynamic_include_mask,
+                exclude_mask=self.dynamic_exclude_mask)
+
             _mask_invalid(measurement_valid, inc_u, inc_v, inc_du_dx,
                           inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f)
 
@@ -700,51 +786,6 @@ class DICAnalysis:
             res.Gxy_rate = _result_f32(rates["Gxy_rate"])
             res.Eyy_rate = res.dVy_dy
             res.Eeff_rate = _result_f32(rates["Eeff_rate"])
-
-    def get_trajectories(self, max_frame: int, step: int = 10) -> list[list[tuple[float, float]]]:
-        if not self.results or max_frame < 0:
-            return []
-
-        valid = np.isfinite(self.results[0].u) & np.isfinite(self.results[0].v)
-
-        y_lines = np.unique(np.where(valid)[0])
-        x_lines = np.unique(np.where(valid)[1])
-
-        y_sampled = y_lines[::step]
-        x_sampled = x_lines[::step]
-
-        xx, yy = np.meshgrid(x_sampled, y_sampled)
-        xx = xx.ravel()
-        yy = yy.ravel()
-
-        valid_intersections = valid[yy, xx]
-        x0 = xx[valid_intersections]
-        y0 = yy[valid_intersections]
-
-        N_particles = len(x0)
-        active = np.ones(N_particles, dtype=bool)
-
-        paths = [[(float(x), float(y))] for x, y in zip(x0, y0)]
-        cum_u = np.zeros(N_particles, dtype=float)
-        cum_v = np.zeros(N_particles, dtype=float)
-
-        for i in range(0, max_frame + 1):
-            if i >= len(self.results):
-                break
-
-            u_i = self.results[i].u[y0, x0]
-            v_i = self.results[i].v[y0, x0]
-
-            lost = ~np.isfinite(u_i) | ~np.isfinite(v_i)
-            active[lost] = False
-            cum_u[active] += u_i[active]
-            cum_v[active] += v_i[active]
-
-            for p_idx in np.where(active)[0]:
-                paths[p_idx].append((float(x0[p_idx] + cum_u[p_idx]),
-                                     float(y0[p_idx] + cum_v[p_idx])))
-
-        return [p for p in paths if len(p) > 1]
 
     # ------------------------------------------------------------------
     # Marker-seeded trajectories
@@ -1023,7 +1064,8 @@ class DICAnalysis:
             for res in self.results:
                 arr = getattr(res, field, None)
                 if arr is not None and arr.size:
-                    valid = arr[np.isfinite(arr)]
+                    materialised = np.asarray(arr)
+                    valid = materialised[np.isfinite(materialised)]
                     if valid.size > 0:
                         vmin = min(vmin, float(valid.min()))
                         vmax = max(vmax, float(valid.max()))
@@ -1038,7 +1080,8 @@ class DICAnalysis:
             arr = getattr(res, field, None)
             if arr is None or not arr.size:
                 continue
-            valid = arr[np.isfinite(arr)]
+            materialised = np.asarray(arr)
+            valid = materialised[np.isfinite(materialised)]
             if valid.size == 0:
                 continue
             if valid.size > 50_000:
@@ -1113,6 +1156,17 @@ class DICAnalysis:
                                   if self.calibration.calibrated else 0.0),
                 display_unit=self.calibration.display_unit,
                 length_units="pixels",
+                analysis_backend=getattr(self, "last_backend", "unknown"),
+                dynamic_roi=str(getattr(self.params, "dynamic_roi", "None")),
+                # NaN is the HDF5-safe sentinel for automatic/Otsu selection.
+                dynamic_roi_threshold=(
+                    np.nan if getattr(self.params, "dynamic_roi_threshold", None) is None
+                    else float(self.params.dynamic_roi_threshold)),
+                dynamic_roi_min_area_frac=float(getattr(
+                    self.params, "dynamic_roi_min_area_frac", 0.02)),
+                dynamic_roi_fill_holes=bool(getattr(
+                    self.params, "dynamic_roi_fill_holes", True)),
+                dynamic_roi_override_semantics="reference_material",
             ))
 
             # 2. Save the ROI Mask (CRITICAL FIX)
@@ -1123,6 +1177,13 @@ class DICAnalysis:
                     compression="gzip",
                     compression_opts=4
                 )
+            for name, mask in (
+                    ("dynamic_include_mask", getattr(self, "dynamic_include_mask", None)),
+                    ("dynamic_exclude_mask", getattr(self, "dynamic_exclude_mask", None))):
+                if mask is not None:
+                    f.create_dataset(
+                        name, data=np.asarray(mask, dtype=bool),
+                        compression="gzip", compression_opts=4)
 
             # 3. Save Frame Data
             for i, res in enumerate(self.results):
@@ -1148,14 +1209,39 @@ class DICAnalysis:
                         g.create_dataset(name, data=data,
                                          compression="gzip", compression_opts=4)
 
-    def load_hdf5(self, path: str) -> None:
+    def load_hdf5(
+            self, path: str,
+            progress_cb: Optional[Callable[[float, str], None]] = None
+            ) -> None:
         import h5py
+
+        def report(fraction: float, message: str) -> None:
+            if progress_cb is not None:
+                progress_cb(float(np.clip(fraction, 0.0, 1.0)), message)
+
+        report(0.0, "Opening HDF5 session…")
+        self._release_loaded_hdf5()
         self.results.clear()
         self.def_paths.clear()
 
-        with h5py.File(path, "r") as f:
+        f = h5py.File(path, "r")
+        try:
             # 1. Restore Global Attributes
+            report(0.04, "Reading session metadata…")
             result_schema = int(f.attrs.get("result_schema", 1))
+            frame_keys = sorted(
+                key for key in f.keys() if key.startswith("frame_"))
+            logical_bytes = 0
+            if frame_keys:
+                first_frame = f[frame_keys[0]]
+                bytes_per_frame = sum(
+                    dataset.size * dataset.dtype.itemsize
+                    for dataset in first_frame.values()
+                    if isinstance(dataset, h5py.Dataset))
+                logical_bytes = bytes_per_frame * len(frame_keys)
+            lazy = (
+                result_schema >= 3
+                and logical_bytes >= HDF5_LAZY_THRESHOLD_BYTES)
             self.ref_path = f.attrs.get("reference_image", "")
             try:
                 if self.ref_path and os.path.exists(self.ref_path):
@@ -1168,37 +1254,67 @@ class DICAnalysis:
             self.params.strain_window = int(f.attrs.get("strain_window", self.params.strain_window))
             self.fps = float(f.attrs.get("fps", 1.0))
 
+            def _attr_text(name: str, default: str) -> str:
+                value = f.attrs.get(name, default)
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return str(value)
+
+            self.last_backend = _attr_text("analysis_backend", "unknown")
+            if "dynamic_roi" in f.attrs:
+                self.params.dynamic_roi = _attr_text("dynamic_roi", "None")
+                threshold = float(f.attrs.get("dynamic_roi_threshold", np.nan))
+                self.params.dynamic_roi_threshold = (
+                    None if not np.isfinite(threshold) else threshold)
+                self.params.dynamic_roi_min_area_frac = float(f.attrs.get(
+                    "dynamic_roi_min_area_frac",
+                    getattr(self.params, "dynamic_roi_min_area_frac", 0.02)))
+                self.params.dynamic_roi_fill_holes = bool(f.attrs.get(
+                    "dynamic_roi_fill_holes",
+                    getattr(self.params, "dynamic_roi_fill_holes", True)))
+
             mpp = float(f.attrs.get("metres_per_pixel", 0.0) or 0.0)
             self.calibration = Calibration(
                 mpp if mpp > 0 else None,
                 str(f.attrs.get("display_unit", "mm")))
 
             # 2. Restore the ROI Mask (CRITICAL FIX)
+            report(0.08, "Restoring ROI and calibration…")
             if "roi_mask" in f:
                 self._roi_mask = f["roi_mask"][:].astype(bool)
             else:
                 self._roi_mask = None
+            self.dynamic_include_mask = (
+                f["dynamic_include_mask"][:].astype(bool)
+                if "dynamic_include_mask" in f else None)
+            self.dynamic_exclude_mask = (
+                f["dynamic_exclude_mask"][:].astype(bool)
+                if "dynamic_exclude_mask" in f else None)
 
             # 3. Restore Frame Data
-            for k in sorted([key for key in f.keys() if key.startswith("frame_")]):
+            n_frames = len(frame_keys)
+            for frame_index, k in enumerate(frame_keys):
+                report(
+                    0.10 + 0.82 * frame_index / max(1, n_frames),
+                    f"Loading frame {frame_index + 1} of {n_frames}…")
                 g = f[k]
                 ipath = g.attrs.get("image_path", "")
                 self.def_paths.append(ipath)
 
+                def read_field(name: str, default=None):
+                    if name not in g:
+                        return np.zeros(0) if default is None else default
+                    return g[name] if lazy else g[name][:]
+
                 res = PairResult(
                     image_path=ipath,
-                    u=g["u"][:] if "u" in g else np.zeros(0),
-                    v=g["v"][:] if "v" in g else np.zeros(0),
-                    Exx=g["Exx"][:] if "Exx" in g else np.zeros(0),
-                    Exy=g["Exy"][:] if "Exy" in g else np.zeros(0),
-                    Eyy=g["Eyy"][:] if "Eyy" in g else np.zeros(0),
-                    Eeff=g["Eeff"][:] if "Eeff" in g else np.zeros(0),
-                    du_dx=g["du_dx"][:] if "du_dx" in g else np.zeros(0),
-                    du_dy=g["du_dy"][:] if "du_dy" in g else np.zeros(0),
-                    dv_dx=g["dv_dx"][:] if "dv_dx" in g else np.zeros(0),
-                    dv_dy=g["dv_dy"][:] if "dv_dy" in g else np.zeros(0),
-                    corr=g["corr"][:] if "corr" in g else np.zeros(0),
-                    valid=g["valid"][:].astype(bool) if "valid" in g else None,
+                    u=read_field("u"), v=read_field("v"),
+                    Exx=read_field("Exx"), Exy=read_field("Exy"),
+                    Eyy=read_field("Eyy"), Eeff=read_field("Eeff"),
+                    du_dx=read_field("du_dx"), du_dy=read_field("du_dy"),
+                    dv_dx=read_field("dv_dx"), dv_dy=read_field("dv_dy"),
+                    corr=read_field("corr"),
+                    valid=(read_field("valid") if "valid" in g else None),
                     elapsed=float(g.attrs.get("elapsed_s", 0.0))
                 )
                 extra_fields = ("u_inc", "v_inc", "mag_inc",
@@ -1208,16 +1324,20 @@ class DICAnalysis:
                                 "Exx_gl", "Eyy_gl", "Exy_gl", "Gxy_gl", "Eeff_gl")
                 for rate in extra_fields:
                     if rate in g:
-                        setattr(res, rate, _result_f32(g[rate][:]))
+                        setattr(res, rate, (g[rate] if lazy else
+                                           _result_f32(g[rate][:])))
 
                 # Loaded files use the same compact in-memory representation as
                 # a fresh run. Schema-3 u_inc/v_inc and the legacy strain names
                 # are exact aliases by definition; reading their duplicate HDF5
                 # datasets into separate arrays used nearly twice the necessary
                 # memory when reopening a long result file.
-                for name in ("u", "v", "Exx", "Exy", "Eyy", "Eeff",
-                             "du_dx", "du_dy", "dv_dx", "dv_dy", "corr"):
-                    setattr(res, name, _result_f32(getattr(res, name)))
+                if not lazy:
+                    for name in ("u", "v", "Exx", "Exy", "Eyy", "Eeff",
+                                 "du_dx", "du_dy", "dv_dx", "dv_dy", "corr"):
+                        setattr(res, name, _result_f32(getattr(res, name)))
+                    if res.valid is not None:
+                        res.valid = np.asarray(res.valid, dtype=bool)
                 if result_schema >= 3:
                     res.u_inc = res.u
                     res.v_inc = res.v
@@ -1240,12 +1360,27 @@ class DICAnalysis:
                     res.Exx_inf = res.Exx
                     res.Eyy_inf = res.Eyy
                     res.Exy_inf = res.Exy
-                    res.Gxy_inf = 2.0 * res.Exy
+                    # A lazy HDF5 dataset cannot represent this derived legacy
+                    # alias without allocating the entire field. Modern schema-3
+                    # files save Gxy_inf explicitly; malformed/partial files
+                    # simply leave this optional compatibility field unavailable.
+                    res.Gxy_inf = None if lazy else 2.0 * res.Exy
                     res.Eeff_inf = res.Eeff
+
+        except Exception:
+            f.close()
+            raise
+
+        if lazy:
+            self._hdf5_handle = f
+            self.hdf5_lazy = True
+        else:
+            f.close()
 
         # Files written before schema 3 stored cumulative u/v. Convert their
         # display fields to frame increments once; schema-3 files already store
         # immediate displacement and only need direct aliases.
+        report(0.94, "Finalising loaded fields…")
         if self.results and result_schema < 3:
             prev_u = prev_v = prev_valid = None
             for res in self.results:
@@ -1264,6 +1399,7 @@ class DICAnalysis:
             self._compute_velocities_and_rates()
         elif self.results and any(r.u_inc is None for r in self.results):
             self._compute_incremental_displacements()
+        report(1.0, f"Loaded {len(self.results)} frames.")
 
     def _get_settings_path(self) -> str:
         import os
@@ -1542,16 +1678,20 @@ class DynamicROI:
         m8 = np.clip(m / s * 255.0, 0, 255).astype(np.uint8)
         return cv2.GaussianBlur(m8, (5, 5), 0)
 
-    # ---- helpers for the dynamic-ROI editor -------------------------------
-    def metric_normalised(self, img: np.ndarray) -> Optional[np.ndarray]:
-        """The texture metric as a 0..1 image, for preview and histogramming."""
-        m8 = self._metric8(img)
-        return None if m8 is None else m8.astype(np.float64) / 255.0
-
     def auto_threshold_normalised(self) -> Optional[float]:
         return None if self.auto_thresh is None else self.auto_thresh / 255.0
 
-    def mask(self, cur_image: np.ndarray) -> Optional[np.ndarray]:
+    def mask(self, cur_image: np.ndarray,
+             reference_frame: bool = False) -> Optional[np.ndarray]:
+        """Return the texture mask in the coordinate system of ``cur_image``.
+
+        ``roi_mask`` and manual overrides were drawn on the reference image.
+        They may therefore be applied pixel-for-pixel only while rendering that
+        reference preview. During analysis, material points are advected and
+        sample this unconstrained current-frame mask at their current positions;
+        applying the original ROI here would turn it into a stationary crop and
+        progressively erase translating material.
+        """
         if not self.enabled:
             return None
         if self.thresh is None:
@@ -1561,13 +1701,14 @@ class DynamicROI:
             return None
         mask = (m8 >= self.thresh).astype(np.uint8) * 255
 
-        # Operator overrides are applied BEFORE the morphology and
-        # connected-component steps so that a hand-included region takes part in
-        # closing and cannot be discarded as a too-small component.
-        if self.exclude_mask is not None:
-            mask[self.exclude_mask] = 0
-        if self.include_mask is not None:
-            mask[self.include_mask] = 255
+        # Overrides are reference-material labels. They can participate in the
+        # dense reference preview, but on later frames they are applied per
+        # tracked point by _dynamic_measurement_mask after advection.
+        if reference_frame:
+            if self.exclude_mask is not None:
+                mask[self.exclude_mask] = 0
+            if self.include_mask is not None:
+                mask[self.include_mask] = 255
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -1586,9 +1727,10 @@ class DynamicROI:
             keep[1:] = areas >= min_area
             out = keep[labels]
 
-        # Clip to the static ROI before filling, so "enclosed" means enclosed
-        # within the region being analysed rather than within the whole frame.
-        if self.roi_mask is not None:
+        # Only the reference preview shares pixel coordinates with the static
+        # ROI. Current-frame masks remain in current image coordinates and are
+        # sampled by advected reference points in the analysis paths.
+        if reference_frame and self.roi_mask is not None:
             out = out & self.roi_mask
 
         # Contour fill: anything fully surrounded by kept material becomes kept.
@@ -1597,7 +1739,7 @@ class DynamicROI:
         if self.fill_holes and out.any():
             from scipy.ndimage import binary_fill_holes
             out = binary_fill_holes(out)
-            if self.roi_mask is not None:
+            if reference_frame and self.roi_mask is not None:
                 out = out & self.roi_mask
 
         # Re-apply the operator's decisions LAST. Setting them before morphology
@@ -1612,12 +1754,13 @@ class DynamicROI:
         # Doing it here also means an explicit Exclude beats the hole fill, which
         # is the escape hatch when an enclosed gap is a genuine void rather than
         # a texture dropout. Precedence: include > exclude > fill > metric.
-        if self.exclude_mask is not None:
-            out = out & ~self.exclude_mask
-        if self.include_mask is not None:
-            out = out | self.include_mask
-            if self.roi_mask is not None:
-                out = out & self.roi_mask
+        if reference_frame:
+            if self.exclude_mask is not None:
+                out = out & ~self.exclude_mask
+            if self.include_mask is not None:
+                out = out | self.include_mask
+                if self.roi_mask is not None:
+                    out = out & self.roi_mask
         return out
 
 

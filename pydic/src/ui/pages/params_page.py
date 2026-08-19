@@ -552,11 +552,13 @@ class ParamsPage(QWidget):
             return
         rad = r["radius"]
         pen = r["penalty_px"]
-        need = (2.0 * pen / (rad ** 2)) if (pen and pen > 0) else float("nan")
+        need = max(0.0, 2.0 * pen / (rad ** 2))
         QMessageBox.information(
             self, "2nd order — measured cost",
-            f"Image noise:            {r['noise_sigma']:.2f} grey levels\n"
-            f"Mean gradient in ROI:   {r['mean_gradient']:.2f} grey/px\n\n"
+            f"Image noise:            {r['noise_sigma']:.2f} grey levels (8-bit)\n"
+            f"Mean gradient in ROI:   {r['mean_gradient']:.2f} grey/px (8-bit)\n"
+            f"Usable samples:         {r['valid_samples_order1']} / "
+            f"{r['valid_samples_order2']} (1st / 2nd order)\n\n"
             f"Predicted random error\n"
             f"   1st order:           {r['sigma_u_order1']:.4f} px\n"
             f"   2nd order:           {r['sigma_u_order2']:.4f} px\n"
