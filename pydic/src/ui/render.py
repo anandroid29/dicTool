@@ -22,6 +22,11 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
+# Colour limits are a display concern but the analysis layer needs the same
+# definition for its sequence-wide range, so the primitive lives in core and
+# both sides import it from there.
+from src.core.stats import robust_limits
+
 try:
     import cv2
     _HAVE_CV2 = True
@@ -52,9 +57,13 @@ class RangeSpec:
     """How the colour limits for a field are chosen.
 
     mode:
-      "auto"   - min/max of the frame being shown
-      "global" - min/max across the whole sequence
+      "auto"   - limits from the frame being shown
+      "global" - limits from the whole sequence, so frames stay comparable
       "manual" - the numbers the user typed
+
+    `percentile` is the central coverage used by auto and global (100 = raw
+    min/max). It does not apply to manual, where the user has stated the limits
+    outright.
 
     Manual limits are in DISPLAY units (what the colourbar is labelled with),
     because that is what the user is reading when they type them. Auto/global
@@ -65,6 +74,7 @@ class RangeSpec:
     vmin: Optional[float] = None
     vmax: Optional[float] = None
     symmetric: bool = False
+    percentile: float = 100.0
 
     def resolve(self, arr: np.ndarray,
                 global_range: Optional[Tuple[float, float]] = None
@@ -77,11 +87,10 @@ class RangeSpec:
         else:
             if arr is None:
                 return None
-            finite = np.isfinite(arr)
-            if not finite.any():
+            limits = robust_limits(np.asarray(arr), self.percentile)
+            if limits is None:
                 return None
-            vals = arr[finite]
-            vmin, vmax = float(vals.min()), float(vals.max())
+            vmin, vmax = limits
 
         if not (np.isfinite(vmin) and np.isfinite(vmax)):
             return None
@@ -91,7 +100,12 @@ class RangeSpec:
             lim = max(abs(vmin), abs(vmax))
             vmin, vmax = -lim, lim
         if vmin == vmax:
-            vmax = vmin + 1e-12
+            # A perfectly uniform field. Widen by a relative amount: the old
+            # fixed 1e-12 was below the resolution of a value of order 1e3, so
+            # normalising against it amplified float noise into full-scale
+            # colour banding across what should read as one flat value.
+            pad = max(abs(vmin) * 1e-6, 1e-12)
+            vmin, vmax = vmin - pad, vmax + pad
         return vmin, vmax
 
 
@@ -99,9 +113,17 @@ class RangeSpec:
 # Field -> RGBA overlay
 # ---------------------------------------------------------------------------
 
+# Colours for values outside the chosen range. Deliberately outside every
+# scientific colormap's gamut so clipping is unmistakable rather than being
+# mistaken for a genuine extreme.
+OVER_RANGE_RGB  = (255, 0, 255)     # magenta -- above vmax
+UNDER_RANGE_RGB = (0, 255, 255)     # cyan    -- below vmin
+
+
 def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
                   roi_mask: Optional[np.ndarray] = None,
-                  spacing: int = 3, alpha: int = 195) -> Optional[np.ndarray]:
+                  spacing: int = 3, alpha: int = 195,
+                  mark_out_of_range: bool = False) -> Optional[np.ndarray]:
     """Colour-mapped RGBA overlay for a sparse field, as uint8 (H, W, 4).
 
     The field is only populated on the correlation grid, so it is decimated to
@@ -109,6 +131,14 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
     back up. Doing it in that order is what avoids the blocky look: the
     interpolation happens on colours at grid resolution rather than on a
     mostly-NaN full-resolution array.
+
+    The colormap is applied exactly as defined. Nothing is done to the colours
+    afterwards, because the colourbar is drawn from the same colormap and any
+    post-hoc adjustment here would break the correspondence between a colour on
+    screen and the value the bar says it means.
+
+    With `mark_out_of_range`, values beyond the limits are flagged in colours no
+    colormap contains, so a scale that is hiding data says so.
     """
     if arr is None or not _HAVE_CV2:
         return None
@@ -139,9 +169,16 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
 
     safe_small = np.where(small_mask, small, vmin)
     rgba_small = cmap_obj(norm(safe_small), bytes=True).astype(np.float32)
-    # Mild contrast lift so the field reads clearly over a grey background.
-    rgba_small[..., :3] = np.clip(
-        0.5 + (rgba_small[..., :3] / 255.0 - 0.5) * 1.35, 0.0, 1.0) * 255.0
+
+    if mark_out_of_range:
+        # Compare before normalisation clips, so the test sees the real values.
+        over = small_mask & (small > vmax)
+        under = small_mask & (small < vmin)
+        if over.any():
+            rgba_small[over, :3] = OVER_RANGE_RGB
+        if under.any():
+            rgba_small[under, :3] = UNDER_RANGE_RGB
+
     # Resize premultiplied colour and coverage separately. Interpolating raw RGB
     # lets arbitrary colours stored at transparent/invalid pixels bleed into a
     # specimen edge; premultiplication makes invalid pixels contribute exactly
@@ -237,12 +274,23 @@ def draw_markers(rgb: np.ndarray, points, colors, radius: int = 6) -> np.ndarray
 
 
 def draw_colorbar(rgb: np.ndarray, cmap_name: str, vmin: float, vmax: float,
-                  unit: str = "", height: int = 12, margin: int = 12) -> np.ndarray:
-    """A horizontal colour ramp with end labels, drawn along the bottom."""
+                  unit: str = "", height: int = 12, margin: int = 12,
+                  clipped_low: bool = False, clipped_high: bool = False
+                  ) -> np.ndarray:
+    """A horizontal colour ramp with end and midpoint labels, along the bottom.
+
+    Drawn from the same colormap the field is coloured with, so a colour on the
+    image and the same colour on the bar mean the same value.
+
+    `clipped_low` / `clipped_high` add a cap in the out-of-range colour, so a
+    figure taken out of the tool still says that the scale is hiding data
+    rather than presenting a clipped extreme as the true one.
+    """
     if not _HAVE_CV2:
         return rgb
     h, w = rgb.shape[:2]
-    bar_w = max(40, w - 2 * margin)
+    cap = 7 if (clipped_low or clipped_high) else 0
+    bar_w = max(40, w - 2 * margin - 2 * cap)
     ramp = np.linspace(0.0, 1.0, bar_w, dtype=np.float32)[None, :]
     cols = (get_cmap(cmap_name, 256)(ramp)[..., :3] * 255).astype(np.uint8)
     bar = np.repeat(cols, height, axis=0)
@@ -250,15 +298,32 @@ def draw_colorbar(rgb: np.ndarray, cmap_name: str, vmin: float, vmax: float,
     y0 = h - margin - height - 14
     if y0 < 0:
         return rgb
-    cv2.rectangle(rgb, (margin - 2, y0 - 2), (margin + bar_w + 2, y0 + height + 2),
-                  (25, 25, 25), -1)
-    rgb[y0:y0 + height, margin:margin + bar_w] = bar
+    x0 = margin + cap
+    cv2.rectangle(rgb, (margin - 2, y0 - 2),
+                  (margin + bar_w + 2 * cap + 2, y0 + height + 2), (25, 25, 25), -1)
+    rgb[y0:y0 + height, x0:x0 + bar_w] = bar
+
+    if clipped_low:
+        rgb[y0:y0 + height, margin:x0] = UNDER_RANGE_RGB
+    if clipped_high:
+        rgb[y0:y0 + height, x0 + bar_w:x0 + bar_w + cap] = OVER_RANGE_RGB
 
     fs, th = 0.38, 1
-    lo, hi = f"{vmin:.4g}", f"{vmax:.4g}" + (f" {unit}" if unit else "")
+    suffix = f" {unit}" if unit else ""
+    mid = 0.5 * (vmin + vmax)
+    lo, md, hi = f"{vmin:.4g}", f"{mid:.4g}", f"{vmax:.4g}{suffix}"
     ty = y0 + height + 12
-    for text, tx in ((lo, margin),
-                     (hi, margin + bar_w - cv2.getTextSize(hi, cv2.FONT_HERSHEY_SIMPLEX, fs, th)[0][0])):
+
+    def _tw(s):
+        return cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, fs, th)[0][0]
+
+    placements = [(lo, x0), (hi, x0 + bar_w - _tw(hi))]
+    # Only label the midpoint when it fits without colliding with the ends.
+    mid_x = x0 + bar_w // 2 - _tw(md) // 2
+    if mid_x > x0 + _tw(lo) + 10 and mid_x + _tw(md) < x0 + bar_w - _tw(hi) - 10:
+        placements.insert(1, (md, mid_x))
+
+    for text, tx in placements:
         cv2.putText(rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2, cv2.LINE_AA)
         cv2.putText(rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, (235, 235, 235), th, cv2.LINE_AA)
     return rgb
@@ -305,6 +370,9 @@ class PanelSpec:
     # content == "streaklines"; opt-in for an image or field panel so you can
     # get paths over a strain map in one cell.
     overlay_streaklines: bool = False
+    # Draw values outside the colour range in the out-of-range colours instead
+    # of at the end colour, where they read as legitimate extremes.
+    mark_out_of_range: bool = False
     range_spec: RangeSpec = _dcfield(default_factory=RangeSpec)
 
     @property
