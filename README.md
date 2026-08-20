@@ -6,8 +6,6 @@ of Ncorr (Blaber, Adair & Antoniou, 2015) in a free, self-contained Python
 package, and adds direct full-field **strain rate** — the capability that
 motivated the project.
 
-Built at IIT Kanpur. No MATLAB, no licence, no scripting required: the whole
-pipeline runs through a six-step GUI.
 
 ---
 
