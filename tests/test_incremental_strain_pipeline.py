@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "pydic"))
 
 from src.core.analysis import DICAnalysis, PairResult
 from src.core.rg_dic import DICParams
-from src.core.strain_accum import StrainAccumulator, _neighbour_estimate
+from src.core.strain_accum import StrainPathTracker
 from src.core.units import Calibration
 from src.ui.render import field_to_rgba
 
@@ -37,146 +37,91 @@ class StrainWindowValidationTests(unittest.TestCase):
         self.assertEqual(params.effective_strain_window(warn=False), 5)
 
 
-class StrainAccumulatorTests(unittest.TestCase):
-    @staticmethod
-    def _xy(shape=(9, 9)):
-        yy, xx = np.mgrid[:shape[0], :shape[1]]
-        return xx.astype(float), yy.astype(float)
+class StrainPathTrackerTests(unittest.TestCase):
+    shape = (17, 41)
+    radius = 2
+    spacing = 2
 
-    def test_accumulates_formulations_and_equivalent_magnitudes_separately(self):
-        shape = (7, 7)
-        acc = StrainAccumulator(shape, strain_window=2)
-        zeros = full(shape, 0.0)
-        x = np.broadcast_to(np.arange(shape[1], dtype=float), shape)
+    def _field(self, value):
+        arr = np.full(self.shape, np.nan, dtype=float)
+        ys = np.arange(self.radius, self.shape[0] - self.radius, self.spacing)
+        xs = np.arange(self.radius, self.shape[1] - self.radius, self.spacing)
+        arr[np.ix_(ys, xs)] = value
+        return arr
 
-        # Two identical 10% x-stretch increments.
+    def _tracker(self):
+        domain = np.ones(self.shape, dtype=bool)
+        origin = np.zeros(self.shape, dtype=bool)
+        origin[:, self.radius:self.radius + 1] = True
+        return StrainPathTracker(
+            self.shape, origin, domain, self.radius, self.spacing)
+
+    def test_continuous_origin_replenishes_material_as_it_moves(self):
+        tracker = self._tracker()
+        u, z = self._field(2.0), self._field(0.0)
+        valid = np.isfinite(u)
+
+        tracker.seed(valid)
+        first_count = tracker.count
+        tracker.advance(u, z, z, z, z, z)
+        tracker.seed(valid)
+        self.assertGreater(tracker.count, first_count)
+        tracker.advance(u, z, z, z, z, z)
+        out = tracker.snapshot()["Exx_inf"]
+
+        # One newly seeded column and one older downstream column coexist.
+        self.assertTrue(np.isfinite(out[:, 4]).any())
+        self.assertTrue(np.isfinite(out[:, 6]).any())
+
+    def test_image_edge_origin_snaps_to_first_measurable_subset_layer(self):
+        domain = np.ones(self.shape, dtype=bool)
+        origin = np.zeros(self.shape, dtype=bool)
+        origin[:, 0] = True
+        tracker = StrainPathTracker(
+            self.shape, origin, domain, self.radius, self.spacing)
+        valid = np.isfinite(self._field(0.0))
+        seeded = tracker.seed(valid)
+        self.assertGreater(seeded, 0)
+        self.assertTrue(np.all(tracker.x == self.radius))
+
+    def test_green_lagrange_uses_composed_deformation_gradient(self):
+        tracker = self._tracker()
+        u, z, stretch = self._field(2.0), self._field(0.0), self._field(0.1)
+        valid = np.isfinite(u)
         for _ in range(2):
-            acc.add_frame(0.1 * x, zeros, zeros, zeros, zeros, zeros)
+            tracker.seed(valid)
+            tracker.advance(u, z, stretch, z, z, z)
+        out = tracker.snapshot()
 
-        out = acc.results()
-        self.assertTrue(np.allclose(out["Exx_inf"], 0.2))
-        # Per increment Green-Lagrange Exx = ((1.1)^2 - 1)/2 = 0.105.
-        self.assertTrue(np.allclose(out["Exx_gl"], 0.21))
-        self.assertTrue(np.allclose(out["Gxy_inf"], 2.0 * out["Exy_inf"]))
-        self.assertTrue(np.allclose(out["Gxy_gl"], 2.0 * out["Exy_gl"]))
+        self.assertTrue(np.allclose(out["Exx_inf"][np.isfinite(out["Exx_inf"])].max(), 0.2))
+        expected_gl = 0.5 * ((1.1 ** 2) ** 2 - 1.0)
+        self.assertAlmostEqual(float(np.nanmax(out["Exx_gl"])), expected_gl)
 
-        one_inf_eq = np.sqrt((2.0 / 3.0) * (0.1**2 + 0.0 + (-0.1)**2))
-        one_gl_eq = np.sqrt((2.0 / 3.0) * (0.105**2 + 0.0 + (-0.105)**2))
-        self.assertTrue(np.allclose(out["Eeff_inf"], 2.0 * one_inf_eq))
-        self.assertTrue(np.allclose(out["Eeff_gl"], 2.0 * one_gl_eq))
+    def test_signed_reversal_can_cancel_but_equivalent_never_decreases(self):
+        tracker = self._tracker()
+        u, z = self._field(2.0), self._field(0.0)
+        valid = np.isfinite(u)
+        tracker.seed(valid)
+        tracker.advance(u, z, self._field(0.1), z, z, z)
+        first_equivalent = float(np.nanmax(tracker.snapshot()["Eeff_gl"]))
+        tracker.seed(valid)
+        tracker.advance(u, z, self._field(-0.1), z, z, z)
+        out = tracker.snapshot()
 
-    def test_dropout_is_hidden_then_can_recover(self):
-        shape = (7, 7)
-        acc = StrainAccumulator(shape, strain_window=2)
-        zeros = full(shape, 0.0)
-        x = np.broadcast_to(np.arange(shape[1], dtype=float), shape)
-        ramp = 0.01 * x
-        nan = full(shape, np.nan)
+        oldest = np.nanmax(out["Eeff_gl"])
+        self.assertGreater(oldest, first_equivalent)
+        self.assertLess(float(np.nanmin(np.abs(out["Exx_inf"]))), 1e-12)
 
-        acc.add_frame(ramp, zeros, zeros, zeros, zeros, zeros)
-        first = acc.results()["Exx_inf"].copy()
-        acc.add_frame(nan, nan, nan, nan, nan, nan)
-        self.assertFalse(acc.valid.any())
-        acc.add_frame(ramp, zeros, zeros, zeros, zeros, zeros)
+    def test_snapshot_ignores_live_points_inside_image_but_outside_subset_grid(self):
+        tracker = self._tracker()
+        tracker._append_zeros(
+            np.array([self.radius, self.shape[1] - 1.0]),
+            np.array([self.radius, self.radius]))
 
-        self.assertTrue(acc.valid.all())
-        self.assertTrue(np.allclose(acc.results()["Exx_inf"], first + 0.01))
+        out = tracker.snapshot()["Exx_inf"]
 
-    def test_simple_shear_keeps_tensor_and_engineering_names_distinct(self):
-        shape = (9, 9)
-        x, y = self._xy(shape)
-        z = np.zeros(shape)
-        gamma = 0.08
-        acc = StrainAccumulator(shape, strain_window=3)
-        acc.add_frame(gamma * y, z, z, z, z, z)
-        out = acc.results()
-        self.assertTrue(np.allclose(out["Exy_inf"], gamma / 2.0))
-        self.assertTrue(np.allclose(out["Gxy_inf"], gamma))
-        self.assertTrue(np.allclose(out["Exy_gl"], gamma / 2.0))
-        self.assertTrue(np.allclose(out["Eyy_gl"], gamma**2 / 2.0))
-
-    def test_rigid_rotation_is_zero_green_lagrange_without_special_correction(self):
-        shape = (11, 11)
-        x, y = self._xy(shape)
-        z = np.zeros(shape)
-        angle = np.deg2rad(7.0)
-        c, s = np.cos(angle), np.sin(angle)
-        u = (c - 1.0) * x - s * y
-        v = s * x + (c - 1.0) * y
-        acc = StrainAccumulator(shape, strain_window=4)
-        acc.add_frame(u, v, z, z, z, z)
-        out = acc.results()
-        self.assertLess(float(np.nanmax(np.abs(out["Exx_gl"]))), 1e-10)
-        self.assertLess(float(np.nanmax(np.abs(out["Eyy_gl"]))), 1e-10)
-        self.assertLess(float(np.nanmax(out["Eeff_gl"])), 1e-10)
-        # Infinitesimal strain is intentionally not rotation-corrected.
-        self.assertGreater(float(np.nanmax(out["Eeff_inf"])), 1e-4)
-
-    def test_compression_preserves_negative_components_and_positive_equivalent(self):
-        shape = (9, 9)
-        x, _ = self._xy(shape)
-        z = np.zeros(shape)
-        acc = StrainAccumulator(shape, strain_window=3)
-        acc.add_frame(-0.05 * x, z, z, z, z, z)
-        out = acc.results()
-        self.assertTrue(np.allclose(out["Exx_inf"], -0.05))
-        self.assertTrue(np.allclose(out["Exx_gl"], -0.04875))
-        self.assertTrue(np.all(out["Eeff_inf"] > 0.0))
-        self.assertTrue(np.all(out["Eeff_gl"] > 0.0))
-
-    def test_reversal_cancels_infinitesimal_component_but_not_equivalent_magnitude(self):
-        shape = (9, 9)
-        x, _ = self._xy(shape)
-        z = np.zeros(shape)
-        acc = StrainAccumulator(shape, strain_window=3)
-        acc.add_frame(0.05 * x, z, z, z, z, z)
-        acc.add_frame(-0.05 * x, z, z, z, z, z)
-        out = acc.results()
-        self.assertLess(float(np.nanmax(np.abs(out["Exx_inf"]))), 1e-10)
-        self.assertGreater(float(np.nanmin(out["Eeff_inf"])), 0.1)
-
-    def test_disconnected_components_do_not_share_a_strain_fit(self):
-        """A physical cut separates independently translating bodies."""
-        shape = (15, 15)
-        u = np.zeros(shape)
-        v = np.zeros(shape)
-        u[:, 8:] = 2.0
-        u[:, 7] = np.nan  # physical cut between independently moving bodies
-        v[:, 7] = np.nan
-        z = np.zeros(shape)
-        acc = StrainAccumulator(shape, strain_window=4)
-        acc.add_frame(u, v, z, z, z, z)
-        grad = acc.results()["du_dx"]
-        near_cut = grad[:, 4:11]
-        self.assertLess(float(np.nanmax(np.abs(near_cut))), 1e-8)
-
-    def test_infinity_is_invalid_for_displacement_and_every_strain_field(self):
-        shape = (9, 9)
-        x, _ = self._xy(shape)
-        u = 0.02 * x
-        v = np.zeros(shape)
-        u[4, 4] = np.inf
-        acc = StrainAccumulator(shape, strain_window=3)
-        acc.add_frame(u, v, v, v, v, v)
-        out = acc.results()
-
-        self.assertFalse(out["valid"][4, 4])
-        for name in ("du_dx", "du_dy", "dv_dx", "dv_dy",
-                     "Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"):
-            self.assertFalse(np.isinf(out[name]).any(), name)
-            self.assertTrue(np.isnan(out[name][4, 4]), name)
-
-    def test_recovery_smoothing_does_not_cross_an_invalid_cut(self):
-        shape = (7, 9)
-        eligible = np.ones(shape, dtype=bool)
-        eligible[:, 4] = False
-        field = np.where(np.indices(shape)[1] < 4, 1.0, 100.0)
-        live = eligible.copy()
-        live[3, 3] = False
-
-        estimate = _neighbour_estimate(
-            field, live, eligible=eligible, grid_spacing=1, radii=(3,))
-        self.assertAlmostEqual(float(estimate[3, 3]), 1.0)
+        self.assertEqual(np.count_nonzero(np.isfinite(out)), 1)
+        self.assertEqual(float(out[self.radius, self.radius]), 0.0)
 
     def test_rendering_masks_nonfinite_and_outside_roi_before_interpolation(self):
         arr = np.array([[0.0, np.nan, 10.0],
@@ -238,7 +183,68 @@ class InstantaneousKinematicsTests(unittest.TestCase):
         self.assertIs(result.v_inc, result.v)
         self.assertTrue(np.isnan(result.u[0, 0]))
 
-    def test_schema_three_hdf5_round_trip_preserves_explicit_fields(self):
+    def test_selected_start_frame_is_zero_then_continuous_strain_advects(self):
+        shape = (17, 41)
+        radius, spacing = 2, 2
+        ys = np.arange(radius, shape[0] - radius, spacing)
+        xs = np.arange(radius, shape[1] - radius, spacing)
+
+        def sparse(value):
+            arr = np.full(shape, np.nan, dtype=float)
+            arr[np.ix_(ys, xs)] = value
+            return arr
+
+        u, z = sparse(2.0), sparse(0.0)
+        # The last interval has a different strain. Its newly seeded path later
+        # revisits x=radius+2 and must not repaint the first path's value there.
+        stretch_history = [0.05, 0.05, 0.05, 0.20]
+        results = []
+        for stretch_value in stretch_history:
+            stretch = sparse(stretch_value)
+            results.append(PairResult(
+                image_path="frame", u=u.copy(), v=z.copy(),
+                Exx=z.copy(), Exy=z.copy(), Eyy=z.copy(), Eeff=z.copy(),
+                du_dx=stretch.copy(), du_dy=z.copy(),
+                dv_dx=z.copy(), dv_dy=z.copy(), corr=z.copy(),
+                valid=np.isfinite(u)))
+
+        analysis = object.__new__(DICAnalysis)
+        analysis.results = results
+        analysis._roi_mask = np.ones(shape, dtype=bool)
+        analysis._strain_origin_mask = np.zeros(shape, dtype=bool)
+        analysis._strain_origin_mask[:, radius] = True
+        analysis.strain_start_frame = 2
+        analysis.params = DICParams(
+            subset_radius=radius, subset_spacing=spacing, strain_window=2)
+        analysis._transport_accumulated_strain()
+
+        self.assertFalse(np.isfinite(results[0].Exx_gl).any())
+        self.assertAlmostEqual(float(np.nanmax(results[1].Exx_gl)), 0.0)
+        self.assertGreater(float(np.nanmax(results[2].Exx_gl)), 0.0)
+        coverage = [np.isfinite(result.Exx_gl) for result in results[1:]]
+        for previous, current in zip(coverage[:-1], coverage[1:]):
+            self.assertTrue(np.all(current[previous]))
+        self.assertGreater(int(coverage[-1].sum()), int(coverage[0].sum()))
+        # The inlet/source element remains coloured after its material path has
+        # moved downstream; the reached region grows instead of translating.
+        self.assertTrue(np.isfinite(results[-1].Exx_gl[:, radius]).any())
+        self.assertTrue(np.isfinite(results[-1].Exx_gl[:, radius + 4]).any())
+        # First arrival wins. Frame 3 first populates radius+2 with 0.05; the
+        # new path arriving there under the later 0.20 interval cannot change it.
+        first = float(results[2].Exx_gl[radius, radius + 2])
+        later = float(results[3].Exx_gl[radius, radius + 2])
+        self.assertGreater(first, 0.0)
+        self.assertEqual(later, first)
+        # More generally, every finite strain value from an earlier frame is
+        # immutable in every later swept snapshot.
+        for previous, current in zip(results[1:-1], results[2:]):
+            for name in ("Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"):
+                old = getattr(previous, name)
+                new = getattr(current, name)
+                fixed = np.isfinite(old)
+                self.assertTrue(np.array_equal(new[fixed], old[fixed]))
+
+    def test_current_hdf5_round_trip_preserves_explicit_fields_and_strain_origin(self):
         result = self._result(1.25)
         result.u_inc = result.u.copy()
         result.v_inc = result.v.copy()
@@ -257,6 +263,9 @@ class InstantaneousKinematicsTests(unittest.TestCase):
         self.analysis.results = [result]
         self.analysis.ref_path = None
         self.analysis.calibration = Calibration()
+        self.analysis._strain_origin_mask = np.array(
+            [[True, False], [True, False]], dtype=bool)
+        self.analysis.strain_start_frame = 1
 
         with tempfile.TemporaryDirectory() as td:
             path = str(Path(td) / "roundtrip.h5")
@@ -277,8 +286,15 @@ class InstantaneousKinematicsTests(unittest.TestCase):
         restored = loaded.results[0]
         self.assertTrue(np.allclose(restored.u, 1.25))
         self.assertTrue(np.allclose(restored.u_inc, restored.u))
-        self.assertTrue(np.allclose(restored.Gxy_inf, 2.0 * restored.Exy_inf))
+        self.assertIsNone(restored.Exy_inf)
+        self.assertIsNone(restored.Gxy_inf)
+        self.assertIsNone(restored.corr)
+        self.assertIsNone(restored.du_dx)
+        self.assertIsNone(restored.Gxy_gl)
         self.assertTrue(np.allclose(restored.Eeff_gl, 0.17))
+        self.assertEqual(loaded.strain_start_frame, 1)
+        self.assertTrue(np.array_equal(
+            loaded.strain_origin_mask, self.analysis._strain_origin_mask))
 
 
 class StatePersistenceTests(unittest.TestCase):
@@ -308,13 +324,16 @@ class StatePersistenceTests(unittest.TestCase):
             analysis.results = [object()]
             analysis.dynamic_include_mask = np.ones((8, 9), bool)
             analysis.dynamic_exclude_mask = np.ones((8, 9), bool)
+            analysis._strain_origin_mask = np.ones((8, 9), bool)
             analysis._roi_mask = np.ones((8, 9), bool)
             analysis.set_reference(image_path)
 
         self.assertEqual(analysis.results, [])
+        self.assertEqual(analysis.reference_image.dtype, np.float32)
         self.assertIsNone(analysis.roi_mask)
         self.assertIsNone(analysis.dynamic_include_mask)
         self.assertIsNone(analysis.dynamic_exclude_mask)
+        self.assertIsNone(analysis.strain_origin_mask)
 
 
 if __name__ == "__main__":

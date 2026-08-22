@@ -101,7 +101,20 @@ class Wizard(QMainWindow):
 
         root.addWidget(self._stack, 1)
 
-    def _go(self, idx: int, page_with_enter=None) -> None:
+    def _go(self, idx: int, page_with_enter=None,
+            run_leave_hook: bool = True) -> None:
+        outgoing = self._stack.currentWidget()
+        if outgoing is not None and outgoing is not page_with_enter:
+            on_leave = getattr(outgoing, "on_leave", None)
+            if run_leave_hook and callable(on_leave):
+                on_leave()
+            canvas = getattr(outgoing, "_canvas", None)
+            release = getattr(canvas, "release_display_buffers", None)
+            if callable(release):
+                # The analysis model retains authoritative state; hidden pages
+                # do not retain recreatable full-resolution arrays or pixmaps.
+                release()
+
         # Clear the incoming page's stale visuals BEFORE it becomes visible.
         #
         # on_enter() is deferred by a timer because some of its work needs final
@@ -140,16 +153,24 @@ class Wizard(QMainWindow):
         self.analysis = DICAnalysis()
         self.seed_xy = None
         self.use_gpu = bool(getattr(self.analysis, "prefer_gpu", True))
-        for page in (self._welcome, self._roi, self._dynroi, self._params,
-                     self._analysis, self._results):
-            for hook in ("reset_markers", "on_before_show", "reset_page"):
-                fn = getattr(page, hook, None)
-                if callable(fn):
-                    try:
-                        fn()
-                    except Exception:
-                        pass
-        self._go(0, self._welcome)
+        # These are concrete lifecycle operations, not optional plugin hooks.
+        # Calling them explicitly makes ownership visible to readers and static
+        # analysis, which previously misreported all three methods as dead.
+        cleanup_actions = (
+            self._results.reset_markers,
+            self._dynroi.reset_page,
+            self._analysis.on_before_show,
+            self._dynroi.on_before_show,
+            self._results.on_before_show,
+        )
+        for cleanup in cleanup_actions:
+            try:
+                cleanup()
+            except Exception:
+                pass
+        # The analysis object was deliberately replaced above. Do not let an
+        # outgoing page commit stale controls into the new session.
+        self._go(0, self._welcome, run_leave_hook=False)
 
     def go_welcome(self) -> None:
         self._go(0, self._welcome)

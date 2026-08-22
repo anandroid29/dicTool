@@ -22,6 +22,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from .compact_field import finite_values
+
 # Below this many points a percentile is not meaningfully different from the
 # extremes it is meant to guard against, so the true range is used instead.
 MIN_SAMPLES_FOR_PERCENTILE = 20
@@ -37,8 +39,7 @@ def robust_limits(values: np.ndarray,
     Returns None when there is nothing finite to describe, so callers can
     distinguish "no data" from "a valid range that happens to be narrow".
     """
-    arr = np.asarray(values)
-    finite = arr[np.isfinite(arr)]
+    finite = finite_values(values)
     if finite.size == 0:
         return None
 
@@ -64,8 +65,7 @@ def field_summary(values: np.ndarray) -> Optional[dict]:
     survive a handful of bad points, as opposed to `minimum`/`maximum`, which
     are the true extremes and may well be those bad points.
     """
-    arr = np.asarray(values)
-    finite = arr[np.isfinite(arr)]
+    finite = finite_values(values)
     if finite.size == 0:
         return None
 

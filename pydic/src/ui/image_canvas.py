@@ -16,7 +16,7 @@ from enum import Enum, auto
 from typing import Optional, List, Tuple
 
 import numpy as np
-from PyQt6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QPixmap,
     QPolygonF, QPainterPath, QImage, QTransform, QFont,
@@ -31,16 +31,44 @@ from PyQt6.QtWidgets import QWidget, QSizePolicy
 class ROITool(Enum):
     NONE      = auto()
     POLYGON   = auto()
+    POLYLINE  = auto()
     RECTANGLE = auto()
     CIRCLE    = auto()
     ERASE     = auto()
 
-POLYGON_SNAP_RADIUS_PX: int = 12   
-VERTEX_HIT_PX:          int = 14   
-EDGE_HIT_PX:            int = 10   
+
+POLYGON_SNAP_RADIUS_PX: int = 12
+VERTEX_HIT_PX:          int = 14
+EDGE_HIT_PX:            int = 10
 HANDLE_HIT_PX:          int = 10   
 HANDLE_HALF:            int = 5    
 MARKER_HIT_PX:          int = 13   
+
+
+def _mask_border(mask: np.ndarray) -> np.ndarray:
+    """Four-connected one-pixel border without importing SciPy in the UI."""
+    src = np.asarray(mask, dtype=bool)
+    interior = np.zeros_like(src)
+    if src.shape[0] > 2 and src.shape[1] > 2:
+        interior[1:-1, 1:-1] = (
+            src[1:-1, 1:-1] & src[:-2, 1:-1] & src[2:, 1:-1] &
+            src[1:-1, :-2] & src[1:-1, 2:]
+        )
+    return src & ~interior
+
+
+def _indexed_pixmap(indices: np.ndarray, colors: list[QColor]) -> QPixmap:
+    """Build a pixmap with a one-byte staging image instead of full RGBA."""
+    data = np.ascontiguousarray(indices, dtype=np.uint8)
+    height, width = data.shape
+    image = QImage(
+        data.data, width, height, data.strides[0],
+        QImage.Format.Format_Indexed8,
+    )
+    image.setColorTable([color.rgba() for color in colors])
+    # fromImage owns its converted pixels; ``data`` and ``image`` can be
+    # released immediately instead of being retained beside the pixmap.
+    return QPixmap.fromImage(image)
 
 # Distinguishable, colour-blind-friendly-ish palette for trajectory markers.
 MARKER_PALETTE = [
@@ -61,6 +89,9 @@ TOOL_TOOLTIPS: dict = {
         "Polygon ROI — Click to add vertices\n"
         "Hover near start to snap-close · click to finish\n"
         "Right-click removes last point · Enter/double-click to finish",
+    ROITool.POLYLINE:
+        "Line / curve — Click to add points or drag to sketch\n"
+        "Enter or double-click finishes · right-click removes the last point",
     ROITool.RECTANGLE:
         "Rectangle ROI — Click and drag to draw · Release commits",
     ROITool.CIRCLE:
@@ -106,6 +137,21 @@ def _apply_rect_handle_drag(r: QRectF, hi: int, dx_img: float, dy_img: float) ->
     if x0 > x1: x0, x1 = x1, x0
     if y0 > y1: y0, y1 = y1, y0
     return QRectF(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def _polyline_mask(points: List[QPointF], height: int, width: int) -> np.ndarray:
+    """Rasterise an open, one-pixel-wide polyline without closing or filling it."""
+    mask = np.zeros((height, width), dtype=bool)
+    if len(points) < 2:
+        return mask
+    for start, end in zip(points[:-1], points[1:]):
+        dx, dy = end.x() - start.x(), end.y() - start.y()
+        count = max(2, int(math.ceil(max(abs(dx), abs(dy)))) + 1)
+        xs = np.rint(np.linspace(start.x(), end.x(), count)).astype(np.intp)
+        ys = np.rint(np.linspace(start.y(), end.y(), count)).astype(np.intp)
+        inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        mask[ys[inside], xs[inside]] = True
+    return mask
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Edit State Containers
@@ -162,6 +208,7 @@ class _RectEdit:
 
 class ImageCanvas(QWidget):
     roi_changed  = pyqtSignal(object)
+    shape_drawing_changed = pyqtSignal(bool)
     seed_placed  = pyqtSignal(int, int)
     cursor_moved = pyqtSignal(int, int, float)
     markers_changed  = pyqtSignal(object)   # list[(x, y)] in image coords
@@ -198,6 +245,15 @@ class ImageCanvas(QWidget):
         self._roi_rgba: Optional[np.ndarray] = None
         self._roi_qimg: Optional[QImage] = None
         self._roi_px: Optional[QPixmap] = None
+        self._roi_fill_color = QColor(self._ROI_FILL_COLOR)
+        self._roi_border_color = QColor(self._ROI_BORDER_COLOR)
+        # Optional blue underlay and hard drawing constraint. The ROI page uses
+        # both while the amber strain-origin line is being edited.
+        self._context_mask: Optional[np.ndarray] = None
+        self._context_rgba: Optional[np.ndarray] = None
+        self._context_qimg: Optional[QImage] = None
+        self._context_px: Optional[QPixmap] = None
+        self._constraint_mask: Optional[np.ndarray] = None
 
         # VISUAL SEED & SUBSET PREVIEW
         self._seed_xy: Optional[Tuple[int, int]] = None
@@ -244,50 +300,118 @@ class ImageCanvas(QWidget):
         self._poly_edit: Optional[_PolyEdit] = None
         self._rect_edit: Optional[_RectEdit] = None
 
+        # Use fast pixmap scaling during continuous pointer interaction, then
+        # restore smooth rendering once the pointer settles. Scaling a large
+        # scientific frame smoothly for every mouse event is needlessly slow.
+        self._fast_paint = False
+        self._smooth_paint_timer = QTimer(self)
+        self._smooth_paint_timer.setSingleShot(True)
+        self._smooth_paint_timer.setInterval(90)
+        self._smooth_paint_timer.timeout.connect(self._restore_smooth_paint)
+
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     # ─────────────────────────────────────────────────────────────────────
     # Safely Handled Pixmap Generation
     # ─────────────────────────────────────────────────────────────────────
 
-    def set_image(self, arr: np.ndarray, keep_view: bool = False) -> None:
+    def _begin_fast_paint(self) -> None:
+        self._fast_paint = True
+        self._smooth_paint_timer.start()
+
+    def _restore_smooth_paint(self) -> None:
+        if self._fast_paint:
+            self._fast_paint = False
+            self.update()
+
+    def set_image(self, arr: np.ndarray, keep_view: bool = False,
+                  display_scale: float = 1.0) -> None:
         self._image_arr = arr
-        self._image_u8 = np.ascontiguousarray(np.clip(arr * 255, 0, 255).astype(np.uint8))
-        H, W = self._image_u8.shape
-        self._image_qimg = QImage(self._image_u8.data, W, H, W, QImage.Format.Format_Grayscale8)
-        self._image_px = QPixmap.fromImage(self._image_qimg)
+        image_u8 = np.ascontiguousarray(
+            np.clip(np.asarray(arr) * (255.0 * float(display_scale)),
+                    0, 255).astype(np.uint8))
+        H, W = image_u8.shape
+        image_qimg = QImage(
+            image_u8.data, W, H, image_u8.strides[0],
+            QImage.Format.Format_Grayscale8)
+        self._image_px = QPixmap.fromImage(image_qimg)
+        # QPixmap owns a converted copy. Retaining the NumPy/QImage staging
+        # pair doubled the display allocation for every hidden wizard page.
+        self._image_u8 = None
+        self._image_qimg = None
 
         if not keep_view:
             self.clear_result_overlay()
             self.clear_roi()
+            self.set_context_mask(None)
+            self.set_draw_constraint(None)
             self._fit_to_window()
+
+        self._rebuild_roi_pixmap()
 
         self.update()
     def set_result_overlay_rgba(self, rgba) -> None:
         if rgba is None:
             self.clear_result_overlay(); return
-            
-        self._result_rgba = np.ascontiguousarray(rgba)
-        H, W = self._result_rgba.shape[:2]
-        self._result_qimg = QImage(self._result_rgba.data, W, H, W * 4, QImage.Format.Format_RGBA8888)
-        self._result_px = QPixmap.fromImage(self._result_qimg)
+
+        result_rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
+        H, W = result_rgba.shape[:2]
+        result_qimg = QImage(
+            result_rgba.data, W, H, result_rgba.strides[0],
+            QImage.Format.Format_RGBA8888)
+        self._result_px = QPixmap.fromImage(result_qimg)
+        self._result_rgba = None
+        self._result_qimg = None
+        self.update()
+
+    def set_result_overlay_indexed(
+            self, indices: np.ndarray, colors: list[QColor]) -> None:
+        """Set a categorical overlay using one byte per staging pixel."""
+        if indices is None:
+            self.clear_result_overlay()
+            return
+        self._result_px = _indexed_pixmap(indices, colors)
+        self._result_rgba = None
+        self._result_qimg = None
         self.update()
 
     def _rebuild_roi_pixmap(self) -> None:
-        if self._roi_mask is None or self._image_arr is None:
-            self._roi_px = None; self._roi_rgba = None; self._roi_qimg = None; return
-        H, W = self._roi_mask.shape
-        rgba = np.zeros((H, W, 4), dtype=np.uint8)
-        rgba[self._roi_mask, 0] = 47; rgba[self._roi_mask, 1] = 129
-        rgba[self._roi_mask, 2] = 247; rgba[self._roi_mask, 3] = 50
-        from scipy.ndimage import binary_erosion
-        border = self._roi_mask & ~binary_erosion(self._roi_mask)
-        rgba[border, 0] = 47; rgba[border, 1] = 129
-        rgba[border, 2] = 247; rgba[border, 3] = 180
-        
-        self._roi_rgba = np.ascontiguousarray(rgba)
-        self._roi_qimg = QImage(self._roi_rgba.data, W, H, W * 4, QImage.Format.Format_RGBA8888)
-        self._roi_px = QPixmap.fromImage(self._roi_qimg)
+        if (self._image_arr is None or
+                (self._roi_mask is None and self._context_mask is None)):
+            self._roi_px = None
+            self._context_px = None
+            self._roi_rgba = None
+            self._roi_qimg = None
+            return
+
+        H, W = self._image_arr.shape
+        indices = np.zeros((H, W), dtype=np.uint8)
+        colors = [
+            QColor(0, 0, 0, 0),
+            QColor(47, 129, 247, 28),
+            QColor(47, 129, 247, 205),
+            QColor(self._roi_fill_color),
+            QColor(self._roi_border_color),
+        ]
+        if self._context_mask is not None:
+            indices[self._context_mask] = 1
+            indices[_mask_border(self._context_mask)] = 2
+        if self._roi_mask is not None:
+            indices[self._roi_mask] = 3
+            indices[_mask_border(self._roi_mask)] = 4
+
+        # Context and active ROI share one categorical pixmap. The previous two
+        # independent RGBA layers cost eight bytes per source pixel in Qt alone.
+        self._roi_px = _indexed_pixmap(indices, colors)
+        self._context_px = self._roi_px if self._context_mask is not None else None
+        self._roi_rgba = None
+        self._roi_qimg = None
+        self._context_rgba = None
+        self._context_qimg = None
+
+    def _rebuild_context_pixmap(self) -> None:
+        # Context is composited into the same indexed pixmap as the active ROI.
+        self._rebuild_roi_pixmap()
 
     def clear_result_overlay(self) -> None:
         self._result_arr = None; self._result_rgba = None; self._result_qimg = None; self._result_px = None
@@ -297,14 +421,36 @@ class ImageCanvas(QWidget):
         self._roi_mask = None;
         self._roi_rgba = None;
         self._roi_qimg = None;
-        self._roi_px = None
         self._poly_pts = [];
+        self.shape_drawing_changed.emit(False)
         self._rect_start = None
         self._committed_poly = None;
         self._committed_rect = None
         self._poly_edit = None;
         self._rect_edit = None
         self._seed_xy = None
+        self._rebuild_roi_pixmap()
+        self.update()
+
+    def release_display_buffers(self) -> None:
+        """Drop recreatable full-resolution canvas state on a hidden page."""
+        self._image_arr = None
+        self._image_u8 = None
+        self._image_qimg = None
+        self._image_px = None
+        self._result_arr = None
+        self._result_rgba = None
+        self._result_qimg = None
+        self._result_px = None
+        self._roi_rgba = None
+        self._roi_qimg = None
+        self._roi_px = None
+        self._context_rgba = None
+        self._context_qimg = None
+        self._context_px = None
+        self._roi_mask = None
+        self._context_mask = None
+        self._constraint_mask = None
         self.update()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -313,15 +459,72 @@ class ImageCanvas(QWidget):
     
     def set_roi_mask(self, mask: np.ndarray) -> None:
         self._roi_mask = mask.astype(bool)
+        # A programmatically supplied mask may belong to another editing
+        # channel (analysis ROI versus strain origin). Do not leave handles from
+        # the previously displayed geometry attached to it.
+        self._poly_pts = []
+        self.shape_drawing_changed.emit(False)
+        self._committed_poly = None
+        self._committed_rect = None
+        self._poly_edit = None
+        self._rect_edit = None
         self._rebuild_roi_pixmap(); self.update()
+
+    def set_context_mask(self, mask: Optional[np.ndarray]) -> None:
+        """Show a non-editable blue ROI beneath the active mask."""
+        if (mask is not None and self._image_arr is not None and
+                np.asarray(mask).shape != self._image_arr.shape):
+            raise ValueError("Context mask shape does not match the image.")
+        # Context and constraints are read-only views of model masks. Copying
+        # both added two more full-resolution arrays on the strain ROI screen.
+        self._context_mask = (None if mask is None else
+                              np.asarray(mask, dtype=bool))
+        self._rebuild_context_pixmap()
+        self.update()
+
+    def set_draw_constraint(self, mask: Optional[np.ndarray]) -> None:
+        """Clip every newly committed active-mask pixel to ``mask``."""
+        if (mask is not None and self._image_arr is not None and
+                np.asarray(mask).shape != self._image_arr.shape):
+            raise ValueError("Drawing constraint shape does not match the image.")
+        self._constraint_mask = (None if mask is None else
+                                 np.asarray(mask, dtype=bool))
+
+    def set_roi_role(self, origin: bool) -> None:
+        """Use blue for analysis ROI and amber for the strain-origin line."""
+        if origin:
+            self._roi_fill_color = QColor(245, 158, 11, 55)
+            self._roi_border_color = QColor(245, 158, 11, 220)
+        else:
+            self._roi_fill_color = QColor(self._ROI_FILL_COLOR)
+            self._roi_border_color = QColor(self._ROI_BORDER_COLOR)
+        self._rebuild_roi_pixmap()
+        self.update()
+
+    def set_roi_colors(self, fill: QColor, border: QColor) -> None:
+        self._roi_fill_color = QColor(fill)
+        self._roi_border_color = QColor(border)
+        self._rebuild_roi_pixmap()
+        self.update()
 
     def set_tool(self, tool: ROITool) -> None:
         self._commit_poly_edit(); self._commit_rect_edit()
         self._tool = tool; self._poly_pts = []; self._poly_snapped = False
+        self.shape_drawing_changed.emit(False)
         self._rect_start = None; self._circ_centre = None
         self._poly_edit = None; self._rect_edit = None
         cursor = Qt.CursorShape.ArrowCursor if tool == ROITool.NONE else Qt.CursorShape.CrossCursor
         self.setCursor(cursor); self.update()
+
+    def finish_active_shape(self) -> bool:
+        """Commit the currently drawn open/closed point shape, if complete."""
+        if self._tool == ROITool.POLYLINE and len(self._poly_pts) >= 2:
+            self._commit_polyline()
+            return True
+        if self._tool == ROITool.POLYGON and len(self._poly_pts) >= 3:
+            self._commit_polygon()
+            return True
+        return False
         
     def set_seed_xy(self, xy: Optional[Tuple[int, int]]) -> None:
         self._seed_xy = xy
@@ -420,9 +623,10 @@ class ImageCanvas(QWidget):
             return
 
         if event.button() == Qt.MouseButton.RightButton:
-            if self._tool == ROITool.POLYGON and self._poly_pts:
+            if self._tool in (ROITool.POLYGON, ROITool.POLYLINE) and self._poly_pts:
                 self._poly_pts.pop();
                 self._poly_snapped = False;
+                self.shape_drawing_changed.emit(bool(self._poly_pts))
                 self.update();
                 return
             img_pt = self._widget_to_image(pos)
@@ -448,6 +652,11 @@ class ImageCanvas(QWidget):
                     self._commit_polygon();
                     return
                 self._poly_pts.append(img_pt);
+                self.shape_drawing_changed.emit(True)
+                self.update()
+            elif self._tool == ROITool.POLYLINE:
+                self._poly_pts.append(img_pt)
+                self.shape_drawing_changed.emit(True)
                 self.update()
             elif self._tool == ROITool.RECTANGLE:
                 self._rect_start = img_pt;
@@ -462,8 +671,11 @@ class ImageCanvas(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             if self._tool == ROITool.POLYGON and len(self._poly_pts) >= 3:
                 self._commit_polygon()
+            elif self._tool == ROITool.POLYLINE and len(self._poly_pts) >= 2:
+                self._commit_polyline()
 
     def mouseMoveEvent(self, event) -> None:
+        self._begin_fast_paint()
         if (self._marker_mode and self._marker_drag and 0 <= self._marker_sel < len(self._markers)):
             ip = self._widget_to_image(event.position())
             if ip is not None and self._image_arr is not None:
@@ -527,7 +739,7 @@ class ImageCanvas(QWidget):
         else: self._poly_snapped = False
 
         if event.buttons() & Qt.MouseButton.LeftButton and img_pt is not None:
-            if self._tool == ROITool.POLYGON and self._poly_pts:
+            if self._tool in (ROITool.POLYGON, ROITool.POLYLINE) and self._poly_pts:
                 last_pt = self._poly_pts[-1]
                 if math.hypot(img_pt.x() - last_pt.x(), img_pt.y() - last_pt.y()) * self._zoom > 10:
                     self._poly_pts.append(img_pt)
@@ -565,6 +777,7 @@ class ImageCanvas(QWidget):
             elif self._tool == ROITool.ERASE: self._erase_pts = []
 
     def wheelEvent(self, event) -> None:
+        self._begin_fast_paint()
         delta  = event.angleDelta().y()
         factor = 1.15 if delta > 0 else 1.0 / 1.15
         pos    = event.position()
@@ -586,12 +799,15 @@ class ImageCanvas(QWidget):
         if key == Qt.Key.Key_Escape:
             if self._poly_edit: self._commit_poly_edit()
             elif self._rect_edit: self._commit_rect_edit()
-            elif self._tool == ROITool.POLYGON: self._poly_pts = []; self._poly_snapped = False
+            elif self._tool in (ROITool.POLYGON, ROITool.POLYLINE):
+                self._poly_pts = []; self._poly_snapped = False
+                self.shape_drawing_changed.emit(False)
             self.update()
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self._poly_edit: self._commit_poly_edit()
             elif self._rect_edit: self._commit_rect_edit()
             elif self._tool == ROITool.POLYGON and len(self._poly_pts) >= 3: self._commit_polygon()
+            elif self._tool == ROITool.POLYLINE and len(self._poly_pts) >= 2: self._commit_polyline()
         elif key == Qt.Key.Key_BracketLeft:
             self._erase_radius = max(4, self._erase_radius - 4); self.update()
         elif key == Qt.Key.Key_BracketRight:
@@ -604,7 +820,8 @@ class ImageCanvas(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform, not self._fast_paint)
         painter.fillRect(self.rect(), QColor("#0d1117"))
 
         if self._image_px is None:
@@ -616,6 +833,7 @@ class ImageCanvas(QWidget):
         painter.setTransform(self._get_transform())
         painter.drawPixmap(0, 0, self._image_px)
         if self._result_px is not None: painter.drawPixmap(0, 0, self._result_px)
+        # The context mask is already composited into _roi_px.
         if self._roi_px is not None: painter.drawPixmap(0, 0, self._roi_px)
         self._paint_roi_preview(painter)
 
@@ -726,9 +944,12 @@ class ImageCanvas(QWidget):
             if 0 <= x < W and 0 <= y < H:
                 val = self._image_arr[int(y), int(x)]
                 extra = ""
-                if self._tool == ROITool.POLYGON and self._poly_pts:
+                if self._tool in (ROITool.POLYGON, ROITool.POLYLINE) and self._poly_pts:
                     extra = f"  pts={len(self._poly_pts)}"
-                    extra += ("  ● click to close" if self._poly_snapped else "  RMB=undo · ↵/dbl=finish")
+                    if self._tool == ROITool.POLYGON and self._poly_snapped:
+                        extra += "  ● click to close"
+                    else:
+                        extra += "  RMB=undo · ↵/dbl=finish"
                 elif self._poly_edit is not None:
                     extra = "  EDIT POLY — drag vertex · click edge=insert · RMB=delete · ↵=done"
                 elif self._rect_edit is not None:
@@ -738,21 +959,22 @@ class ImageCanvas(QWidget):
                 painter.drawText(4, self.height() - 6, txt)
 
     def _paint_roi_preview(self, painter: QPainter) -> None:
-        if self._tool == ROITool.POLYGON and self._poly_pts:
-            pen = QPen(self._ROI_BORDER_COLOR, 1.5 / self._zoom)
+        if self._tool in (ROITool.POLYGON, ROITool.POLYLINE) and self._poly_pts:
+            pen = QPen(self._roi_border_color, 1.5 / self._zoom)
             painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
             for i in range(len(self._poly_pts) - 1):
                 painter.drawLine(self._poly_pts[i], self._poly_pts[i + 1])
             if self._mouse_img:
-                tgt  = self._poly_pts[0] if self._poly_snapped else self._mouse_img
-                c    = self._SNAP_RING_COLOR if self._poly_snapped else self._ROI_BORDER_COLOR
+                closed = self._tool == ROITool.POLYGON and self._poly_snapped
+                tgt  = self._poly_pts[0] if closed else self._mouse_img
+                c    = self._SNAP_RING_COLOR if closed else self._roi_border_color
                 painter.setPen(QPen(c, 1.5 / self._zoom, Qt.PenStyle.DashLine))
                 painter.drawLine(self._poly_pts[-1], tgt)
             r = 3.5 / self._zoom
             painter.setPen(QPen(self._POLY_VERT_COLOR, 1.5 / self._zoom))
             painter.setBrush(QBrush(self._POLY_VERT_COLOR))
             for pt in self._poly_pts: painter.drawEllipse(pt, r, r)
-            if self._poly_snapped:
+            if self._tool == ROITool.POLYGON and self._poly_snapped:
                 snap_r = POLYGON_SNAP_RADIUS_PX / self._zoom
                 painter.setPen(QPen(self._SNAP_RING_COLOR, 2.0 / self._zoom))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -761,13 +983,13 @@ class ImageCanvas(QWidget):
         elif self._tool == ROITool.RECTANGLE and self._rect_start and self._rect_cur:
             x1, y1 = self._rect_start.x(), self._rect_start.y()
             x2, y2 = self._rect_cur.x(),   self._rect_cur.y()
-            painter.setPen(QPen(self._ROI_BORDER_COLOR, 1.5 / self._zoom))
-            painter.setBrush(QBrush(self._ROI_FILL_COLOR))
+            painter.setPen(QPen(self._roi_border_color, 1.5 / self._zoom))
+            painter.setBrush(QBrush(self._roi_fill_color))
             painter.drawRect(QRectF(min(x1,x2), min(y1,y2), abs(x2-x1), abs(y2-y1)))
 
         elif self._tool == ROITool.CIRCLE and self._circ_centre and self._circ_radius > 0:
-            painter.setPen(QPen(self._ROI_BORDER_COLOR, 1.5 / self._zoom))
-            painter.setBrush(QBrush(self._ROI_FILL_COLOR))
+            painter.setPen(QPen(self._roi_border_color, 1.5 / self._zoom))
+            painter.setBrush(QBrush(self._roi_fill_color))
             painter.drawEllipse(self._circ_centre, self._circ_radius, self._circ_radius)
 
         elif self._tool == ROITool.ERASE and self._mouse_img:
@@ -862,6 +1084,19 @@ class ImageCanvas(QWidget):
         self._committed_rect = None
         self._merge_mask(_polygon_mask(self._poly_pts, H, W))
         self._poly_pts = []; self._poly_snapped = False; self.update()
+        self.shape_drawing_changed.emit(False)
+
+    def _commit_polyline(self) -> None:
+        if self._image_arr is None or len(self._poly_pts) < 2:
+            return
+        H, W = self._image_arr.shape
+        self._committed_poly = None
+        self._committed_rect = None
+        self._merge_mask(_polyline_mask(self._poly_pts, H, W))
+        self._poly_pts = []
+        self._poly_snapped = False
+        self.shape_drawing_changed.emit(False)
+        self.update()
 
     def _commit_rectangle(self) -> None:
         if self._image_arr is None or not self._rect_start or not self._rect_cur: return
@@ -893,6 +1128,10 @@ class ImageCanvas(QWidget):
         self._rebuild_roi_pixmap(); self.roi_changed.emit(self._roi_mask.copy())
 
     def _merge_mask(self, new_mask: np.ndarray) -> None:
+        if self._constraint_mask is not None:
+            if self._constraint_mask.shape != new_mask.shape:
+                raise ValueError("Drawing constraint shape does not match the image.")
+            new_mask = np.asarray(new_mask, dtype=bool) & self._constraint_mask
         self._roi_mask = new_mask if self._roi_mask is None else (self._roi_mask | new_mask)
         self._rebuild_roi_pixmap(); self.roi_changed.emit(self._roi_mask.copy())
 
@@ -931,9 +1170,6 @@ class ImageCanvas(QWidget):
         self.update()
 
     @property
-    def marker_mode(self) -> bool:
-        return self._marker_mode
-
     def markers(self) -> list[tuple[float, float]]:
         return [(p.x(), p.y()) for p in self._markers]
 

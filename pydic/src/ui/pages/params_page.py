@@ -2,6 +2,7 @@
 params_page.py — Step 4: DIC parameters with live preview.
 """
 from __future__ import annotations
+import importlib.util
 from typing import TYPE_CHECKING
 import numpy as np
 from PyQt6.QtCore import Qt
@@ -18,13 +19,10 @@ if TYPE_CHECKING:
 
 from src.ui.image_canvas import ImageCanvas
 
-try:
-    import cupy as cp
-    # Optional: Quick test to ensure CUDA runtime is actually responding
-    cp.cuda.Device(0).compute_capability
-    _HAS_GPU = True
-except Exception:
-    _HAS_GPU = False
+# Do not import CuPy or touch a CUDA device while constructing the UI. On a
+# working installation that alone creates a large context. The analysis worker
+# performs authoritative driver/device validation when GPU execution is chosen.
+_HAS_GPU = importlib.util.find_spec("cupy") is not None
 
 _C_SURFACE = "#0e1c2e"
 _C_CARD    = "#132035"
@@ -338,7 +336,8 @@ class ParamsPage(QWidget):
                 f"QPushButton:checked {{ background: {_C_ACCENT}; color: white; border: 1px solid {_C_ACCENT}; border-radius: 6px; padding: 0 12px; }}"
                 f"QPushButton:!checked {{ background: transparent; color: {_C_TEXT2}; border: 1px solid {_C_BORDER}; border-radius: 6px; padding: 0 12px; }}"
             )
-            self._gpu_chk.setToolTip("GPU detected! Batched IC-GN will be used.")
+            self._gpu_chk.setToolTip(
+                "CuPy is installed. The NVIDIA device is checked when analysis starts.")
         else:
             self._gpu_chk.setChecked(False)
             self._gpu_chk.setEnabled(False)
@@ -364,7 +363,7 @@ class ParamsPage(QWidget):
 
     def on_enter(self) -> None:
         self._sync_controls_from_model()
-        img = self._wizard.analysis.reference_image
+        img = self._wizard.analysis.strain_reference_image()
         if img is not None:
             # Only set the image if it's new to preserve pan/zoom
             if self._canvas._image_arr is not img:
@@ -387,6 +386,9 @@ class ParamsPage(QWidget):
 
         # Trigger parameter refresh to draw the subset radius
         self._on_param_changed()
+
+    def on_leave(self) -> None:
+        self._preview_roi_mask = None
 
     def _sync_controls_from_model(self) -> None:
         """Restore cached/model values without firing partial updates.
@@ -462,7 +464,7 @@ class ParamsPage(QWidget):
             self._canvas.set_subset_radius(p.subset_radius)
 
         # Count estimated subsets
-        img = self._wizard.analysis.reference_image
+        img = self._wizard.analysis.strain_reference_image()
         mask = self._preview_roi_mask
         if img is not None and mask is not None:
             H, W = img.shape
@@ -536,7 +538,7 @@ class ParamsPage(QWidget):
 
     def _probe_shape_order(self) -> None:
         from PyQt6.QtWidgets import QMessageBox
-        img = self._wizard.analysis.reference_image
+        img = self._wizard.analysis.strain_reference_image()
         if img is None:
             QMessageBox.information(self, "No reference image",
                                     "Load a reference image first.")
@@ -607,6 +609,15 @@ class ParamsPage(QWidget):
 
     def _on_run_clicked(self) -> None:
         """Save the GPU preference to the wizard, then proceed to the analysis screen."""
+        origin = self._wizard.analysis.strain_origin_mask
+        if origin is None or not np.any(origin):
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Strain origin required",
+                "Draw the strain-origin line/curve inside the ROI. New "
+                "material crossing that region starts at zero accumulated strain.")
+            self._wizard.go_roi()
+            return
         # Commit every visible control even if it was edited by keyboard and has
         # not yet emitted editingFinished.
         self._on_param_changed()

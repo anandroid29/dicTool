@@ -14,6 +14,8 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from src.core.compact_field import finite_values
+
 from src.core.units import Calibration
 from . import render as R
 
@@ -173,7 +175,7 @@ class ViewRenderer:
                 rgb = R.alpha_over(rgb, rgba)
                 # An exported figure leaves the tool and gets read on its own,
                 # so a trimmed scale has to declare itself on the colourbar.
-                finite = arr[np.isfinite(arr)]
+                finite = finite_values(arr)
                 clip_low = bool(np.any(finite < vmin))
                 clip_high = bool(np.any(finite > vmax))
 

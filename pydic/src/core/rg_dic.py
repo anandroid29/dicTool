@@ -7,9 +7,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, Optional
 import numpy as np
-from .bspline import BSplineInterpolator, circular_subset, image_gradient
-from .ncc import ncc_initial_guess
-from .icgn import precompute_subset, run_icgn, infer_intensity_scale
+
+
+_SOLVER_COMPONENTS = None
+
+
+def _solver_components():
+    """Import the heavy SciPy-backed solver stack on first analysis only."""
+    global _SOLVER_COMPONENTS
+    if _SOLVER_COMPONENTS is None:
+        from .bspline import BSplineInterpolator, circular_subset, image_gradient
+        from .ncc import ncc_initial_guess
+        from .icgn import precompute_subset, run_icgn, infer_intensity_scale
+        _SOLVER_COMPONENTS = (
+            BSplineInterpolator, circular_subset, image_gradient,
+            ncc_initial_guess, precompute_subset, run_icgn,
+            infer_intensity_scale,
+        )
+    return _SOLVER_COMPONENTS
 
 
 @dataclass
@@ -106,6 +121,8 @@ def run_rg_dic(
     guess_v: float = 0.0,
     use_gpu = False
 ) -> DICResult:
+    (BSplineInterpolator, circular_subset, image_gradient, _, _, _,
+     infer_intensity_scale) = _solver_components()
     if cancel_flag is None:
         cancel_flag = [False]
 
@@ -203,6 +220,8 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
                 params, seed_xy, shape, cancel_flag, progress_cb,
                 shared_state, lock, guess_u, guess_v, roi_mask=None,
                 intensity_scale=255.0):
+    (_, _, _, ncc_initial_guess, precompute_subset, run_icgn,
+     _) = _solver_components()
 
     step = params.subset_spacing
     cutoff_disp = float(step + 1)

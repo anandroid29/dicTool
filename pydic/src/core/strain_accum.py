@@ -1,306 +1,331 @@
-"""Backend-neutral accumulation for immediate-frame DIC.
+"""Material-path strain transport for immediate-frame DIC.
 
-Correlation always measures the current frame against the immediately previous
-frame.  Displacement remains an interval quantity; only strain is accumulated.
-The accumulator also keeps a private position history used solely to find the
-same material in the next frame.  That history must never leak into the public
-``u``/``v`` result fields.
+Correlation is performed once for each adjacent image pair on a fresh spatial
+grid. This module consumes those pairwise fields; it never runs correlation of
+its own. Material states are continuously injected through an operator-drawn
+origin region, advected by the measured pair displacement, and accumulated
+along their paths.
+
+Signed infinitesimal components integrate the symmetric displacement gradient.
+Finite Green--Lagrange components come from composition of the incremental
+deformation gradients. Equivalent accumulated strain is the non-negative path
+integral of equivalent strain rate and therefore never decreases.
 """
 from __future__ import annotations
+
+from typing import Optional
+
 import numpy as np
-from scipy.ndimage import uniform_filter
-from .strain import (compute_velocity_strains, connected_support_labels,
-                     von_mises_equivalent)
 
-# Minimum number of currently-live neighbours required before a re-appearing
-# point's accumulated total may be re-baselined from them.
-_MIN_NEIGHBOUR_SUPPORT = 3.0
-# Box half-widths tried, smallest first, when looking for that support.
-_REPAIR_RADII = (3, 6, 12, 24)
+from .strain import von_mises_equivalent
 
 
-def _neighbour_estimate(field: np.ndarray, live: np.ndarray,
-                        eligible: np.ndarray,
-                        grid_spacing: int = 1,
-                        radii=_REPAIR_RADII) -> np.ndarray:
-    """Estimate `field` where it is not live, from the mean of nearby live values.
-
-    Returns NaN wherever no radius in `radii` gathered enough support, so the
-    caller can tell "repaired" from "genuinely unrecoverable".
-    """
-    est = np.full(field.shape, np.nan, dtype=np.float64)
-    eligible = np.asarray(eligible, dtype=bool)
-    live = np.asarray(live, dtype=bool) & eligible & np.isfinite(field)
-    need = eligible & ~live
-    if not need.any():
-        return est
-    labels, n_components = connected_support_labels(eligible, grid_spacing)
-    for component_id in range(1, n_components + 1):
-        component = eligible & (labels == component_id)
-        source = live & component
-        component_need = need & component
-        if not source.any() or not component_need.any():
-            continue
-        fz = np.where(source, field, 0.0).astype(np.float64)
-        cz = source.astype(np.float64)
-        for r in radii:
-            k = 2 * int(r) + 1
-            area = float(k * k)
-            s = uniform_filter(fz, size=k, mode="constant", cval=0.0) * area
-            n = uniform_filter(cz, size=k, mode="constant", cval=0.0) * area
-            ok = component_need & (n >= _MIN_NEIGHBOUR_SUPPORT)
-            if ok.any():
-                values = s[ok] / n[ok]
-                finite = np.isfinite(values)
-                indices = np.where(ok)
-                est[indices[0][finite], indices[1][finite]] = values[finite]
-                component_need[indices[0][finite], indices[1][finite]] = False
-            if not component_need.any():
-                break
-    return est
+_STATE_NAMES = (
+    "Exx_inf", "Eyy_inf", "Exy_inf", "Eeff_inf",
+    "Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl",
+)
 
 
-def _principal_2x2(Axx, Ayy, Axy):
-    """Eigenvalues of a symmetric 2x2 field, larger first."""
-    tr = Axx + Ayy
-    disc = np.sqrt(np.maximum((Axx - Ayy) ** 2 + 4.0 * Axy ** 2, 0.0))
-    return 0.5 * (tr + disc), 0.5 * (tr - disc)
+class StrainPathTracker:
+    """Continuously seed and transport accumulated strain through an ROI.
 
-
-def _equivalent_from_principal(e1, e2):
-    """von Mises equivalent strain from the in-plane principal values.
-
-    Shear vanishes in the principal frame, so this is the shared definition
-    evaluated there. Routing through it keeps accumulated strain and strain
-    rate on one formula.
-    """
-    return von_mises_equivalent(e1, e2, 0.0)
-
-
-def incremental_strains(du_dx, du_dy, dv_dx, dv_dy):
-    """Return infinitesimal and Green-Lagrange strain for one frame interval.
-
-    ``Exy`` is tensor shear.  Engineering shear is always exactly ``2*Exy`` and
-    is returned under a separate, explicit name.  Equivalent strain is a
-    non-negative magnitude; the accumulator sums that magnitude frame by frame.
-    """
-    with np.errstate(invalid="ignore", over="ignore"):
-        # Infinitesimal strain: symmetric part of the displacement gradient.
-        inf_xx = du_dx
-        inf_yy = dv_dy
-        inf_xy = 0.5 * (du_dy + dv_dx)
-
-        # Incremental Green-Lagrange strain: E = 0.5 * (F.T F - I).
-        F11 = 1.0 + du_dx
-        F12 = du_dy
-        F21 = dv_dx
-        F22 = 1.0 + dv_dy
-        gl_xx = 0.5 * (F11 * F11 + F21 * F21 - 1.0)
-        gl_yy = 0.5 * (F12 * F12 + F22 * F22 - 1.0)
-        gl_xy = 0.5 * (F11 * F12 + F21 * F22)
-
-        inf_1, inf_2 = _principal_2x2(inf_xx, inf_yy, inf_xy)
-        gl_1, gl_2 = _principal_2x2(gl_xx, gl_yy, gl_xy)
-        inf_eff = _equivalent_from_principal(inf_1, inf_2)
-        gl_eff = _equivalent_from_principal(gl_1, gl_2)
-
-    result = dict(
-        Exx_inf=inf_xx, Eyy_inf=inf_yy, Exy_inf=inf_xy,
-        Gxy_inf=2.0 * inf_xy, Eeff_inf=inf_eff,
-        Exx_gl=gl_xx, Eyy_gl=gl_yy, Exy_gl=gl_xy,
-        Gxy_gl=2.0 * gl_xy, Eeff_gl=gl_eff,
-    )
-    for values in result.values():
-        values[~np.isfinite(values)] = np.nan
-    return result
-
-
-class StrainAccumulator:
-    """Accumulate both requested strain measures, but not displacement.
-
-    The private ``u``/``v`` arrays are position hints for temporal tracking.
-    Public result displacement is supplied by the current frame's solver.  A
-    dropout is recoverable: retained history is hidden while invalid and is
-    resumed if the point is measured again.
+    Fields supplied to :meth:`advance` are sparse full-image arrays populated
+    on the regular DIC subset grid. Particle state is kept at floating-point
+    material positions, while :meth:`snapshot` remeshes it onto that same grid
+    for rendering and HDF5 export.
     """
 
-    def __init__(self, shape, strain_window: int, grid_spacing: int = 1):
-        self.shape = shape
-        self.strain_window = int(strain_window)
-        self.grid_spacing = max(1, int(grid_spacing))
-        self.u = np.full(shape, np.nan)
-        self.v = np.full(shape, np.nan)
-        self.Exx_inf = np.full(shape, np.nan)
-        self.Eyy_inf = np.full(shape, np.nan)
-        self.Exy_inf = np.full(shape, np.nan)
-        self.Eeff_inf = np.full(shape, np.nan)
-        self.Exx_gl = np.full(shape, np.nan)
-        self.Eyy_gl = np.full(shape, np.nan)
-        self.Exy_gl = np.full(shape, np.nan)
-        self.Eeff_gl = np.full(shape, np.nan)
-        self.n_frames = np.zeros(shape, np.int32)
-        self.started = np.zeros(shape, bool)    # has ever been successfully tracked
-        # Carries a usable running total RIGHT NOW. Recomputed every frame, so a
-        # point can leave this set and come back into it.
-        self.tracked = np.zeros(shape, bool)
-        self.strain_tracked = np.zeros(shape, bool)
-        # Sticky, informational: this point's total no longer traces back to
-        # frame 0 unbroken (it was re-baselined or started late).
-        self.rebased = np.zeros(shape, bool)
-        self._first = True
+    def __init__(
+        self,
+        shape: tuple[int, int],
+        origin_mask: np.ndarray,
+        domain_mask: np.ndarray,
+        subset_radius: int,
+        grid_spacing: int,
+    ) -> None:
+        self.shape = tuple(int(v) for v in shape)
+        self.radius = max(0, int(subset_radius))
+        self.spacing = max(1, int(grid_spacing))
+        self.domain_mask = np.asarray(domain_mask, dtype=bool)
+        self.origin_mask = np.asarray(origin_mask, dtype=bool) & self.domain_mask
+        if self.domain_mask.shape != self.shape:
+            raise ValueError("Strain domain mask shape does not match the images.")
+        if self.origin_mask.shape != self.shape:
+            raise ValueError("Strain-origin mask shape does not match the images.")
 
-    # Kept as a read-only alias: "not trustworthy for this frame".
-    @property
-    def broken(self):
-        return self.started & ~self.tracked
-
-    def add_frame(self, inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy):
-        ok = np.isfinite(inc_u) & np.isfinite(inc_v)
-
-        # Derive gradients from the same immediate displacement fields on both
-        # backends. Solver-affine terms are deliberately not used for strain:
-        # they differ between CPU/GPU implementations and bypass strain_window.
-        grad = compute_velocity_strains(
-            inc_u, inc_v, ok, self.strain_window, self.grid_spacing)
-        inc_du_dx = grad["dVx_dx"]
-        inc_du_dy = grad["dVx_dy"]
-        inc_dv_dx = grad["dVy_dx"]
-        inc_dv_dy = grad["dVy_dy"]
-        self.last_gradients = {
-            "du_dx": inc_du_dx, "du_dy": inc_du_dy,
-            "dv_dx": inc_dv_dx, "dv_dy": inc_dv_dy,
-        }
-        strain_ok = (ok & np.isfinite(inc_du_dx) & np.isfinite(inc_du_dy) &
-                     np.isfinite(inc_dv_dx) & np.isfinite(inc_dv_dy))
-
-        increments = incremental_strains(
-            inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy)
-
-        if self._first:
-            self.u[ok] = inc_u[ok]
-            self.v[ok] = inc_v[ok]
-            for name in ("Exx_inf", "Eyy_inf", "Exy_inf", "Eeff_inf",
-                         "Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"):
-                arr = getattr(self, name)
-                arr[strain_ok] = 0.0
-            self.started |= ok
-            self._first = False
+        h, w = self.shape
+        self.grid_x = np.arange(self.radius, w - self.radius, self.spacing,
+                                dtype=np.int32)
+        self.grid_y = np.arange(self.radius, h - self.radius, self.spacing,
+                                dtype=np.int32)
+        if self.grid_x.size and self.grid_y.size:
+            gx, gy = np.meshgrid(self.grid_x, self.grid_y)
+            candidates = self.domain_mask[gy, gx]
+            source = np.zeros(gx.shape, dtype=bool)
+            # A wall can be thinner than the correlation spacing, or lie at an
+            # image/ROI boundary where no complete subset centre can physically
+            # sit. Snap each disconnected origin component to its nearest
+            # measurable lattice layer instead of silently producing no strain.
+            from scipy.ndimage import distance_transform_edt, label
+            labels, count = label(self.origin_mask)
+            for component_id in range(1, count + 1):
+                component = labels == component_id
+                distances = distance_transform_edt(~component)[gy, gx]
+                available = distances[candidates]
+                if available.size:
+                    nearest = float(np.min(available))
+                    source |= candidates & (
+                        distances <= nearest + 0.51 * self.spacing)
+            self._source_x = gx[source].astype(np.float64)
+            self._source_y = gy[source].astype(np.float64)
+            self._source_flat = (
+                np.searchsorted(self.grid_y, gy[source]) * self.grid_x.size
+                + np.searchsorted(self.grid_x, gx[source]))
         else:
-            # Totals that were trustworthy going into this frame.
-            live = self.tracked & np.isfinite(self.u) & np.isfinite(self.v)
+            self._source_x = np.empty(0, dtype=np.float64)
+            self._source_y = np.empty(0, dtype=np.float64)
+            self._source_flat = np.empty(0, dtype=np.int64)
 
-            cont = ok & live
-
-            # Measured now but without an intact total: either returning from a
-            # gap or seen for the first time. Both are handled the same way --
-            # take the neighbours' accumulated total as this point's total
-            # through the PREVIOUS frame, then add this frame's own increment.
-            #
-            # The estimate MUST be read before `cont` is advanced below. Reading
-            # it afterwards samples neighbours that already include this frame's
-            # motion, and adding inc on top double-counts one increment.
-            need = ok & ~cont
-            est_u = est_v = None
-            if need.any():
-                est_u = _neighbour_estimate(
-                    self.u, live, eligible=ok, grid_spacing=self.grid_spacing)
-                est_v = _neighbour_estimate(
-                    self.v, live, eligible=ok, grid_spacing=self.grid_spacing)
-
-            # Intact history: accumulate normally.
-            self.u[cont] += inc_u[cont]
-            self.v[cont] += inc_v[cont]
-
-            if need.any():
-                rep = need & np.isfinite(est_u) & np.isfinite(est_v)
-                self.u[rep] = est_u[rep] + inc_u[rep]
-                self.v[rep] = est_v[rep] + inc_v[rep]
-
-                # No live neighbours anywhere near: nothing to borrow. Start this
-                # point's own history here, which is honest but means its
-                # displacement is relative to now, not to frame 0.
-                orphan = need & ~rep
-                self.u[orphan] = inc_u[orphan]
-                self.v[orphan] = inc_v[orphan]
-
-                self.started |= need
-                self.rebased |= need
-
-                # Newly appearing points have no strain history. Returning
-                # points retain their own pre-dropout history. This avoids both
-                # permanent death and fabrication of a local strain peak from a
-                # neighbour's value.
-                new = need & ~np.isfinite(self.Exx_inf)
-                for name in ("Exx_inf", "Eyy_inf", "Exy_inf", "Eeff_inf",
-                             "Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"):
-                    getattr(self, name)[new] = 0.0
-
-        # A point is trustworthy for THIS frame exactly when it was measured for
-        # this frame. Freezing a stale total and still reporting it as valid was
-        # the other half of the problem: downstream velocity differencing then
-        # saw a perfectly ordinary number that had quietly stopped updating.
-        self.tracked = ok & self.started & np.isfinite(self.u) & np.isfinite(self.v)
-
-        # Accumulate tensor components and non-negative equivalent magnitudes
-        # independently for each requested formulation.
-        self.strain_tracked = self.tracked & strain_ok
-        good = self.strain_tracked
-        first_strain = good & ~np.isfinite(self.Exx_inf)
-        if first_strain.any():
-            for name in ("Exx_inf", "Eyy_inf", "Exy_inf", "Eeff_inf",
-                         "Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"):
-                getattr(self, name)[first_strain] = 0.0
-        for name in ("Exx_inf", "Eyy_inf", "Exy_inf", "Eeff_inf",
-                     "Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"):
-            total = getattr(self, name)
-            inc = increments[name]
-            acc = good & np.isfinite(total) & np.isfinite(inc)
-            total[acc] += inc[acc]
-        self.n_frames[good] += 1
+        self.x = np.empty(0, dtype=np.float64)
+        self.y = np.empty(0, dtype=np.float64)
+        self.Exx_inf = np.empty(0, dtype=np.float64)
+        self.Eyy_inf = np.empty(0, dtype=np.float64)
+        self.Exy_inf = np.empty(0, dtype=np.float64)
+        self.equivalent = np.empty(0, dtype=np.float64)
+        self.F11 = np.empty(0, dtype=np.float64)
+        self.F12 = np.empty(0, dtype=np.float64)
+        self.F21 = np.empty(0, dtype=np.float64)
+        self.F22 = np.empty(0, dtype=np.float64)
+        self.age = np.empty(0, dtype=np.int32)
 
     @property
-    def valid(self):
-        """Points carrying a live, trustworthy accumulated total this frame."""
-        return self.tracked & np.isfinite(self.u) & np.isfinite(self.v)
+    def count(self) -> int:
+        return int(self.x.size)
 
-    def position_hint(self):
-        """Best-known (x, y) offsets for EVERY started point, dropouts included.
+    def _append_zeros(self, x: np.ndarray, y: np.ndarray) -> None:
+        n = int(x.size)
+        if not n:
+            return
+        self.x = np.concatenate((self.x, x.astype(np.float64, copy=False)))
+        self.y = np.concatenate((self.y, y.astype(np.float64, copy=False)))
+        zeros = np.zeros(n, dtype=np.float64)
+        ones = np.ones(n, dtype=np.float64)
+        for name in ("Exx_inf", "Eyy_inf", "Exy_inf", "equivalent",
+                     "F12", "F21"):
+            setattr(self, name, np.concatenate((getattr(self, name), zeros)))
+        self.F11 = np.concatenate((self.F11, ones))
+        self.F22 = np.concatenate((self.F22, ones))
+        self.age = np.concatenate((self.age, np.zeros(n, dtype=np.int32)))
 
-        Deliberately not masked by `valid`: a point that missed this frame is
-        still far more likely to be near its last known position than at its
-        frame-0 position, and handing the solver NaN here makes a temporary
-        dropout permanent.
-        """
-        return self.u, self.v
+    def _particle_grid_cells(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.count or not self.grid_x.size or not self.grid_y.size:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty, np.empty(0, dtype=bool)
+        ix = np.rint((self.x - self.radius) / self.spacing).astype(np.int64)
+        iy = np.rint((self.y - self.radius) / self.spacing).astype(np.int64)
+        inside = ((ix >= 0) & (ix < self.grid_x.size) &
+                  (iy >= 0) & (iy < self.grid_y.size))
+        return ix, iy, inside
 
-    def results(self):
-        v = self.valid
-        strain_v = v & self.strain_tracked
-        out = {
-            "u_total": self.u,
-            "v_total": self.v,
-            "Exx_inf": np.where(strain_v, self.Exx_inf, np.nan),
-            "Eyy_inf": np.where(strain_v, self.Eyy_inf, np.nan),
-            "Exy_inf": np.where(strain_v, self.Exy_inf, np.nan),
-            "Gxy_inf": np.where(strain_v, 2.0 * self.Exy_inf, np.nan),
-            "Eeff_inf": np.where(strain_v, self.Eeff_inf, np.nan),
-            "Exx_gl": np.where(strain_v, self.Exx_gl, np.nan),
-            "Eyy_gl": np.where(strain_v, self.Eyy_gl, np.nan),
-            "Exy_gl": np.where(strain_v, self.Exy_gl, np.nan),
-            "Gxy_gl": np.where(strain_v, 2.0 * self.Exy_gl, np.nan),
-            "Eeff_gl": np.where(strain_v, self.Eeff_gl, np.nan),
+    def seed(self, pair_valid: Optional[np.ndarray] = None) -> int:
+        """Inject unoccupied subset centres from the spatial origin region."""
+        if not self._source_x.size:
+            return 0
+        eligible = np.ones(self._source_x.size, dtype=bool)
+        if pair_valid is not None:
+            valid = np.asarray(pair_valid, dtype=bool)
+            eligible &= valid[self._source_y.astype(np.intp),
+                              self._source_x.astype(np.intp)]
+
+        # Replenish the inlet without stacking a new state on material that has
+        # not yet moved away from its source cell.
+        if self.count:
+            ix, iy, inside = self._particle_grid_cells()
+            pidx = np.where(inside)[0]
+            if pidx.size:
+                px = self.radius + ix[pidx] * self.spacing
+                py = self.radius + iy[pidx] * self.spacing
+                close = ((self.x[pidx] - px) ** 2 + (self.y[pidx] - py) ** 2
+                         <= (0.60 * self.spacing) ** 2)
+                pidx = pidx[close]
+                if pidx.size:
+                    flats = iy[pidx] * self.grid_x.size + ix[pidx]
+                    eligible &= ~np.isin(self._source_flat, np.unique(flats))
+
+        x = self._source_x[eligible]
+        y = self._source_y[eligible]
+        self._append_zeros(x, y)
+        return int(x.size)
+
+    def _sample(self, field: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Strict bilinear sampling of a sparse regular-grid result field."""
+        values = np.full(self.count, np.nan, dtype=np.float64)
+        if (not self.count or field is None or not self.grid_x.size
+                or not self.grid_y.size):
+            return values, np.zeros(self.count, dtype=bool)
+        arr = np.asarray(field)
+        qx = (self.x - self.radius) / self.spacing
+        qy = (self.y - self.radius) / self.spacing
+        in_grid = ((qx >= 0.0) & (qx <= self.grid_x.size - 1) &
+                   (qy >= 0.0) & (qy <= self.grid_y.size - 1))
+        rows = np.where(in_grid)[0]
+        if not rows.size:
+            return values, in_grid
+
+        xq, yq = qx[rows], qy[rows]
+        ix0 = np.floor(xq).astype(np.intp)
+        iy0 = np.floor(yq).astype(np.intp)
+        ix1 = np.minimum(ix0 + 1, self.grid_x.size - 1)
+        iy1 = np.minimum(iy0 + 1, self.grid_y.size - 1)
+        tx, ty = xq - ix0, yq - iy0
+        tx[ix0 == ix1] = 0.0
+        ty[iy0 == iy1] = 0.0
+
+        xs0, xs1 = self.grid_x[ix0], self.grid_x[ix1]
+        ys0, ys1 = self.grid_y[iy0], self.grid_y[iy1]
+        samples = np.column_stack((
+            arr[ys0, xs0], arr[ys0, xs1],
+            arr[ys1, xs0], arr[ys1, xs1],
+        )).astype(np.float64, copy=False)
+        weights = np.column_stack((
+            (1.0 - tx) * (1.0 - ty), tx * (1.0 - ty),
+            (1.0 - tx) * ty, tx * ty,
+        ))
+        needed = weights > 1e-12
+        good = np.all(~needed | np.isfinite(samples), axis=1)
+        interpolated = np.sum(np.where(needed, samples, 0.0) * weights, axis=1)
+        good &= np.isfinite(interpolated)
+        values[rows[good]] = interpolated[good]
+        valid = np.zeros(self.count, dtype=bool)
+        valid[rows[good]] = True
+        return values, valid
+
+    def _retain(self, keep: np.ndarray) -> None:
+        for name in ("x", "y", "Exx_inf", "Eyy_inf", "Exy_inf",
+                     "equivalent", "F11", "F12", "F21", "F22", "age"):
+            setattr(self, name, getattr(self, name)[keep])
+
+    def advance(
+        self,
+        u: np.ndarray,
+        v: np.ndarray,
+        du_dx: np.ndarray,
+        du_dy: np.ndarray,
+        dv_dx: np.ndarray,
+        dv_dy: np.ndarray,
+    ) -> int:
+        """Transport all live states through one measured frame interval."""
+        if not self.count:
+            return 0
+        sampled = [self._sample(a) for a in
+                   (u, v, du_dx, du_dy, dv_dx, dv_dy)]
+        vals = [item[0] for item in sampled]
+        good = np.logical_and.reduce([item[1] for item in sampled])
+        if not good.any():
+            self._retain(good)
+            return 0
+
+        uu, vv, h11, h12, h21, h22 = vals
+        new_x = self.x + uu
+        new_y = self.y + vv
+        h, w = self.shape
+        in_frame = (np.isfinite(new_x) & np.isfinite(new_y) &
+                    (new_x >= 0.0) & (new_x <= w - 1.0) &
+                    (new_y >= 0.0) & (new_y <= h - 1.0))
+        # Material points may leave the initial domain_mask (ROI) but still be on-screen
+        # and valid if the solver tracked them. Kill them only if they fall off the image.
+        good &= in_frame
+        if not good.any():
+            self._retain(good)
+            return 0
+
+        deq = von_mises_equivalent(h11, h22, 0.5 * (h12 + h21))
+        good &= np.isfinite(deq)
+        if not good.any():
+            self._retain(good)
+            return 0
+
+        # Signed small-strain components integrate D*dt. H is the displacement
+        # gradient for this frame interval, so dt is already included.
+        self.Exx_inf[good] += h11[good]
+        self.Eyy_inf[good] += h22[good]
+        self.Exy_inf[good] += 0.5 * (h12[good] + h21[good])
+        self.equivalent[good] += deq[good]
+
+        # Updated-Lagrangian finite strain: F_total(n+1) = F_inc * F_total(n).
+        f11, f12 = self.F11.copy(), self.F12.copy()
+        f21, f22 = self.F21.copy(), self.F22.copy()
+        a11, a12 = 1.0 + h11, h12
+        a21, a22 = h21, 1.0 + h22
+        self.F11[good] = a11[good] * f11[good] + a12[good] * f21[good]
+        self.F12[good] = a11[good] * f12[good] + a12[good] * f22[good]
+        self.F21[good] = a21[good] * f11[good] + a22[good] * f21[good]
+        self.F22[good] = a21[good] * f12[good] + a22[good] * f22[good]
+        good &= (np.isfinite(self.F11) & np.isfinite(self.F12) &
+                 np.isfinite(self.F21) & np.isfinite(self.F22))
+
+        self.x[good], self.y[good] = new_x[good], new_y[good]
+        self.age[good] += 1
+        self._retain(good)
+        return self.count
+
+    def snapshot(self) -> dict[str, np.ndarray]:
+        """Remesh live material state to the current regular subset grid."""
+        out = {name: np.full(self.shape, np.nan, dtype=np.float32)
+               for name in _STATE_NAMES if name != "Eeff_gl"}
+        out["Eeff_gl"] = out["Eeff_inf"]
+        if not self.count:
+            return out
+        ix, iy, inside = self._particle_grid_cells()
+        rows = np.where(inside)[0]
+        if not rows.size:
+            return out
+
+        # Work only with particles that can be remeshed. A live point may still
+        # be inside the image while sitting in the subset-radius margin; mixing
+        # the full ix/iy arrays with this filtered row list made snapshot()
+        # broadcast incompatible shapes as soon as that happened.
+        ix_inside = ix[rows]
+        iy_inside = iy[rows]
+        flat = iy_inside * self.grid_x.size + ix_inside
+        distance = (
+            (self.x[rows] - (self.radius + ix_inside * self.spacing)) ** 2
+            + (self.y[rows] - (self.radius + iy_inside * self.spacing)) ** 2)
+        order = np.lexsort((-self.age[rows], distance, flat))
+        ordered_flat = flat[order]
+        first = np.empty(order.size, dtype=bool)
+        first[0] = True
+        first[1:] = ordered_flat[1:] != ordered_flat[:-1]
+        chosen = rows[order[first]]
+        cx = (self.radius + np.rint((self.x[chosen] - self.radius) /
+              self.spacing).astype(np.int64) * self.spacing)
+        cy = (self.radius + np.rint((self.y[chosen] - self.radius) /
+              self.spacing).astype(np.int64) * self.spacing)
+
+        exx_gl = 0.5 * (self.F11 ** 2 + self.F21 ** 2 - 1.0)
+        eyy_gl = 0.5 * (self.F12 ** 2 + self.F22 ** 2 - 1.0)
+        exy_gl = 0.5 * (self.F11 * self.F12 + self.F21 * self.F22)
+        values = {
+            "Exx_inf": self.Exx_inf,
+            "Eyy_inf": self.Eyy_inf,
+            "Exy_inf": self.Exy_inf,
+            "Eeff_inf": self.equivalent,
+            "Exx_gl": exx_gl,
+            "Eyy_gl": eyy_gl,
+            "Exy_gl": exy_gl,
+            # This is the non-negative path integral requested by the UI, not
+            # von_mises_equivalent(E_total), which can decrease on unloading.
+            "Eeff_gl": self.equivalent,
         }
-        for name, arr in getattr(self, "last_gradients", {}).items():
-            out[name] = np.where(strain_v, arr, np.nan)
-        # Legacy field aliases remain readable for old integrations. They now
-        # mean accumulated infinitesimal strain and are not shown under these
-        # ambiguous names in the UI.
-        out["Exx"] = out["Exx_inf"]
-        out["Eyy"] = out["Eyy_inf"]
-        out["Exy"] = out["Exy_inf"]
-        out["Eeff"] = out["Eeff_inf"]
-        out["valid"] = v
-        out["strain_valid"] = strain_v
-        out["broken"] = self.broken
-        out["rebased"] = self.rebased
+        finite_xy = ((cx >= 0) & (cx < self.shape[1]) &
+                     (cy >= 0) & (cy < self.shape[0]))
+        cx, cy, chosen = cx[finite_xy], cy[finite_xy], chosen[finite_xy]
+        for name, state in values.items():
+            vals = state[chosen]
+            finite = np.isfinite(vals)
+            out[name][cy[finite], cx[finite]] = vals[finite]
+        # Both formulations use the same requested accumulated equivalent-rate
+        # path integral. Share storage instead of retaining a duplicate full
+        # image for every frame.
+        out["Eeff_gl"] = out["Eeff_inf"]
         return out
