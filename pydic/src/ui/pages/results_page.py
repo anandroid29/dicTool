@@ -14,7 +14,6 @@ import os
 from typing import TYPE_CHECKING, Optional
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QColor, QPainter, QLinearGradient, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialog,
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
@@ -24,19 +23,16 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.stats import field_summary
+from src.core.compact_field import finite_values
 from src.core.units import LENGTH_UNIT_ORDER
 from src.ui import render
+from src.ui.components import ResultColorBar
 from src.ui.render import RangeSpec
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 
 from src.ui.image_canvas import ImageCanvas, marker_color
-
-try:
-    import cv2; _CV2 = True
-except ImportError:
-    _CV2 = False
 
 _C_BG      = "#08111d"
 _C_SURFACE = "#0e1c2e"
@@ -112,6 +108,54 @@ def _group_of(field: str) -> str:
     return next(iter(FIELD_GROUPS))
 
 
+def _interpolate_between_subset_centres(
+        arr: np.ndarray, x: int, y: int, spacing: int, origin: int
+        ) -> Optional[float]:
+    """Bilinearly interpolate a sparse regular-grid field at ``(x, y)``.
+
+    Every contributing subset centre must contain a finite value.  This is
+    deliberately stricter than nearest-neighbour filling: a failed correlation,
+    dynamic-ROI hole, or specimen boundary must not be painted over with an
+    apparently trustworthy number.
+    """
+    if arr is None or arr.ndim != 2:
+        return None
+    h, w = arr.shape
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+
+    s = max(1, int(spacing))
+    o = int(origin)
+    gx = (x - o) / s
+    gy = (y - o) / s
+    ix0, ix1 = int(np.floor(gx)), int(np.ceil(gx))
+    iy0, iy1 = int(np.floor(gy)), int(np.ceil(gy))
+
+    # A missing value at an actual subset centre is a failed/unsupported
+    # measurement, not a gap that interpolation is allowed to conceal.
+    if ix0 == ix1 and iy0 == iy1:
+        return None
+
+    x0, x1 = o + ix0 * s, o + ix1 * s
+    y0, y1 = o + iy0 * s, o + iy1 * s
+    if x0 < 0 or x1 >= w or y0 < 0 or y1 >= h:
+        return None
+
+    x_terms = [(x0, 1.0)] if x0 == x1 else [
+        (x0, (x1 - x) / s), (x1, (x - x0) / s)]
+    y_terms = [(y0, 1.0)] if y0 == y1 else [
+        (y0, (y1 - y) / s), (y1, (y - y0) / s)]
+
+    value = 0.0
+    for sy, wy in y_terms:
+        for sx, wx in x_terms:
+            sample = arr[sy, sx]
+            if not np.isfinite(sample):
+                return None
+            value += float(sample) * wx * wy
+    return value if np.isfinite(value) else None
+
+
 # FEA-style rainbow ramps first: blue (low) through cyan/green/yellow to red
 # (high) is the contour convention every ANSYS/Abaqus user reads instinctively.
 # turbo is the default rather than jet -- same blue-to-red identity, but without
@@ -179,82 +223,6 @@ class _VideoWorker(QThread):
             self.done.emit(False, str(e))
 
 
-class _ColorBar(QWidget):
-    """A thin horizontal gradient bar with vmin/vmax labels.
-
-    Caps appear at either end when the scale does not span the whole field.
-    Silent clipping is the failure this guards against: values beyond the
-    limits would otherwise render in the end colour and read as the true
-    extreme, which is how a trimmed scale gets mistaken for the real range.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(46)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._colors = [(8,17,29)] * 2
-        self._vmin = self._vmax = 0.0
-        self._unit = ""
-        self._below = self._above = self._total = 0
-
-    def update_bar(self, vmin, vmax, unit, colors,
-                   below: int = 0, above: int = 0, total: int = 0):
-        self._vmin, self._vmax, self._unit = vmin, vmax, unit
-        self._colors = colors
-        self._below, self._above, self._total = below, above, total
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        lm, rm, th = 6, 6, 12
-        cap = 7
-        lo_cap = self._below > 0
-        hi_cap = self._above > 0
-
-        w = self.width() - lm - rm - (cap if lo_cap else 0) - (cap if hi_cap else 0)
-        x0 = lm + (cap if lo_cap else 0)
-
-        grad = QLinearGradient(x0, 0, x0 + w, 0)
-        n = len(self._colors)
-        for i, (r, g, b) in enumerate(self._colors):
-            grad.setColorAt(i / max(n - 1, 1), QColor(r, g, b))
-
-        p.setBrush(grad)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(x0, 4, w, th, 3, 3)
-
-        # Same colours the overlay uses for out-of-range values.
-        if lo_cap:
-            p.setBrush(QColor(*render.UNDER_RANGE_RGB))
-            p.drawRect(lm, 4, cap, th)
-        if hi_cap:
-            p.setBrush(QColor(*render.OVER_RANGE_RGB))
-            p.drawRect(x0 + w, 4, cap, th)
-
-        p.setPen(QColor(_C_TEXT2))
-        p.setFont(QFont("Fira Code, Consolas, monospace", 9))
-        # The unit is shown once in the sidebar section heading. Repeating a
-        # long unit such as "dimensionless" here made the right endpoint grow
-        # into the left endpoint in the deliberately compact sidebar.
-        vmin_s, vmax_s = f"{self._vmin:.4g}", f"{self._vmax:.4g}"
-        base = 4 + th + 13
-        fm = p.fontMetrics()
-        p.drawText(lm, base, vmin_s)
-        p.drawText(self.width() - rm - fm.horizontalAdvance(vmax_s), base, vmax_s)
-
-        # One line stating exactly how much of the field lies outside the scale.
-        if (lo_cap or hi_cap) and self._total:
-            pct = 100.0 * (self._below + self._above) / self._total
-            note = f"{pct:.2g}% outside range"
-            p.setFont(QFont("Fira Code, Consolas, monospace", 8))
-            p.setPen(QColor(_C_WARN))
-            fm2 = p.fontMetrics()
-            p.drawText((self.width() - fm2.horizontalAdvance(note)) // 2,
-                       base + 12, note)
-        p.end()
-
-
 class ResultsPage(QWidget):
     """Step 6 — results viewer with correct frame-by-frame image updates."""
 
@@ -263,6 +231,7 @@ class ResultsPage(QWidget):
         self._wizard = wizard
         self._frame  = 0
         self._field  = "Eeff_rate"
+        self._unit_scale_cache: dict = {}
         # Frame-pair average. When set, the viewer shows this instead of a
         # single frame and the scrubber is inert -- the average has no position
         # in the sequence to scrub to.
@@ -271,6 +240,10 @@ class ResultsPage(QWidget):
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(200)
         self._play_timer.timeout.connect(self._advance)
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setSingleShot(True)
+        self._scrub_timer.setInterval(35)
+        self._scrub_timer.timeout.connect(self._render_scrubbed_frame)
         # Colour-scale mode. Radio buttons, not checkboxes: the three are
         # mutually exclusive, and as checkboxes they suggested combinations that
         # do not exist (ticking both "Static" and "Range" only ever meant
@@ -602,7 +575,7 @@ class ResultsPage(QWidget):
             f"color:{_C_TEXT2}; font-size:9px; font-style:italic;")
         cb_head_row.addWidget(self._colorbar_unit_lbl)
         sb_lay.addLayout(cb_head_row)
-        self._colorbar = _ColorBar()
+        self._colorbar = ResultColorBar()
         sb_lay.addWidget(self._colorbar)
 
         sb_lay.addWidget(self._sep())
@@ -803,6 +776,9 @@ class ResultsPage(QWidget):
         self._unit_combo.addItems(LENGTH_UNIT_ORDER)
         self._unit_combo.setCurrentText("mm")
         self._unit_combo.setFixedWidth(66)
+        self._unit_combo.setToolTip(
+            "Unit used to enter the pixel size. Result values automatically "
+            "promote to a larger engineering unit when they reach 100.")
         self._unit_combo.currentTextChanged.connect(self._on_calibration_changed)
         bot_lay.addWidget(self._unit_combo)
 
@@ -816,6 +792,7 @@ class ResultsPage(QWidget):
         val = float(self._px_size_spin.value())
         self._wizard.analysis.calibration = (
             Calibration.from_pixel_size(val, unit) if val > 0 else Calibration(None, unit))
+        self._unit_scale_cache.clear()
         try:
             self._wizard.analysis.save_settings()
         except Exception:
@@ -963,6 +940,7 @@ class ResultsPage(QWidget):
     def on_enter(self) -> None:
         """Refresh after analysis completes."""
         n = len(self._wizard.analysis.results)
+        self._unit_scale_cache.clear()
         # Markers are indexed against the previous run's displacement fields, so
         # they are meaningless for a new sequence.
         self._canvas.clear_markers()
@@ -993,35 +971,26 @@ class ResultsPage(QWidget):
         if idx < len(analysis.def_paths):
             path = analysis.def_paths[idx]
 
-            # Inline robust image loading
-            img = None
             try:
-                import cv2
-                img_cv = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                if img_cv is not None:
-                    img = img_cv.astype(np.float64) / 255.0
-            except Exception:
-                pass
-
-            if img is None:
-                try:
-                    from PIL import Image
-                    img = np.array(Image.open(path).convert("L"), dtype=np.float64) / 255.0
-                except Exception as e:
-                    print(f"Failed to load image {path}: {e}")
+                from src.core.analysis import _load_image
+                img = _load_image(path)
+            except Exception as e:
+                img = None
+                print(f"Failed to load image {path}: {e}")
 
             if img is not None:
-                # FORCE DEEP CONTIGUOUS COPY to prevent 0xC0000409 crash
-                safe_img = np.ascontiguousarray(img * 0.45, dtype=np.float64)
                 keep = self._canvas._image_arr is not None
-                self._canvas.set_image(safe_img, keep_view=keep)
+                # Dim only the pixmap; retain the compact float32 source for
+                # cursor values without allocating a second full image.
+                self._canvas.set_image(
+                    img, keep_view=keep, display_scale=0.45)
             else:
                 self._canvas.clear_result_overlay()
 
         # 2. ── Render field overlay ──────────────────────────────────
         result = analysis.results[idx]
         arr, _ = self._display_array(result)
-        if arr is not None and np.any(np.isfinite(arr)):
+        if arr is not None and finite_values(arr).size:
             # _apply_overlay internally checks if static_scale_chk is enabled
             self._apply_overlay(arr)
         else:
@@ -1061,10 +1030,9 @@ class ResultsPage(QWidget):
         arr, _ = self._display_array(results[idx])
         if arr is None:
             return
-        finite = np.isfinite(arr)
-        if not finite.any():
+        vals = finite_values(arr)
+        if not vals.size:
             return
-        vals = arr[finite]
         blocked = (self._range_min_spin.blockSignals(True),
                    self._range_max_spin.blockSignals(True))
         self._range_min_spin.setValue(float(vals.min()))
@@ -1153,7 +1121,7 @@ class ResultsPage(QWidget):
             # How much of the field the scale is actually showing. Reported
             # rather than inferred, so a trimmed scale is never mistaken for
             # the full data range.
-            finite = arr[np.isfinite(arr)]
+            finite = finite_values(arr)
             below = int(np.count_nonzero(finite < vmin))
             above = int(np.count_nonzero(finite > vmax))
             self._update_colorbar(render.get_cmap(cmap_name, 256), vmin, vmax,
@@ -1170,15 +1138,49 @@ class ResultsPage(QWidget):
     # overlay range, colourbar, statistics -- goes through this one conversion
     # so the number and its unit can never disagree.
 
-    def _unit_factor(self) -> tuple:
-        cal = self._wizard.analysis.calibration
+    def _unit_factor(self, result=None, native_arr=None) -> tuple:
+        analysis = self._wizard.analysis
+        cal = analysis.calibration
         base = FIELDS.get(self._field, ("", ""))[1]
-        return cal.factor_and_unit(self._field, base)
+        results = analysis.results
+        lazy = bool(getattr(analysis, "hdf5_lazy", False))
+        if result is None and lazy and results:
+            result = (self._pair_avg if self._pair_avg is not None else
+                      results[max(0, min(self._frame, len(results) - 1))])
+        key = (
+            self._field, cal.metres_per_pixel, cal.display_unit, len(results),
+            id(result) if lazy else (id(results[0]) if results else None),
+            None if lazy else (id(results[-1]) if results else None),
+        )
+        cached = self._unit_scale_cache.get(key)
+        if cached is not None:
+            return cached
+
+        factor_unit = cal.factor_and_unit(self._field, base)
+        if cal.calibrated and results:
+            if lazy and result is not None:
+                values = (np.asarray(native_arr) if native_arr is not None else
+                          np.asarray(getattr(result, self._field, np.zeros(0))))
+                finite = np.abs(values[np.isfinite(values)])
+                magnitude = (float(np.percentile(finite, 99.0))
+                             if finite.size else 0.0)
+            else:
+                lo, hi = analysis.get_global_range(self._field, 99.0)
+                magnitude = max(abs(float(lo)), abs(float(hi)))
+            factor_unit = cal.compact_factor_and_unit(
+                self._field, magnitude, base)
+        self._unit_scale_cache.clear()
+        self._unit_scale_cache[key] = factor_unit
+        return factor_unit
 
     def _display_array(self, result):
         """The selected field in display units, plus its unit label."""
         arr = getattr(result, self._field, None)
-        factor, unit = self._unit_factor()
+        if (arr is not None and
+                bool(getattr(self._wizard.analysis, "hdf5_lazy", False)) and
+                not isinstance(arr, np.ndarray)):
+            arr = np.asarray(arr)
+        factor, unit = self._unit_factor(result, arr)
         if arr is None or factor == 1.0:
             return arr, unit
         return arr * factor, unit
@@ -1238,10 +1240,11 @@ class ResultsPage(QWidget):
     # ------------------------------------------------------------------
 
     def _on_cursor_moved(self, x: int, y: int, _v: float) -> None:
-        """Report the stored field value at the pixel under the cursor.
+        """Report the field value at the pixel under the cursor.
 
-        Reads the array directly rather than inverting the colour, so the
-        number is the computed value and not an estimate off the colourbar.
+        Stored subset-centre values are reported exactly. Pixels between subset
+        centres use bilinear interpolation and are visibly marked approximate;
+        values are never inferred by inverting the rendered colour.
         """
         result = self._pair_avg
         if result is None:
@@ -1258,23 +1261,41 @@ class ResultsPage(QWidget):
             self._probe_lbl.setText(f"x={x}  y={y}\noutside field")
             return
 
+        analysis = self._wizard.analysis
+        roi = analysis.roi_mask
+        if roi is not None and roi.shape == arr.shape and not roi[y, x]:
+            self._probe_lbl.setText(f"x={x}  y={y}\noutside ROI")
+            return
+
         val = arr[y, x]
         short = _field_short(self._field)
+        suffix = f" {unit}" if unit else ""
         if np.isfinite(val):
-            suffix = f" {unit}" if unit else ""
             self._probe_lbl.setText(f"x={x}  y={y}\n{short} = {val:.6g}{suffix}")
         else:
-            # A gap between subset centres is not the same as a correlation
-            # that failed, and the distinction matters when judging coverage.
-            spacing = max(1, int(getattr(
-                self._wizard.analysis.params, "subset_spacing", 1)))
-            on_grid = np.any(np.isfinite(
-                arr[max(0, y - spacing):y + spacing + 1,
-                    max(0, x - spacing):x + spacing + 1]))
+            params = analysis.params
+            spacing = max(1, int(getattr(params, "subset_spacing", 1)))
+            origin = int(getattr(params, "subset_radius", 0))
+            estimate = _interpolate_between_subset_centres(
+                arr, x, y, spacing, origin)
+            if estimate is not None:
+                self._probe_lbl.setText(
+                    f"x={x}  y={y}\n{short} ≈ {estimate:.6g}{suffix}"
+                    "\n(interpolated between subset centres)")
+                return
+
+            on_grid = ((x - origin) % spacing == 0 and
+                       (y - origin) % spacing == 0)
+            if on_grid:
+                valid = getattr(result, "valid", None)
+                failed = (valid is not None and valid.shape == arr.shape and
+                          not bool(valid[y, x]))
+                reason = ("not correlated here" if failed else
+                          "no valid field value at this subset centre")
+            else:
+                reason = "insufficient surrounding subset data"
             self._probe_lbl.setText(
-                f"x={x}  y={y}\n{short} = no data"
-                + ("\n(between subset centres)" if on_grid else
-                   "\n(not correlated here)"))
+                f"x={x}  y={y}\n{short} = no data\n({reason})")
 
     # ------------------------------------------------------------------
     # Slots
@@ -1282,7 +1303,13 @@ class ResultsPage(QWidget):
 
     def _on_slider(self, val: int) -> None:
         self._frame = val
-        self._show_frame(val)
+        # Loading, colouring and uploading a full-resolution frame for every
+        # intermediate slider event makes scrubbing lag behind the pointer.
+        # Render the most recent position after a very short coalescing window.
+        self._scrub_timer.start()
+
+    def _render_scrubbed_frame(self) -> None:
+        self._show_frame(self._frame)
 
     def _sync_field_buttons(self) -> None:
         """Show only the buttons belonging to the selected category."""
@@ -1403,12 +1430,12 @@ class ResultsPage(QWidget):
 
         ref = analysis.reference_image
         if ref is not None:
-            safe_img = np.ascontiguousarray(ref * 0.45, dtype=np.float64)
             keep = self._canvas._image_arr is not None
-            self._canvas.set_image(safe_img, keep_view=keep)
+            self._canvas.set_image(
+                ref, keep_view=keep, display_scale=0.45)
 
         arr, _ = self._display_array(res)
-        if arr is not None and np.any(np.isfinite(arr)):
+        if arr is not None and finite_values(arr).size:
             self._apply_overlay(arr)
         else:
             self._canvas.set_result_overlay_rgba(None)
@@ -1602,23 +1629,3 @@ class ResultsPage(QWidget):
             f"QToolButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }}"
         )
         return btn
-
-
-# ---------------------------------------------------------------------------
-# Image loading helper (frame-level, fast path)
-# ---------------------------------------------------------------------------
-
-def _load_gray(path: str) -> Optional[np.ndarray]:
-    """Return float64 greyscale [0,1] or None on error."""
-    try:
-        if _CV2:
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                return None
-            mx = float(np.iinfo(img.dtype).max) if img.dtype.kind == "u" else 1.0
-            return img.astype(np.float64) / mx
-        else:
-            from PIL import Image as PILImage
-            return np.asarray(PILImage.open(path).convert("L"), np.float64) / 255.0
-    except Exception:
-        return None
