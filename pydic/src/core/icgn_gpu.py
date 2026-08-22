@@ -127,7 +127,9 @@ class GPUWavefrontDIC:
         return ((xs.min(axis=1) < -0.5) | (xs.max(axis=1) > self.W - 0.5) |
                 (ys.min(axis=1) < -0.5) | (ys.max(axis=1) > self.H - 0.5))
 
-    def solve_frame(self, cur_image: np.ndarray, seed_idx: int = -1, seed_p: np.ndarray = None, warm_start: bool = False, total_u: np.ndarray = None, total_v: np.ndarray = None):
+    def solve_frame(self, cur_image: np.ndarray, seed_idx: int = -1,
+                    seed_p: np.ndarray = None,
+                    warm_start: bool = False):
         if not self._initialized:
             raise RuntimeError("Must precompute reference before solving frames.")
 
@@ -149,22 +151,18 @@ class GPUWavefrontDIC:
             self.p_global[seed_idx] = cp.asarray(seed_p, dtype=cp.float64)
         else:
             self.state[self.state == 2] = 1
-            valid_gpu = cp.asarray(self.valid_mask)
-            self.state[(self.state == -1) & valid_gpu] = 0
+            # Re-open failed points inside the analysis ROI so a reliable
+            # neighbour can repair them on this fresh previous->current pair.
+            # The grid is Eulerian/image-space: material-path transport is a
+            # separate strain operation, so warm starting must never grow the
+            # pairwise solve outside the operator's analysis ROI.
+            self.state[self.state == -1] = 0
+            self.state[~cp.asarray(self.valid_mask)] = -1
             if getattr(self, "retry", None) is None or len(self.retry) != self.N_total:
                 self.retry = cp.zeros(self.N_total, dtype=cp.int8)
             self.retry[:] = 0
 
         Ny, Nx = self.grid_shape
-
-        if total_u is not None and total_v is not None:
-            u_ref_gpu = cp.asarray(total_u[self.gy_flat, self.gx_flat], dtype=cp.float64)
-            v_ref_gpu = cp.asarray(total_v[self.gy_flat, self.gx_flat], dtype=cp.float64)
-            u_ref_gpu[cp.isnan(u_ref_gpu)] = 0.0
-            v_ref_gpu[cp.isnan(v_ref_gpu)] = 0.0
-        else:
-            u_ref_gpu = cp.zeros(self.N_total, dtype=cp.float64)
-            v_ref_gpu = cp.zeros(self.N_total, dtype=cp.float64)
 
         def get_neighbors(indices):
             y = indices // Nx
@@ -199,11 +197,15 @@ class GPUWavefrontDIC:
 
             gx_act = self.gx_gpu[active_indices]
             gy_act = self.gy_gpu[active_indices]
-            u_ref_act = u_ref_gpu[active_indices]
-            v_ref_act = v_ref_gpu[active_indices]
 
-            ref_xs_act = gx_act[:, None] + u_ref_act[:, None] + self.dx_sub[None, :]
-            ref_ys_act = gy_act[:, None] + v_ref_act[:, None] + self.dy_sub[None, :]
+            # update_reference_image() makes the immediately previous frame
+            # the reference. Its subset centres are therefore the fixed
+            # image-space grid, not frame-0 centres plus a cumulative offset.
+            # p_global still supplies the previous pair as a numerical warm
+            # start, but never changes which points this pair is allowed to
+            # measure.
+            ref_xs_act = gx_act[:, None] + self.dx_sub[None, :]
+            ref_ys_act = gy_act[:, None] + self.dy_sub[None, :]
 
             # Every map_coordinates call here uses mode='mirror', which does not
             # fail on out-of-range coordinates -- it REFLECTS the image and

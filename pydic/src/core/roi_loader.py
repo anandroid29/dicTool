@@ -52,28 +52,6 @@ def load_roi_mask(path: str,
     return mask
 
 
-def save_roi_mask(mask: np.ndarray, path: str) -> None:
-    """
-    Save an ROI mask as a PNG file (white = ROI, black = background).
-    The saved file can be reloaded with load_roi_mask().
-    """
-    try:
-        from PIL import Image
-        arr = (mask.astype(np.uint8)) * 255
-        Image.fromarray(arr, mode="L").save(path)
-        return
-    except ImportError:
-        pass
-    try:
-        import cv2
-        arr = (mask.astype(np.uint8)) * 255
-        cv2.imwrite(path, arr)
-        return
-    except ImportError:
-        pass
-    raise ImportError("Install Pillow or opencv-python to save ROI images.")
-
-
 def _load_image(path: str) -> np.ndarray:
     """Load image file and threshold at 50 % of max (matches MATLAB im2bw)."""
     try:
