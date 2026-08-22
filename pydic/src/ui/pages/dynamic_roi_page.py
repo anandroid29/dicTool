@@ -8,7 +8,7 @@ to see or influence the result -- so when it cut into material the operator
 wanted kept (or kept background the operator wanted gone), there was nothing to
 do about it.
 
-This page shows the resulting mask on the reference frame while you change the
+This page shows the resulting mask on the selected zero-strain frame while you change the
 threshold, and lets you force regions in or out by hand. Include beats exclude
 beats the texture metric, so an operator decision is never quietly reinterpreted
 frame to frame.
@@ -17,7 +17,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QSlider, QCheckBox, QFrame, QSizePolicy, QButtonGroup, QDoubleSpinBox,
@@ -74,6 +75,10 @@ class DynamicROIPage(QWidget):
         self._channel = "include"          # which one the canvas is editing
         self._tool = ROITool.RECTANGLE      # active drawing geometry
         self._updating = False             # guard against feedback loops
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(60)
+        self._refresh_timer.timeout.connect(self._refresh)
         self._build_ui()
 
     # ------------------------------------------------------------------ UI
@@ -128,7 +133,7 @@ class DynamicROIPage(QWidget):
             "Contrast  — local intensity standard deviation.\n"
             "Edge Detection — Sobel gradient magnitude.\n"
             "Hybrid — both, each normalised before being summed.\n\n"
-            "The threshold is calibrated once on the reference frame and then\n"
+            "The threshold is calibrated once on the selected zero-strain frame and then\n"
             "held fixed, so 'enough texture' means the same thing in frame 500\n"
             "as in frame 1.")
         self._cb_method.currentTextChanged.connect(self._on_method_changed)
@@ -146,7 +151,7 @@ class DynamicROIPage(QWidget):
         self._auto_chk = QCheckBox("Automatic (Otsu)")
         self._auto_chk.setChecked(True)
         self._auto_chk.setToolTip(
-            "Pick the threshold automatically from the reference frame.\n"
+            "Pick the threshold automatically from the selected zero-strain frame.\n"
             "Uncheck to set it by hand.")
         self._auto_chk.toggled.connect(self._on_auto_toggled)
         lay.addWidget(self._auto_chk)
@@ -278,7 +283,7 @@ class DynamicROIPage(QWidget):
 
     def on_enter(self) -> None:
         a = self._wizard.analysis
-        ref = a.reference_image
+        ref = a.strain_reference_image()
         if ref is None:
             return
         self._updating = True
@@ -286,9 +291,15 @@ class DynamicROIPage(QWidget):
         self._canvas.fit_image()
 
         if self._include is None or self._include.shape != ref.shape:
-            self._include = np.zeros(ref.shape, bool)
+            stored = a.dynamic_include_mask
+            self._include = (stored.copy() if stored is not None and
+                             stored.shape == ref.shape else
+                             np.zeros(ref.shape, bool))
         if self._exclude is None or self._exclude.shape != ref.shape:
-            self._exclude = np.zeros(ref.shape, bool)
+            stored = a.dynamic_exclude_mask
+            self._exclude = (stored.copy() if stored is not None and
+                             stored.shape == ref.shape else
+                             np.zeros(ref.shape, bool))
 
         self._cb_method.setCurrentText(getattr(a.params, "dynamic_roi", "None"))
         thr = getattr(a.params, "dynamic_roi_threshold", None)
@@ -302,6 +313,13 @@ class DynamicROIPage(QWidget):
         self._set_channel(self._channel)
         self._refresh()
 
+    def on_leave(self) -> None:
+        """Commit controls, then release full-resolution editor work masks."""
+        self._refresh_timer.stop()
+        self._commit_to_analysis()
+        self._include = None
+        self._exclude = None
+
     # ---------------------------------------------------------------- events
     def _on_method_changed(self, _t: str) -> None:
         if not self._updating:
@@ -314,7 +332,10 @@ class DynamicROIPage(QWidget):
 
     def _on_threshold_changed(self, _v) -> None:
         if not self._updating:
-            self._refresh()
+            # Threshold/area controls emit continuously while dragged. Coalesce
+            # those events so a large texture mask is computed only for the
+            # latest visible value.
+            self._refresh_timer.start()
 
     def _set_channel(self, chan: str) -> None:
         """Swap which override the canvas is painting into."""
@@ -330,8 +351,8 @@ class DynamicROIPage(QWidget):
             self._canvas.set_roi_mask(other.copy())
         r, g, b = _C_INCLUDE if chan == "include" else _C_EXCLUDE
         from PyQt6.QtGui import QColor
-        self._canvas._ROI_FILL_COLOR = QColor(r, g, b, 70)
-        self._canvas._ROI_BORDER_COLOR = QColor(r, g, b, 210)
+        self._canvas.set_roi_colors(
+            QColor(r, g, b, 70), QColor(r, g, b, 210))
         self._canvas.set_tool(self._tool)
         self._btn_inc.setChecked(chan == "include")
         self._btn_exc.setChecked(chan == "exclude")
@@ -412,7 +433,7 @@ class DynamicROIPage(QWidget):
 
     def _refresh(self) -> None:
         a = self._wizard.analysis
-        ref = a.reference_image
+        ref = a.strain_reference_image()
         method = self._cb_method.currentText()
         self._commit_to_analysis()
 
@@ -450,18 +471,27 @@ class DynamicROIPage(QWidget):
 
         static = a.roi_mask
 
-        rgba = np.zeros((*m.shape, 4), np.uint8)
+        # This is a categorical mask, so a byte of palette indices is enough.
+        # Building a four-channel RGBA frame made every slider tick allocate and
+        # copy four times more data than necessary.
+        overlay = np.zeros(m.shape, np.uint8)
         # Everything outside the static ROI is dimmed, so it is obvious that the
         # dynamic mask only ever refines the region already drawn.
         if static is not None:
-            rgba[~static] = (15, 23, 42, 130)
-        rgba[m] = (16, 185, 129, 70)
+            overlay[~static] = 1
+        overlay[m] = 2
         inside = static if static is not None else np.ones_like(m)
         if self._exclude is not None and self._exclude.any():
-            rgba[self._exclude & inside] = (239, 68, 68, 90)
+            overlay[self._exclude & inside] = 3
         if self._include is not None and self._include.any():
-            rgba[self._include & inside] = (16, 185, 129, 130)
-        self._canvas.set_result_overlay_rgba(rgba)
+            overlay[self._include & inside] = 4
+        self._canvas.set_result_overlay_indexed(overlay, [
+            QColor(0, 0, 0, 0),
+            QColor(15, 23, 42, 130),
+            QColor(16, 185, 129, 70),
+            QColor(239, 68, 68, 90),
+            QColor(16, 185, 129, 130),
+        ])
         denom = int(static.sum()) if static is not None else m.size
         kept = int((m & static).sum()) if static is not None else int(m.sum())
         pct = 100.0 * kept / max(1, denom)
@@ -469,10 +499,11 @@ class DynamicROIPage(QWidget):
         n_inc = int((self._include & inside).sum()) if self._include is not None else 0
         n_exc = int((self._exclude & inside).sum()) if self._exclude is not None else 0
         self._stats.setText(
-            f"Keeps {pct:.1f}% of the static ROI on the reference frame  ({auto_txt}).\n"
+            f"Keeps {pct:.1f}% of the static ROI on the zero-strain frame  ({auto_txt}).\n"
             f"Overrides: {n_inc:,} px forced in, {n_exc:,} px forced out.")
 
     def _on_continue(self) -> None:
+        self._refresh_timer.stop()
         self._set_channel(self._channel)   # flush any in-progress drawing
         self._commit_to_analysis()
         try:

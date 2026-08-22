@@ -5,11 +5,14 @@
 *.h5
 *.tif
 *.mp4
-__pycache__/
+*.pptx
+*.exe
+*.avi__pycache__/
 *.py[cod]
 /output/
 sample video_frames
 tmp/
+Lab Data/
 # Keep local/manual verification assets out of Git, but retain focused unit
 # regressions that protect shipped behaviour.
 !tests/test_dynamic_roi_coordinates.py

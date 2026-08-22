@@ -26,6 +26,7 @@ import numpy as np
 # definition for its sequence-wide range, so the primitive lives in core and
 # both sides import it from there.
 from src.core.stats import robust_limits
+from src.core.compact_field import CompactField
 
 try:
     import cv2
@@ -87,7 +88,7 @@ class RangeSpec:
         else:
             if arr is None:
                 return None
-            limits = robust_limits(np.asarray(arr), self.percentile)
+            limits = robust_limits(arr, self.percentile)
             if limits is None:
                 return None
             vmin, vmax = limits
@@ -142,6 +143,11 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
     """
     if arr is None or not _HAVE_CV2:
         return None
+    if isinstance(arr, CompactField):
+        return _compact_field_to_rgba(
+            arr, vmin, vmax, cmap_name, roi_mask=roi_mask,
+            spacing=spacing, alpha=alpha,
+            mark_out_of_range=mark_out_of_range)
     import matplotlib.colors as mc
 
     valid = np.isfinite(arr)
@@ -206,6 +212,70 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
         out[~roi_mask, 3] = 0.0
     out[~np.isfinite(out)] = 0.0
     return np.ascontiguousarray(out.astype(np.uint8))
+
+
+def _compact_field_to_rgba(
+        arr: CompactField, vmin: float, vmax: float, cmap_name: str,
+        roi_mask: Optional[np.ndarray] = None, spacing: int = 3,
+        alpha: int = 195, mark_out_of_range: bool = False):
+    """Colour a packed subset field without constructing a dense float image."""
+    if not arr.indices.size:
+        return None
+    import matplotlib.colors as mc
+
+    values = arr.values
+    keep = np.isfinite(values)
+    width = arr.shape[1]
+    ys = (arr.indices // width).astype(np.int64, copy=False)
+    xs = (arr.indices % width).astype(np.int64, copy=False)
+    if roi_mask is not None:
+        keep &= np.asarray(roi_mask, dtype=bool)[ys, xs]
+    if not keep.any():
+        return None
+    ys, xs, values = ys[keep], xs[keep], values[keep]
+    ymin, ymax = int(ys.min()), int(ys.max())
+    xmin, xmax = int(xs.min()), int(xs.max())
+    s = max(1, int(spacing))
+    gh = (ymax - ymin) // s + 1
+    gw = (xmax - xmin) // s + 1
+    gy = ((ys - ymin) // s).astype(np.intp, copy=False)
+    gx = ((xs - xmin) // s).astype(np.intp, copy=False)
+    small = np.full((gh, gw), vmin, dtype=np.float32)
+    small_mask = np.zeros((gh, gw), dtype=bool)
+    small[gy, gx] = values
+    small_mask[gy, gx] = True
+
+    norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    cmap_obj = get_cmap(cmap_name, 256)
+    rgba_small = cmap_obj(norm(small), bytes=True).astype(np.float32)
+    if mark_out_of_range:
+        over = small_mask & (small > vmax)
+        under = small_mask & (small < vmin)
+        rgba_small[over, :3] = OVER_RANGE_RGB
+        rgba_small[under, :3] = UNDER_RANGE_RGB
+
+    coverage_small = small_mask.astype(np.float32)
+    premult_small = rgba_small[..., :3] * coverage_small[..., None]
+    th, tw = ymax - ymin + 1, xmax - xmin + 1
+    coverage = cv2.resize(
+        coverage_small, (tw, th), interpolation=cv2.INTER_LINEAR)
+    premult = cv2.resize(
+        premult_small, (tw, th), interpolation=cv2.INTER_LINEAR)
+    if premult.ndim == 2:
+        premult = premult[..., None]
+    rgb = np.zeros_like(premult, dtype=np.float32)
+    np.divide(premult, coverage[..., None], out=rgb,
+              where=coverage[..., None] > 1e-6)
+    big = np.zeros((th, tw, 4), dtype=np.float32)
+    big[..., :3] = rgb
+    big[..., 3] = coverage * float(alpha)
+    if roi_mask is not None:
+        big[~np.asarray(roi_mask, dtype=bool)[ymin:ymax + 1,
+                                             xmin:xmax + 1], 3] = 0.0
+    big[~np.isfinite(big)] = 0.0
+    out = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.uint8)
+    out[ymin:ymax + 1, xmin:xmax + 1] = big.astype(np.uint8)
+    return np.ascontiguousarray(out)
 
 
 # ---------------------------------------------------------------------------

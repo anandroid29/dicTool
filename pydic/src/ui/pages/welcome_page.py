@@ -463,7 +463,17 @@ class WelcomePage(QWidget):
         ref_idx = dlg.reference_index
         ref_path = paths[ref_idx]
 
-        def_paths = [p for i, p in enumerate(paths) if i != ref_idx]
+        # Immediate-frame DIC requires a chronological chain beginning at the
+        # selected reference. Frames before it cannot be inserted ahead of it,
+        # and joining the frame before and after it after removing only the
+        # reference creates a false, non-adjacent interval.
+        def_paths = paths[ref_idx + 1:]
+        if not def_paths:
+            QMessageBox.warning(
+                self, "Reference has no following frames",
+                "Choose a reference frame earlier in the extracted sequence. "
+                "Updated-Lagrangian analysis proceeds forward from it.")
+            return
         analysis = self._wizard.analysis
         analysis.calibration = dlg.get_calibration()
         analysis.save_settings()

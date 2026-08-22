@@ -5,13 +5,18 @@ Reusable UI components styled with PyDIC's global theme tokens.
 """
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QCursor, QColor
-from PyQt6.QtWidgets import QPushButton, QGraphicsDropShadowEffect, QWidget, QHBoxLayout, QLabel, QFrame
+from PyQt6.QtGui import QCursor, QColor, QFont, QLinearGradient, QPainter
+from PyQt6.QtWidgets import (
+    QPushButton, QGraphicsDropShadowEffect, QWidget, QHBoxLayout, QLabel,
+    QFrame, QSizePolicy,
+)
+
+from src.ui import render
 
 # Import your raw color tokens
 from src.ui.theme import (
     C_ACCENT, C_ACCENT_G, C_ACCENT_D,
-    C_SURFACE, C_BORDER, C_TEXT2, C_TEXT3
+    C_SURFACE, C_BORDER, C_TEXT2, C_TEXT3, C_WARNING,
 )
 
 
@@ -54,6 +59,76 @@ class FooterButton(QPushButton):
         shadow.setColor(QColor(0, 0, 0, 100))
         shadow.setOffset(0, 3)
         self.setGraphicsEffect(shadow)
+
+
+class ResultColorBar(QWidget):
+    """Scientific colour scale with explicit out-of-range indicators."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(46)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+        self._colors = [(8, 17, 29)] * 2
+        self._vmin = self._vmax = 0.0
+        self._unit = ""
+        self._below = self._above = self._total = 0
+
+    def update_bar(self, vmin, vmax, unit, colors,
+                   below: int = 0, above: int = 0, total: int = 0):
+        self._vmin, self._vmax, self._unit = vmin, vmax, unit
+        self._colors = colors
+        self._below, self._above, self._total = below, above, total
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        left, right, thickness = 6, 6, 12
+        cap = 7
+        has_low_cap = self._below > 0
+        has_high_cap = self._above > 0
+        width = (self.width() - left - right -
+                 (cap if has_low_cap else 0) -
+                 (cap if has_high_cap else 0))
+        x0 = left + (cap if has_low_cap else 0)
+
+        gradient = QLinearGradient(x0, 0, x0 + width, 0)
+        for index, (red, green, blue) in enumerate(self._colors):
+            gradient.setColorAt(
+                index / max(len(self._colors) - 1, 1),
+                QColor(red, green, blue))
+        painter.setBrush(gradient)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(x0, 4, width, thickness, 3, 3)
+
+        if has_low_cap:
+            painter.setBrush(QColor(*render.UNDER_RANGE_RGB))
+            painter.drawRect(left, 4, cap, thickness)
+        if has_high_cap:
+            painter.setBrush(QColor(*render.OVER_RANGE_RGB))
+            painter.drawRect(x0 + width, 4, cap, thickness)
+
+        painter.setPen(QColor(C_TEXT2))
+        painter.setFont(QFont("Fira Code, Consolas, monospace", 9))
+        minimum, maximum = f"{self._vmin:.4g}", f"{self._vmax:.4g}"
+        baseline = 4 + thickness + 13
+        metrics = painter.fontMetrics()
+        painter.drawText(left, baseline, minimum)
+        painter.drawText(
+            self.width() - right - metrics.horizontalAdvance(maximum),
+            baseline, maximum)
+
+        if (has_low_cap or has_high_cap) and self._total:
+            percentage = 100.0 * (self._below + self._above) / self._total
+            note = f"{percentage:.2g}% outside range"
+            painter.setFont(QFont("Fira Code, Consolas, monospace", 8))
+            painter.setPen(QColor(C_WARNING))
+            note_metrics = painter.fontMetrics()
+            painter.drawText(
+                (self.width() - note_metrics.horizontalAdvance(note)) // 2,
+                baseline + 12, note)
+        painter.end()
 
 
 class WizardStepper(QWidget):

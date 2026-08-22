@@ -14,7 +14,6 @@ import os
 from typing import TYPE_CHECKING, Optional
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QColor, QPainter, QLinearGradient, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialog,
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
@@ -24,8 +23,10 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.stats import field_summary
+from src.core.compact_field import finite_values
 from src.core.units import LENGTH_UNIT_ORDER
 from src.ui import render
+from src.ui.components import ResultColorBar
 from src.ui.render import RangeSpec
 
 if TYPE_CHECKING:
@@ -222,82 +223,6 @@ class _VideoWorker(QThread):
             self.done.emit(False, str(e))
 
 
-class _ColorBar(QWidget):
-    """A thin horizontal gradient bar with vmin/vmax labels.
-
-    Caps appear at either end when the scale does not span the whole field.
-    Silent clipping is the failure this guards against: values beyond the
-    limits would otherwise render in the end colour and read as the true
-    extreme, which is how a trimmed scale gets mistaken for the real range.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(46)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._colors = [(8,17,29)] * 2
-        self._vmin = self._vmax = 0.0
-        self._unit = ""
-        self._below = self._above = self._total = 0
-
-    def update_bar(self, vmin, vmax, unit, colors,
-                   below: int = 0, above: int = 0, total: int = 0):
-        self._vmin, self._vmax, self._unit = vmin, vmax, unit
-        self._colors = colors
-        self._below, self._above, self._total = below, above, total
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        lm, rm, th = 6, 6, 12
-        cap = 7
-        lo_cap = self._below > 0
-        hi_cap = self._above > 0
-
-        w = self.width() - lm - rm - (cap if lo_cap else 0) - (cap if hi_cap else 0)
-        x0 = lm + (cap if lo_cap else 0)
-
-        grad = QLinearGradient(x0, 0, x0 + w, 0)
-        n = len(self._colors)
-        for i, (r, g, b) in enumerate(self._colors):
-            grad.setColorAt(i / max(n - 1, 1), QColor(r, g, b))
-
-        p.setBrush(grad)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(x0, 4, w, th, 3, 3)
-
-        # Same colours the overlay uses for out-of-range values.
-        if lo_cap:
-            p.setBrush(QColor(*render.UNDER_RANGE_RGB))
-            p.drawRect(lm, 4, cap, th)
-        if hi_cap:
-            p.setBrush(QColor(*render.OVER_RANGE_RGB))
-            p.drawRect(x0 + w, 4, cap, th)
-
-        p.setPen(QColor(_C_TEXT2))
-        p.setFont(QFont("Fira Code, Consolas, monospace", 9))
-        # The unit is shown once in the sidebar section heading. Repeating a
-        # long unit such as "dimensionless" here made the right endpoint grow
-        # into the left endpoint in the deliberately compact sidebar.
-        vmin_s, vmax_s = f"{self._vmin:.4g}", f"{self._vmax:.4g}"
-        base = 4 + th + 13
-        fm = p.fontMetrics()
-        p.drawText(lm, base, vmin_s)
-        p.drawText(self.width() - rm - fm.horizontalAdvance(vmax_s), base, vmax_s)
-
-        # One line stating exactly how much of the field lies outside the scale.
-        if (lo_cap or hi_cap) and self._total:
-            pct = 100.0 * (self._below + self._above) / self._total
-            note = f"{pct:.2g}% outside range"
-            p.setFont(QFont("Fira Code, Consolas, monospace", 8))
-            p.setPen(QColor(_C_WARN))
-            fm2 = p.fontMetrics()
-            p.drawText((self.width() - fm2.horizontalAdvance(note)) // 2,
-                       base + 12, note)
-        p.end()
-
-
 class ResultsPage(QWidget):
     """Step 6 — results viewer with correct frame-by-frame image updates."""
 
@@ -315,6 +240,10 @@ class ResultsPage(QWidget):
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(200)
         self._play_timer.timeout.connect(self._advance)
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setSingleShot(True)
+        self._scrub_timer.setInterval(35)
+        self._scrub_timer.timeout.connect(self._render_scrubbed_frame)
         # Colour-scale mode. Radio buttons, not checkboxes: the three are
         # mutually exclusive, and as checkboxes they suggested combinations that
         # do not exist (ticking both "Static" and "Range" only ever meant
@@ -646,7 +575,7 @@ class ResultsPage(QWidget):
             f"color:{_C_TEXT2}; font-size:9px; font-style:italic;")
         cb_head_row.addWidget(self._colorbar_unit_lbl)
         sb_lay.addLayout(cb_head_row)
-        self._colorbar = _ColorBar()
+        self._colorbar = ResultColorBar()
         sb_lay.addWidget(self._colorbar)
 
         sb_lay.addWidget(self._sep())
@@ -1042,35 +971,26 @@ class ResultsPage(QWidget):
         if idx < len(analysis.def_paths):
             path = analysis.def_paths[idx]
 
-            # Inline robust image loading
-            img = None
             try:
-                import cv2
-                img_cv = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                if img_cv is not None:
-                    img = img_cv.astype(np.float64) / 255.0
-            except Exception:
-                pass
-
-            if img is None:
-                try:
-                    from PIL import Image
-                    img = np.array(Image.open(path).convert("L"), dtype=np.float64) / 255.0
-                except Exception as e:
-                    print(f"Failed to load image {path}: {e}")
+                from src.core.analysis import _load_image
+                img = _load_image(path)
+            except Exception as e:
+                img = None
+                print(f"Failed to load image {path}: {e}")
 
             if img is not None:
-                # FORCE DEEP CONTIGUOUS COPY to prevent 0xC0000409 crash
-                safe_img = np.ascontiguousarray(img * 0.45, dtype=np.float64)
                 keep = self._canvas._image_arr is not None
-                self._canvas.set_image(safe_img, keep_view=keep)
+                # Dim only the pixmap; retain the compact float32 source for
+                # cursor values without allocating a second full image.
+                self._canvas.set_image(
+                    img, keep_view=keep, display_scale=0.45)
             else:
                 self._canvas.clear_result_overlay()
 
         # 2. ── Render field overlay ──────────────────────────────────
         result = analysis.results[idx]
         arr, _ = self._display_array(result)
-        if arr is not None and np.any(np.isfinite(arr)):
+        if arr is not None and finite_values(arr).size:
             # _apply_overlay internally checks if static_scale_chk is enabled
             self._apply_overlay(arr)
         else:
@@ -1110,10 +1030,9 @@ class ResultsPage(QWidget):
         arr, _ = self._display_array(results[idx])
         if arr is None:
             return
-        finite = np.isfinite(arr)
-        if not finite.any():
+        vals = finite_values(arr)
+        if not vals.size:
             return
-        vals = arr[finite]
         blocked = (self._range_min_spin.blockSignals(True),
                    self._range_max_spin.blockSignals(True))
         self._range_min_spin.setValue(float(vals.min()))
@@ -1202,7 +1121,7 @@ class ResultsPage(QWidget):
             # How much of the field the scale is actually showing. Reported
             # rather than inferred, so a trimmed scale is never mistaken for
             # the full data range.
-            finite = arr[np.isfinite(arr)]
+            finite = finite_values(arr)
             below = int(np.count_nonzero(finite < vmin))
             above = int(np.count_nonzero(finite > vmax))
             self._update_colorbar(render.get_cmap(cmap_name, 256), vmin, vmax,
@@ -1384,7 +1303,13 @@ class ResultsPage(QWidget):
 
     def _on_slider(self, val: int) -> None:
         self._frame = val
-        self._show_frame(val)
+        # Loading, colouring and uploading a full-resolution frame for every
+        # intermediate slider event makes scrubbing lag behind the pointer.
+        # Render the most recent position after a very short coalescing window.
+        self._scrub_timer.start()
+
+    def _render_scrubbed_frame(self) -> None:
+        self._show_frame(self._frame)
 
     def _sync_field_buttons(self) -> None:
         """Show only the buttons belonging to the selected category."""
@@ -1505,12 +1430,12 @@ class ResultsPage(QWidget):
 
         ref = analysis.reference_image
         if ref is not None:
-            safe_img = np.ascontiguousarray(ref * 0.45, dtype=np.float64)
             keep = self._canvas._image_arr is not None
-            self._canvas.set_image(safe_img, keep_view=keep)
+            self._canvas.set_image(
+                ref, keep_view=keep, display_scale=0.45)
 
         arr, _ = self._display_array(res)
-        if arr is not None and np.any(np.isfinite(arr)):
+        if arr is not None and finite_values(arr).size:
             self._apply_overlay(arr)
         else:
             self._canvas.set_result_overlay_rgba(None)

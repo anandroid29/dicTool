@@ -60,13 +60,6 @@ class Calibration:
             return cls(None, unit if unit in LENGTH_UNITS else "mm")
         return cls(float(value) * LENGTH_UNITS[unit], unit)
 
-    @classmethod
-    def from_known_length(cls, pixels: float, length: float, unit: str) -> "Calibration":
-        """Calibrate from a feature of known size spanning `pixels` pixels."""
-        if not pixels or pixels <= 0:
-            return cls(None, unit)
-        return cls.from_pixel_size(float(length) / float(pixels), unit)
-
     @property
     def calibrated(self) -> bool:
         return self.metres_per_pixel is not None and self.metres_per_pixel > 0
@@ -126,10 +119,6 @@ class Calibration:
         if arr is None or factor == 1.0:
             return arr, unit
         return arr * factor, unit
-
-    def convert_value(self, field_key: str, value: float, base_unit: str = ""):
-        factor, unit = self.factor_and_unit(field_key, base_unit)
-        return (None if value is None else value * factor), unit
 
     # -- persistence ----------------------------------------------------------
     def to_dict(self) -> dict:

@@ -23,10 +23,12 @@ from src.core.units import Calibration
 from src.core.analysis import DICAnalysis
 from src.core.rg_dic import DICParams
 from src.ui.pages.params_page import ParamsPage
+from src.ui.pages.roi_page import ROIPage
 from src.ui.pages.dynamic_roi_page import DynamicROIPage
 from src.ui.pages.analysis_page import AnalysisPage
 from src.ui.pages.results_page import FIELDS, FIELD_GROUPS
-from src.ui.image_canvas import ROITool
+from src.ui.image_canvas import ROITool, _polyline_mask
+from src.ui.components import FooterButton
 from src.ui.pages.welcome_page import ImageLoadSettingsDialog
 from src.ui.video_importer import VideoImporterDialog
 
@@ -198,6 +200,95 @@ class ImportCalibrationUITests(unittest.TestCase):
         self.assertTrue(page._tool_buttons[ROITool.POLYGON].isChecked())
         self.assertEqual(page._canvas._tool, ROITool.POLYGON)
         page.close()
+
+    def test_roi_page_requires_and_preserves_spatial_strain_origin(self):
+        analysis = object.__new__(DICAnalysis)
+        analysis.params = DICParams(dynamic_roi="None")
+        analysis.results = []
+        analysis._ref_image = np.zeros((12, 14), dtype=float)
+        analysis.def_paths = []
+        analysis._roi_mask = np.zeros((12, 14), dtype=bool)
+        analysis._roi_mask[1:-1, 1:-1] = True
+        analysis._strain_origin_mask = None
+        analysis.strain_start_frame = 0
+        analysis.dynamic_include_mask = None
+        analysis.dynamic_exclude_mask = None
+
+        class Wizard:
+            seed_xy = None
+            def __init__(self, model): self.analysis = model
+            def go_welcome(self): pass
+            def go_after_roi(self): pass
+
+        page = ROIPage(Wizard(analysis))
+        page.on_enter()
+        self.assertIsNone(page._canvas._image_u8)
+        self.assertIsNone(page._canvas._image_qimg)
+        self.assertFalse(page._next_btn.isEnabled())
+        self.assertTrue(page._tool_btns[ROITool.RECTANGLE].isChecked())
+        self.assertEqual(page._canvas._tool, ROITool.RECTANGLE)
+
+        page._origin_channel_btn.click()
+        self.assertEqual(page._canvas._tool, ROITool.POLYLINE)
+        self.assertFalse(page._tool_btns[ROITool.POLYLINE].isHidden())
+        self.assertTrue(page._tool_btns[ROITool.RECTANGLE].isHidden())
+        self.assertTrue(page._finish_line_btn.isHidden())
+        self.assertFalse(page._next_btn.isHidden())
+        self.assertIsInstance(page._finish_line_btn, FooterButton)
+        footer_layout = page._finish_line_btn.parentWidget().layout()
+        self.assertIs(footer_layout.itemAt(footer_layout.count() - 1).widget(),
+                      page._finish_line_btn)
+        self.assertGreaterEqual(page._finish_line_btn.minimumWidth(), 120)
+        self.assertTrue(np.array_equal(
+            page._canvas._context_mask, analysis.roi_mask))
+        self.assertIsNotNone(page._canvas._context_px)
+        self.assertIs(page._canvas._context_px, page._canvas._roi_px)
+        self.assertIsNone(page._canvas._context_rgba)
+        self.assertIsNone(page._canvas._roi_rgba)
+        self.assertTrue(np.array_equal(
+            page._canvas._constraint_mask, analysis.roi_mask))
+
+        from PyQt6.QtCore import QPointF
+        page._canvas._poly_pts = [QPointF(2, 3), QPointF(10, 3)]
+        page._canvas.shape_drawing_changed.emit(True)
+        self.assertFalse(page._finish_line_btn.isHidden())
+        self.assertTrue(page._next_btn.isHidden())
+        page._finish_line_btn.click()
+        self.assertTrue(analysis.strain_origin_mask[3, 2:11].all())
+        self.assertEqual(page._canvas._poly_pts, [])
+        self.assertTrue(page._finish_line_btn.isHidden())
+        self.assertFalse(page._next_btn.isHidden())
+
+        origin = np.zeros((12, 14), dtype=bool)
+        origin[1:-1, 2] = True
+        page._on_roi_changed(origin)
+        self.assertTrue(page._origin_channel_btn.isChecked())
+        self.assertTrue(np.array_equal(analysis.strain_origin_mask, origin))
+        self.assertTrue(page._next_btn.isEnabled())
+
+        crossing = np.zeros((12, 14), dtype=bool)
+        crossing[5, :] = True
+        page._canvas._roi_mask = None
+        page._canvas._merge_mask(crossing)
+        self.assertFalse(analysis.strain_origin_mask[5, 0])
+        self.assertFalse(analysis.strain_origin_mask[5, -1])
+        self.assertTrue(analysis.strain_origin_mask[5, 1:-1].all())
+        page._canvas.release_display_buffers()
+        self.assertIsNone(page._canvas._image_px)
+        self.assertIsNone(page._canvas._roi_px)
+        self.assertIsNone(page._canvas.roi_mask)
+        page.close()
+
+    def test_strain_origin_polyline_is_open_and_one_pixel_wide(self):
+        from PyQt6.QtCore import QPointF
+        points = [QPointF(2, 2), QPointF(8, 2), QPointF(8, 7)]
+
+        mask = _polyline_mask(points, 12, 14)
+
+        self.assertTrue(mask[2, 2:9].all())
+        self.assertTrue(mask[2:8, 8].all())
+        self.assertFalse(mask[7, 2])  # no closing segment
+        self.assertLessEqual(int(mask.sum()), 13)
 
     def test_parameters_preview_uses_dynamic_reference_mask(self):
         analysis = object.__new__(DICAnalysis)

@@ -34,27 +34,24 @@ class DynamicROICoordinateTests(unittest.TestCase):
         self.assertFalse(preview[10, 22])
         self.assertFalse(np.any(preview & ~static))
 
-    def test_translating_material_samples_mask_at_advected_position(self):
+    def test_each_pair_samples_from_its_own_previous_frame_grid(self):
         shape = (9, 24)
         points = np.zeros(shape, dtype=bool)
         points[4, 3:9] = True
         inc_u = np.where(points, 2.0, np.nan)
         inc_v = np.where(points, 0.0, np.nan)
-        prior_u = np.full(shape, np.nan)
-        prior_v = np.full(shape, np.nan)
-
         for frame in range(6):
             current = np.zeros(shape, dtype=bool)
-            start = 3 + 2 * (frame + 1)
+            # Every iteration represents a new previous->current pair. The
+            # source centres are spatially fresh, so only this pair's +2 px
+            # displacement belongs in the coordinate transform.
+            start = 5
             current[4, start:start + 6] = True
             valid = _dynamic_measurement_mask(
-                points, current, inc_u, inc_v,
-                prior_u=prior_u, prior_v=prior_v)
+                points, current, inc_u, inc_v)
             self.assertTrue(valid[points].all(), frame)
-            prior_u[points] = 2.0 * (frame + 1)
-            prior_v[points] = 0.0
 
-    def test_reference_overrides_follow_material_and_include_wins(self):
+    def test_source_grid_overrides_apply_each_pair_and_include_wins(self):
         shape = (7, 12)
         points = np.zeros(shape, dtype=bool)
         points[3, 2:5] = True

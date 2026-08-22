@@ -19,8 +19,8 @@ results.
 |---|---|
 | Displacement `u`, `v`, magnitude | Motion from the immediately previous frame to the current frame; it is not accumulated |
 | Velocity `Vx`, `Vy`, effective velocity | Immediate displacement divided by the frame interval |
-| Strain `Exx`, `Eyy`, `Exy` | Green–Lagrange strain increments accumulated frame by frame |
-| Equivalent strain | Sum of the non-negative equivalent magnitude of each strain increment |
+| Strain `Exx`, `Eyy`, `Exy` | Material-path strain since the point crossed the selected strain-origin line; Green–Lagrange components come from composed incremental deformation gradients |
+| Equivalent strain | Non-negative path integral of equivalent strain rate; it never decreases along a valid material path |
 | Strain rate | Instantaneous symmetric spatial gradient of the velocity field; it is not obtained by differentiating accumulated strain in time |
 
 `Exy` is tensor shear strain, not engineering shear (`Gxy = 2 Exy`). The
@@ -32,7 +32,8 @@ with the out-of-plane term inferred from plastic incompressibility.
 - Import an ordered image folder, extract frames from a video, or reopen an HDF5
   analysis session.
 - Draw or load a static ROI using rectangle, circle, polygon, eraser, and full-ROI
-  tools, then place the propagation seed.
+  tools, choose the zero-strain frame, draw the continuously seeding strain-origin
+  region, then place the correlation propagation seed.
 - Optionally refine the static ROI on every frame with Contrast, Edge Detection,
   or Hybrid dynamic ROI masking.
 - Run reliability-guided IC-GN DIC on the CPU or use optional CuPy acceleration.
@@ -105,7 +106,9 @@ skipped when its mode is **None**.
 Choose one of the following sources:
 
 - **Video:** select a video, choose frame extraction settings and the reference
-  frame, and optionally set the physical size represented by one pixel.
+  frame, and optionally set the physical size represented by one pixel. Analysis
+  proceeds chronologically through frames following that reference; earlier
+  extracted frames are not spliced into the forward pair sequence.
 - **Image folder:** images are sorted by filename. Configure sampling, frame
   rate, an optional ROI-mask file, and pixel-to-length calibration. A file with
   `roi` in its name is offered as the ROI mask rather than as a specimen frame.
@@ -116,9 +119,20 @@ rate. When no reliable rate is available, PyDIC uses an interval of one second.
 
 ### 2. Static ROI
 
-Draw the material region that is eligible for analysis, load a binary mask, or
-use the complete image. Place the seed in a well-textured part of that ROI.
-Subset centres outside the static ROI are never admitted by Dynamic ROI.
+Choose the full-sequence frame on which accumulated strain is zero. The canvas
+shows that frame while masks are drawn. Draw the material region eligible for
+pairwise analysis, load a binary mask, or use the complete image. Place the
+correlation seed in a well-textured part of that ROI.
+
+Use the **ROI / ε₀** channel buttons to switch between the blue analysis ROI and
+the amber strain-origin line/curve. The main ROI remains visible in blue while
+the origin is drawn, and the line is clipped to stay inside it. The origin is an
+inlet or wall cross-section through which material paths continuously begin at
+zero accumulated strain. It is sampled on every frame from the selected start frame onward, so
+new material entering later is included. A thin wall is snapped to the nearest
+measurable DIC subset layer. Both masks are required by the GUI.
+
+Subset centres outside the analysis ROI are never admitted by Dynamic ROI.
 
 Choose the Dynamic ROI mode here:
 
@@ -129,11 +143,12 @@ Choose the Dynamic ROI mode here:
 
 ### 3. Dynamic ROI (optional)
 
-Dynamic ROI is a per-frame texture filter for the material points selected by the
-static ROI. Its scoring normalization and automatic Otsu threshold are calibrated
-on the reference frame, then the same rule is applied at each point's advected
-position on later frames; the original ROI is not reused as a stationary image
-crop. The threshold does not drift to fit each image independently.
+Dynamic ROI is a per-frame texture filter inside the analysis ROI. Its scoring
+normalization and automatic Otsu threshold are calibrated on the selected
+zero-strain frame. For every adjacent pair, its current-frame mask is sampled at
+the source subset centre plus that pair's displacement. No frame-0 survival or
+accumulated displacement is involved, and the threshold does not drift to fit
+each image independently.
 
 Available controls are:
 
@@ -144,13 +159,14 @@ Available controls are:
   of the largest retained region.
 - **Fill enclosed holes:** restore rejected islands completely enclosed by a
   retained material region.
-- **Include / Exclude overrides:** draw persistent, material-attached rectangle,
-  polygon, or circle overrides. Include wins if both channels overlap.
+- **Include / Exclude overrides:** draw persistent image-space rectangle,
+  polygon, or circle overrides for each adjacent pair. Include wins if both
+  channels overlap.
 
-The reference preview shown here is also used by the Parameters preview and by
-the first Analysis-page ROI display. Later Analysis frames show their own
-measured dynamic masks. A point hidden or lost on one frame may become valid
-again later.
+The selected zero-strain-frame preview shown here is also used by the Parameters
+preview. Later Analysis frames show their own measured pairwise masks. A failed
+point in one interval does not disable the corresponding image location in later
+intervals.
 
 ### 4. Parameters
 
@@ -189,16 +205,30 @@ and feature scale; the defaults are starting points, not universal settings.
 
 ### 5. Analysis
 
-PyDIC tracks each current frame from the immediately previous one. Integer-pixel
-NCC provides or repairs an initial guess, IC-GN refines it to sub-pixel precision,
-and a reliability-guided wavefront propagates good solutions through the ROI.
-The previous interval also supplies temporal warm starts.
+PyDIC tracks each current frame from the immediately previous one on a fresh
+spatial grid. Integer-pixel NCC provides or repairs an initial guess, IC-GN
+refines it to sub-pixel precision, and a reliability-guided wavefront propagates
+good solutions through the ROI. The previous interval may supply numerical CPU
+or GPU warm starts, but never determines which points are eligible or valid.
 
-Before gradients or strain accumulation, measurements that are outside the
+Before gradients or strain transport, measurements that are outside the
 current frame, rejected by Dynamic ROI, non-finite, or otherwise invalid are
 converted to missing values. Gradient fitting and dropout recovery are restricted
 to connected valid material regions so smoothing does not bridge cuts or bleed
 background values into the specimen.
+
+After each pair is measured, material states are continuously injected through
+the strain-origin region. Pair displacement advects each state and the measured
+displacement gradient updates it. A path ends if the necessary pair measurement
+is unavailable or it leaves the ROI; this never removes pairwise displacement,
+velocity, or strain-rate measurements from future frames.
+
+Accumulated-strain coverage is persistent and swept: once a valid material path
+reaches a DIC grid element, that element remains populated on later strain
+frames. The moving front therefore expands the coloured region instead of making
+the existing coloured region translate or disappear. Its complete strain state
+is fixed at the first arrival: later material paths only populate grid elements
+that have never been encountered and cannot overwrite an existing value.
 
 Analysis may be cancelled. Completed frames remain available in the current
 session.
@@ -243,9 +273,10 @@ written with their applicable calibrated units.
 
 ### HDF5
 
-**HDF5 (all frames)** stores the complete result sequence, ROI, Dynamic ROI
-configuration and overrides, analysis backend, core grid/strain parameters,
-frame-rate information, calibration, and result-semantics metadata.
+**HDF5 (all frames)** stores the complete result sequence, analysis ROI,
+strain-origin mask and start frame, Dynamic ROI configuration and overrides,
+analysis backend, core grid/strain parameters, frame-rate information,
+calibration, and result-semantics metadata.
 HDF5 files can be loaded from the Import page without rerunning correlation.
 Source images are referenced by path rather than embedded, so keep them available
 if image backdrops are needed after moving the HDF5 file. Compatibility aliases
@@ -276,30 +307,27 @@ available video codecs.
    needed.
 4. Inverse-compositional Gauss–Newton minimizes ZNSSD for each circular subset.
 5. Reliability-guided propagation prioritizes the best converged subsets and
-   warm-starts neighbouring points.
-6. Local least-squares plane fits are applied to immediate displacement and
-   velocity fields. Invalid pixels are excluded, and separate material
-   components are fitted independently.
-7. Green–Lagrange strain increments are accumulated. Velocity and strain rate
-   remain interval quantities.
-
-For an immediate displacement gradient, the accumulated increment uses:
-
-```text
-Exx = du/dx + 0.5 * ((du/dx)^2 + (dv/dx)^2)
-Eyy = dv/dy + 0.5 * ((du/dy)^2 + (dv/dy)^2)
-Exy = 0.5 * (du/dy + dv/dx + du/dx*du/dy + dv/dx*dv/dy)
-```
-
-This implementation adds these component increments through time. It does not
-currently compose a total deformation gradient multiplicatively across frames.
+   warm-starts neighbouring points. Each new pair resets spatial eligibility;
+   previous-frame solver parameters are guesses only.
+6. Local least-squares plane fits are applied to immediate displacement fields.
+   Dividing by the frame interval gives velocity gradients and strain rate.
+   Invalid pixels are excluded, and disconnected material components are fitted
+   independently.
+7. Starting on the selected zero-strain frame, new material states are seeded
+   continuously through the strain-origin region.
+8. States sample the pair displacement and gradient at their current positions,
+   move to the next frame, and retain their own strain history.
+9. Signed infinitesimal components integrate the symmetric incremental gradient.
+   Green–Lagrange components are derived from the multiplicatively composed
+   deformation gradient. Equivalent accumulated strain integrates the
+   non-negative equivalent strain rate and therefore never decreases.
 
 ## Testing
 
 Run the automated test suite from the repository root:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest tests -q
 ```
 
 The `tests/` directory also contains manual and hardware-dependent verification
@@ -317,9 +345,9 @@ frames.
   and enough subset support inside the ROI.
 - Dynamic ROI is a texture heuristic, not material segmentation. Inspect its
   reference preview and use manual overrides where needed.
-- A point that appears late or returns without enough intact neighbouring history
-  may be rebased. It can contribute again, but its accumulated history may not
-  represent an unbroken path from the original reference frame.
+- Accumulated strain exists only along continuously valid paths that crossed the
+  selected strain-origin region. A lost path is terminated rather than having a
+  missing strain increment fabricated; continuous seeding supplies later paths.
 - Second-order shape functions are CPU-only in the current implementation.
 - Long, high-resolution sequences retain result fields for every completed frame
   and can still require substantial system memory. GPU temporary-memory pools are
@@ -346,7 +374,7 @@ PyDIC/
         |   |-- ncc.py            Integer-pixel initial search
         |   |-- rg_dic.py         CPU reliability-guided DIC and parameters
         |   |-- strain.py         Gradient fitting and strain-rate calculation
-        |   |-- strain_accum.py   Immediate-frame tracking and strain accumulation
+        |   |-- strain_accum.py   Continuous material-path strain transport
         |   `-- units.py          Spatial calibration and unit conversion
         `-- ui/
             |-- wizard.py         Six-stage application workflow
