@@ -14,18 +14,24 @@ from PyQt6.QtWidgets import (
     QPushButton, QProgressBar, QFrame, QSizePolicy,
 )
 
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_DANGER, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2
+
+_C_ACCENT = C_ACCENT
+_C_BORDER = C_BORDER
+_C_CARD = C_CARD
+_C_DANGER = C_DANGER
+_C_SUCCESS = C_SUCCESS
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+
+
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 
 
-_C_SURFACE = "#0e1c2e"
-_C_CARD    = "#132035"
-_C_BORDER  = "#1e3a5a"
-_C_ACCENT  = "#3b82f6"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_SUCCESS = "#10b981"
-_C_DANGER  = "#ef4444"
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +93,7 @@ class AnalysisPage(QWidget):
                                         QSizePolicy.Policy.Expanding)
         self._preview_lbl.setStyleSheet(
             f"background:{_C_CARD}; border:1px solid {_C_BORDER}; "
-            f"border-radius:8px; color:{_C_TEXT2}; font-size:13px;"
+            f"border-radius:3px; color:{_C_TEXT2}; font-size:13px;"
         )
         self._preview_lbl.setText("Preparing…")
         body_lay.addWidget(self._preview_lbl, 1)
@@ -414,7 +420,7 @@ def _stat_label(title: str, value: str) -> QWidget:
     w = QWidget()
     w.setStyleSheet(
         f"background:{_C_CARD}; border:1px solid {_C_BORDER}; "
-        f"border-radius:8px; padding:8px 20px;"
+        f"border-radius:3px; padding:8px 20px;"
     )
     lay = QVBoxLayout(w)
     lay.setContentsMargins(0, 0, 0, 0)

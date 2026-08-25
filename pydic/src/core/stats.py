@@ -70,11 +70,19 @@ def field_summary(values: np.ndarray) -> Optional[dict]:
         return None
 
     finite = finite.astype(np.float64, copy=False)
-    q1, med, q3 = (np.percentile(finite, [25, 50, 75])
-                   if finite.size >= 4 else (np.nan, float(np.median(finite)), np.nan))
+
+    # One percentile call for every quantile needed, not one per group. Each
+    # call runs its own O(n) partition over the whole field, and this runs on
+    # every rendered frame -- two calls doubled the cost of the statistics
+    # panel for no benefit, since the quantiles come from the same data.
     if finite.size >= MIN_SAMPLES_FOR_PERCENTILE:
-        p_low, p_high = np.percentile(finite, [1, 99])
+        p_low, q1, med, q3, p_high = np.percentile(finite, [1, 25, 50, 75, 99])
+    elif finite.size >= 4:
+        q1, med, q3 = np.percentile(finite, [25, 50, 75])
+        p_low, p_high = float(finite.min()), float(finite.max())
     else:
+        q1 = q3 = np.nan
+        med = float(np.median(finite))
         p_low, p_high = float(finite.min()), float(finite.max())
 
     return {

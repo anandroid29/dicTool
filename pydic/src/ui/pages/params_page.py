@@ -19,19 +19,25 @@ if TYPE_CHECKING:
 
 from src.ui.image_canvas import ImageCanvas
 
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+
+_C_ACCENT = C_ACCENT
+_C_BORDER = C_BORDER
+_C_CARD = C_CARD
+_C_SUCCESS = C_SUCCESS
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+_C_TEXT3 = C_TEXT3
+
+
 # Do not import CuPy or touch a CUDA device while constructing the UI. On a
 # working installation that alone creates a large context. The analysis worker
 # performs authoritative driver/device validation when GPU execution is chosen.
 _HAS_GPU = importlib.util.find_spec("cupy") is not None
 
-_C_SURFACE = "#0e1c2e"
-_C_CARD    = "#132035"
-_C_BORDER  = "#1e3a5a"
-_C_ACCENT  = "#3b82f6"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_TEXT3   = "#475569"
-_C_SUCCESS = "#10b981"
 
 
 def _section_label(text: str) -> QLabel:
@@ -208,7 +214,7 @@ class ParamsPage(QWidget):
         self._strain_warn.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self._strain_warn.setMinimumHeight(46)
-        self._strain_warn.setStyleSheet("color:#f59e0b; font-size:11px;")
+        self._strain_warn.setStyleSheet("color:#c2954f; font-size:11px;")
         self._strain_warn.setVisible(False)
         right_lay.addWidget(self._strain_warn)
 
@@ -218,8 +224,8 @@ class ParamsPage(QWidget):
         # --- PASTE THIS NEW BLOCK RIGHT HERE ---
         reset_btn = QPushButton("Reset to Defaults")
         reset_btn.setStyleSheet(
-            "background: #132035; color: #94a3b8; border: 1px solid #1e3a5a; "
-            "padding: 6px; border-radius: 4px;"
+            "background: #282b2e; color: #94a3b8; border: 1px solid #3c4247; "
+            "padding: 6px; border-radius:3px;"
         )
         reset_btn.setFixedHeight(32)
         reset_btn.clicked.connect(self._reset_defaults)
@@ -271,7 +277,7 @@ class ParamsPage(QWidget):
         self._order_note.setWordWrap(True)
         self._order_note.setStyleSheet(
             f"color:{_C_TEXT2}; font-size:10px; background:{_C_CARD};"
-            f" border:1px solid {_C_BORDER}; border-radius:4px; padding:6px;")
+            f" border:1px solid {_C_BORDER}; border-radius:3px; padding:6px;")
         self._order_note.setVisible(False)
         right_lay.addWidget(self._order_note)
 
@@ -333,8 +339,8 @@ class ParamsPage(QWidget):
         if _HAS_GPU:
             self._gpu_chk.setChecked(bool(getattr(self._wizard, "use_gpu", True)))
             self._gpu_chk.setStyleSheet(
-                f"QPushButton:checked {{ background: {_C_ACCENT}; color: white; border: 1px solid {_C_ACCENT}; border-radius: 6px; padding: 0 12px; }}"
-                f"QPushButton:!checked {{ background: transparent; color: {_C_TEXT2}; border: 1px solid {_C_BORDER}; border-radius: 6px; padding: 0 12px; }}"
+                f"QPushButton:checked {{ background: {_C_ACCENT}; color: white; border: 1px solid {_C_ACCENT}; border-radius:3px; padding: 0 12px; }}"
+                f"QPushButton:!checked {{ background: transparent; color: {_C_TEXT2}; border: 1px solid {_C_BORDER}; border-radius:3px; padding: 0 12px; }}"
             )
             self._gpu_chk.setToolTip(
                 "CuPy is installed. The NVIDIA device is checked when analysis starts.")
@@ -342,7 +348,7 @@ class ParamsPage(QWidget):
             self._gpu_chk.setChecked(False)
             self._gpu_chk.setEnabled(False)
             self._gpu_chk.setStyleSheet(
-                f"background: transparent; color: {_C_BORDER}; border: 1px solid {_C_BORDER}; border-radius: 6px; padding: 0 12px;"
+                f"background: transparent; color: {_C_BORDER}; border: 1px solid {_C_BORDER}; border-radius:3px; padding: 0 12px;"
             )
             self._gpu_chk.setToolTip("No compatible NVIDIA GPU or CuPy installation detected.")
 
@@ -528,7 +534,7 @@ class ParamsPage(QWidget):
         # The GPU wavefront solver has no 12-parameter path; it would silently
         # keep running first order, so say so rather than let it look applied.
         if self._gpu_chk.isChecked():
-            msgs.append("<b style='color:#f59e0b;'>GPU solver does not support "
+            msgs.append("<b style='color:#c2954f;'>GPU solver does not support "
                         "2nd order</b> — it will run 1st order. Turn off GPU "
                         "acceleration to use it.")
         msgs.append("2nd order lowers systematic error where strain curves "

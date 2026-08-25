@@ -19,14 +19,20 @@ from PyQt6.QtWidgets import (
 from src.ui.render import PanelSpec, RangeSpec, BACKGROUND_CHOICES
 from src.ui.video_export import ExportSpec, CODECS
 
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_BORDER, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+
+_C_BORDER = C_BORDER
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+_C_TEXT3 = C_TEXT3
+
+
 if TYPE_CHECKING:
     pass
 
-_C_SURFACE = "#0e1c2e"
-_C_BORDER  = "#1e3a5a"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_TEXT3   = "#475569"
 _C_DISABLED = "#3f4a5c"
 
 CONTENTS = [("Result field", "field"),
@@ -153,7 +159,7 @@ class _PanelEditor(QWidget):
         fg = "#000" if (r * 299 + g * 587 + b * 114) / 1000 > 128 else "#fff"
         self.colour_btn.setStyleSheet(
             f"QPushButton {{ background:rgb({r},{g},{b}); color:{fg}; "
-            f"border:1px solid {_C_BORDER}; border-radius:4px; padding:4px 8px; }} "
+            f"border:1px solid {_C_BORDER}; border-radius:3px; padding:4px 8px; }} "
             f"QPushButton:disabled {{ background:{_C_SURFACE}; color:{_C_DISABLED}; }}")
 
     def _pick_colour(self):

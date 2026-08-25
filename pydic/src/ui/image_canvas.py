@@ -826,10 +826,10 @@ class ImageCanvas(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(
             QPainter.RenderHint.SmoothPixmapTransform, not self._fast_paint)
-        painter.fillRect(self.rect(), QColor("#0d1117"))
+        painter.fillRect(self.rect(), QColor("#1a1c1e"))
 
         if self._image_px is None:
-            painter.setPen(QColor("#484f58"))
+            painter.setPen(QColor("#6b7378"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Load a reference image to begin")
             return
 
@@ -959,7 +959,7 @@ class ImageCanvas(QWidget):
                 elif self._rect_edit is not None:
                     extra = "  EDIT RECT — drag handle · drag interior=move · ↵=done"
                 txt = f"  x={int(x)}  y={int(y)}  I={val:.3f}  zoom={self._zoom:.2f}×{extra}"
-                painter.setPen(QColor("#8b949e"))
+                painter.setPen(QColor("#a2a8ad"))
                 painter.drawText(4, self.height() - 6, txt)
 
     def _paint_roi_preview(self, painter: QPainter) -> None:
@@ -1013,7 +1013,7 @@ class ImageCanvas(QWidget):
         for i in range(n if n >= 3 else n - 1):
             a, b = cpts[i], cpts[(i + 1) % n]
             painter.drawLine(a, b)
-            painter.setPen(QPen(QColor(0, 229, 255, 180), 1)); painter.setBrush(QBrush(QColor("#161B22")))
+            painter.setPen(QPen(QColor(0, 229, 255, 180), 1)); painter.setBrush(QBrush(QColor("#1a1c1e")))
             painter.drawEllipse(QPointF((a.x() + b.x()) / 2, (a.y() + b.y()) / 2), 4.0, 4.0)
             painter.setPen(edge_pen)
         font = QFont("Courier", 7, QFont.Weight.Bold)
@@ -1024,7 +1024,7 @@ class ImageCanvas(QWidget):
             painter.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 55), 6))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(cp, r + 4, r + 4)
-            painter.setPen(QPen(col, 2)); painter.setBrush(QBrush(QColor("#0d1117")))
+            painter.setPen(QPen(col, 2)); painter.setBrush(QBrush(QColor("#1a1c1e")))
             painter.drawEllipse(cp, r, r)
             painter.setPen(QPen(col)); painter.setFont(font)
             painter.drawText(QRect(int(cp.x()) - 8, int(cp.y()) - 8, 16, 16), Qt.AlignmentFlag.AlignCenter, str(i + 1))
@@ -1038,7 +1038,7 @@ class ImageCanvas(QWidget):
         painter.drawRect(QRectF(wx0, wy0, wx1 - wx0, wy1 - wy0))
         for h in _rect_handles(re.rect):
             cx, cy = h.x() * self._zoom + self._pan_x, h.y() * self._zoom + self._pan_y
-            painter.setPen(QPen(self._HANDLE_COLOR, 1.5)); painter.setBrush(QBrush(QColor("#0d1117")))
+            painter.setPen(QPen(self._HANDLE_COLOR, 1.5)); painter.setBrush(QBrush(QColor("#1a1c1e")))
             painter.drawRect(QRectF(cx - float(HANDLE_HALF), cy - float(HANDLE_HALF), float(HANDLE_HALF) * 2, float(HANDLE_HALF) * 2))
 
     # ─────────────────────────────────────────────────────────────────────

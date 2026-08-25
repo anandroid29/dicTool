@@ -21,32 +21,38 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
 )
 
-_C_SURFACE = "#0e1c2e"
-_C_CARD    = "#132035"
-_C_RAISED  = "#1a2d47"
-_C_BORDER  = "#1e3a5a"
-_C_ACCENT  = "#3b82f6"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_TEXT3   = "#475569"
-_C_WARN    = "#f59e0b"
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_RAISED, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
+
+_C_ACCENT = C_ACCENT
+_C_BORDER = C_BORDER
+_C_CARD = C_CARD
+_C_RAISED = C_RAISED
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+_C_TEXT3 = C_TEXT3
+_C_WARN = C_WARNING
+
+
 
 _BTN = (
     f"QPushButton {{ background:{_C_CARD}; color:{_C_TEXT}; "
-    f"border:1px solid {_C_BORDER}; border-radius:5px; font-size:11px; "
+    f"border:1px solid {_C_BORDER}; border-radius:3px; font-size:11px; "
     f"padding:5px 12px; }} "
     f"QPushButton:hover {{ background:{_C_RAISED}; }} "
     f"QPushButton:disabled {{ color:{_C_TEXT3}; }}"
 )
 _BTN_ACCENT = (
     f"QPushButton {{ background:{_C_ACCENT}; color:#fff; border:none; "
-    f"border-radius:5px; font-size:12px; font-weight:700; padding:6px 18px; }} "
-    f"QPushButton:hover {{ background:#60a5fa; }} "
+    f"border-radius:3px; font-size:12px; font-weight:700; padding:6px 18px; }} "
+    f"QPushButton:hover {{ background:#74a6c9; }} "
     f"QPushButton:disabled {{ background:{_C_CARD}; color:{_C_TEXT3}; }}"
 )
 _SPIN = (
     f"QSpinBox {{ background:{_C_CARD}; color:{_C_TEXT}; "
-    f"border:1px solid {_C_BORDER}; border-radius:4px; padding:4px 6px; "
+    f"border:1px solid {_C_BORDER}; border-radius:3px; padding:4px 6px; "
     f"font-size:11px; }}"
 )
 
@@ -65,11 +71,11 @@ class FramePairDialog(QDialog):
             f"QDialog {{ background:{_C_SURFACE}; }} "
             f"QLabel {{ color:{_C_TEXT}; font-size:11px; }} "
             f"QGroupBox {{ color:{_C_TEXT2}; font-size:10px; font-weight:700; "
-            f"  border:1px solid {_C_BORDER}; border-radius:6px; "
+            f"  border:1px solid {_C_BORDER}; border-radius:3px; "
             f"  margin-top:8px; padding-top:12px; }} "
             f"QGroupBox::title {{ subcontrol-origin:margin; left:8px; }} "
             f"QListWidget {{ background:{_C_CARD}; color:{_C_TEXT}; "
-            f"  border:1px solid {_C_BORDER}; border-radius:4px; font-size:11px; }} "
+            f"  border:1px solid {_C_BORDER}; border-radius:3px; font-size:11px; }} "
             f"QListWidget::item {{ padding:4px 6px; }} "
             f"QListWidget::item:selected {{ background:{_C_RAISED}; "
             f"  border-left:2px solid {_C_ACCENT}; }}"

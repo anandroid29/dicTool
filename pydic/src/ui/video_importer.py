@@ -120,8 +120,8 @@ class _PreviewLabel(QLabel):
         self.setMinimumSize(240, 135)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet(
-            "background:#0d1117; border:1px solid #30363d; border-radius:6px;"
-            "color:#484f58; font-size:11px;"
+            "background:#1a1c1e; border:1px solid #3c4247; border-radius:3px;"
+            "color:#6b7378; font-size:11px;"
         )
         self.setText("No preview")
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
@@ -148,28 +148,28 @@ class _PreviewLabel(QLabel):
 # ---------------------------------------------------------------------------
 
 _BTN = (
-    "QPushButton { background:#21262d; color:#c9d1d9; border:1px solid #30363d; "
-    "border-radius:5px; font-size:11px; padding:4px 12px; } "
-    "QPushButton:hover { background:#2d333b; color:#e6edf3; border-color:#8b949e; } "
-    "QPushButton:pressed { background:#161b22; }"
+    "QPushButton { background:#212426; color:#e6e8ea; border:1px solid #3c4247; "
+    "border-radius:3px; font-size:11px; padding:4px 12px; } "
+    "QPushButton:hover { background:#31353a; color:#e6e8ea; border-color:#a2a8ad; } "
+    "QPushButton:pressed { background:#1a1c1e; }"
 )
 _BTN_ACCENT = (
-    "QPushButton { background:#2f81f7; color:#fff; border:none; "
-    "border-radius:5px; font-size:12px; font-weight:700; padding:6px 16px; } "
-    "QPushButton:hover { background:#388bfd; } "
-    "QPushButton:pressed { background:#1f6feb; } "
-    "QPushButton:disabled { background:#21262d; color:#484f58; }"
+    "QPushButton { background:#5a8cb0; color:#fff; border:none; "
+    "border-radius:3px; font-size:12px; font-weight:700; padding:6px 16px; } "
+    "QPushButton:hover { background:#74a6c9; } "
+    "QPushButton:pressed { background:#41697f; } "
+    "QPushButton:disabled { background:#212426; color:#6b7378; }"
 )
 _SPIN = (
-    "QSpinBox, QDoubleSpinBox { background:#21262d; color:#e6edf3; "
-    "border:1px solid #30363d; "
-    "border-radius:5px; padding:3px 6px; font-size:11px; } "
+    "QSpinBox, QDoubleSpinBox { background:#212426; color:#e6e8ea; "
+    "border:1px solid #3c4247; "
+    "border-radius:3px; padding:3px 6px; font-size:11px; } "
     "QSpinBox::up-button, QSpinBox::down-button, "
     "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button "
     "{ border:none; width:16px; }"
 )
-_LABEL_DIM = "color:#8b949e; font-size:11px;"
-_LABEL_PRI = "color:#e6edf3; font-size:11px;"
+_LABEL_DIM = "color:#a2a8ad; font-size:11px;"
+_LABEL_PRI = "color:#e6e8ea; font-size:11px;"
 
 
 class VideoImporterDialog(QDialog):
@@ -189,26 +189,26 @@ class VideoImporterDialog(QDialog):
         self.setMinimumWidth(520)
         self.setModal(True)
         self.setStyleSheet(
-            "QDialog { background:#0d1117; } "
-            "QGroupBox { color:#8b949e; font-size:10px; font-weight:700; "
+            "QDialog { background:#1a1c1e; } "
+            "QGroupBox { color:#a2a8ad; font-size:10px; font-weight:700; "
             "  text-transform:uppercase; letter-spacing:0.5px; "
-            "  border:1px solid #21262d; border-radius:6px; "
+            "  border:1px solid #212426; border-radius:3px; "
             "  margin-top:8px; padding-top:12px; } "
             "QGroupBox::title { subcontrol-origin:margin; left:8px; } "
-            "QLabel { color:#e6edf3; } "
-            "QLineEdit { background:#21262d; color:#e6edf3; border:1px solid #30363d; "
-            "  border-radius:5px; padding:4px 8px; font-size:11px; } "
-            "QCheckBox { color:#8b949e; font-size:11px; } "
-            "QCheckBox::indicator { width:13px; height:13px; border:1px solid #30363d; "
-            "  border-radius:3px; background:#21262d; } "
-            "QCheckBox::indicator:checked { background:#2f81f7; border-color:#2f81f7; } "
-            "QSlider::groove:horizontal { background:#21262d; height:5px; border-radius:3px; } "
-            "QSlider::handle:horizontal { background:#2f81f7; width:13px; height:13px; "
-            "  margin:-4px 0; border-radius:6px; } "
-            "QSlider::sub-page:horizontal { background:#1f4e8c; border-radius:3px; } "
-            "QProgressBar { background:#21262d; border:1px solid #30363d; border-radius:4px; "
+            "QLabel { color:#e6e8ea; } "
+            "QLineEdit { background:#212426; color:#e6e8ea; border:1px solid #3c4247; "
+            "  border-radius:3px; padding:4px 8px; font-size:11px; } "
+            "QCheckBox { color:#a2a8ad; font-size:11px; } "
+            "QCheckBox::indicator { width:13px; height:13px; border:1px solid #3c4247; "
+            "  border-radius:3px; background:#212426; } "
+            "QCheckBox::indicator:checked { background:#5a8cb0; border-color:#5a8cb0; } "
+            "QSlider::groove:horizontal { background:#212426; height:5px; border-radius:3px; } "
+            "QSlider::handle:horizontal { background:#5a8cb0; width:13px; height:13px; "
+            "  margin:-4px 0; border-radius:3px; } "
+            "QSlider::sub-page:horizontal { background:#41697f; border-radius:3px; } "
+            "QProgressBar { background:#212426; border:1px solid #3c4247; border-radius:3px; "
             "  height:8px; text-align:center; } "
-            "QProgressBar::chunk { background:#2f81f7; border-radius:4px; }"
+            "QProgressBar::chunk { background:#5a8cb0; border-radius:3px; }"
         )
 
         # State
@@ -244,7 +244,7 @@ class VideoImporterDialog(QDialog):
 
         # ── Title ──────────────────────────────────────────────────────
         title = QLabel("Import Video Frames")
-        title.setStyleSheet("color:#e6edf3; font-size:15px; font-weight:700;")
+        title.setStyleSheet("color:#e6e8ea; font-size:15px; font-weight:700;")
         root.addWidget(title)
 
         sub = QLabel("Extract individual frames from a video file for use as DIC images.")
@@ -337,8 +337,8 @@ class VideoImporterDialog(QDialog):
         self._px_unit_combo = QComboBox()
         self._px_unit_combo.addItems(LENGTH_UNIT_ORDER)
         self._px_unit_combo.setStyleSheet(
-            "QComboBox { background:#21262d; color:#e6edf3; "
-            "border:1px solid #30363d; border-radius:5px; padding:3px 6px; }")
+            "QComboBox { background:#212426; color:#e6e8ea; "
+            "border:1px solid #3c4247; border-radius:3px; padding:3px 6px; }")
         scale_row.addWidget(self._px_unit_combo)
         scale_row.addStretch()
         vlay.addLayout(scale_row)
@@ -487,7 +487,7 @@ class VideoImporterDialog(QDialog):
     def _separator(self) -> QFrame:
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color:#21262d;")
+        line.setStyleSheet("color:#212426;")
         return line
 
     # ------------------------------------------------------------------
@@ -587,7 +587,7 @@ class VideoImporterDialog(QDialog):
 
         if e < s:
             self._count_lbl.setText("Invalid range (End < Start)")
-            self._count_lbl.setStyleSheet("color:#ef4444; font-size:11px;")  # Red warning
+            self._count_lbl.setStyleSheet("color:#bf6259; font-size:11px;")  # Red warning
             self._ref_spin.setMaximum(0)
             if hasattr(self, '_extract_btn'):
                 self._extract_btn.setEnabled(False)

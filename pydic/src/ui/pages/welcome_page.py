@@ -20,16 +20,22 @@ if TYPE_CHECKING:
 from src.ui.components import FooterButton
 from src.ui.image_importer import ImageSequenceImporterDialog
 
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+
+_C_ACCENT = C_ACCENT
+_C_BG = C_BG
+_C_BORDER = C_BORDER
+_C_CARD = C_CARD
+_C_SUCCESS = C_SUCCESS
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+_C_TEXT3 = C_TEXT3
+
+
 # color shortcuts
-_C_BG      = "#08111d"
-_C_SURFACE = "#0e1c2e"
-_C_CARD    = "#132035"
-_C_BORDER  = "#1e3a5a"
-_C_ACCENT  = "#3b82f6"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_TEXT3   = "#475569"
-_C_SUCCESS = "#10b981"
 
 
 class _HDF5LoadWorker(QObject):
@@ -71,11 +77,11 @@ class _ImportCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._normal_style = (
             f"QFrame {{ background:{_C_CARD}; border:1px solid {_C_BORDER}; "
-            f"border-radius:14px; }}"
+            f"border-radius:3px; }}"
         )
         self._hover_style = (
-            f"QFrame {{ background:#172842; border:1px solid {_C_ACCENT}; "
-            f"border-radius:14px; }}"
+            f"QFrame {{ background:#31353a; border:1px solid {_C_ACCENT}; "
+            f"border-radius:3px; }}"
         )
         self.setStyleSheet(self._normal_style)
 
@@ -85,8 +91,8 @@ class _ImportCard(QFrame):
 
         kind = QLabel(source_type.upper())
         kind.setStyleSheet(
-            f"color:#93c5fd; background:#102a4c; border:1px solid #214f7f; "
-            "border-radius:5px; padding:3px 8px; font-size:9px; "
+            f"color:#74a6c9; background:#282b2e; border:1px solid #3c4247; "
+            "border-radius:3px; padding:3px 8px; font-size:9px; "
             "font-weight:700; letter-spacing:1px;")
         kind.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         lay.addWidget(kind, 0, Qt.AlignmentFlag.AlignLeft)
@@ -164,7 +170,7 @@ class WelcomePage(QWidget):
 
         product = QLabel("PYDIC  /  MEASUREMENT WORKSPACE")
         product.setStyleSheet(
-            f"color:#93c5fd; font-size:10px; font-weight:700; "
+            f"color:#74a6c9; font-size:10px; font-weight:700; "
             "letter-spacing:1.8px;")
         hero_lay.addWidget(product)
 
@@ -186,8 +192,8 @@ class WelcomePage(QWidget):
         for text in ("DISPLACEMENT", "VELOCITY", "STRAIN RATE", "STRAIN"):
             chip = QLabel(text)
             chip.setStyleSheet(
-                "color:#a9bdd4; background:#102239; border:1px solid #1d3d61; "
-                "border-radius:5px; padding:4px 9px; font-size:9px; "
+                "color:#a2a8ad; background:#282b2e; border:1px solid #3c4247; "
+                "border-radius:3px; padding:4px 9px; font-size:9px; "
                 "font-weight:650; letter-spacing:0.6px;")
             chip.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             capabilities.addWidget(chip)
@@ -248,7 +254,7 @@ class WelcomePage(QWidget):
         self._status_box.setMinimumHeight(96)
         self._status_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._status_box.setStyleSheet(
-            f"background:#0f2035; border:1px solid #245079; border-radius:12px;"
+            f"background:#0f2035; border:1px solid #245079; border-radius:3px;"
         )
         self._status_box.setVisible(False)
         status_lay = QVBoxLayout(self._status_box)
@@ -257,7 +263,7 @@ class WelcomePage(QWidget):
 
         status_title = QLabel("DATASET READY")
         status_title.setStyleSheet(
-            "color:#93c5fd; font-size:9px; font-weight:700; "
+            "color:#74a6c9; font-size:9px; font-weight:700; "
             "letter-spacing:1px; border:none;")
         status_lay.addWidget(status_title)
 
