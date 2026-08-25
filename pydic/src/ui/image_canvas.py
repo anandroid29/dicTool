@@ -675,7 +675,12 @@ class ImageCanvas(QWidget):
                 self._commit_polyline()
 
     def mouseMoveEvent(self, event) -> None:
-        self._begin_fast_paint()
+        # Nearest-neighbour scaling is useful while actively dragging a large
+        # image, but applying it to ordinary hover motion makes the canvas blur
+        # and then sharpen again after every pointer event.  Keep hover previews
+        # and zooming smooth; use the fast path only during a button drag.
+        if event.buttons() != Qt.MouseButton.NoButton:
+            self._begin_fast_paint()
         if (self._marker_mode and self._marker_drag and 0 <= self._marker_sel < len(self._markers)):
             ip = self._widget_to_image(event.position())
             if ip is not None and self._image_arr is not None:
@@ -777,7 +782,6 @@ class ImageCanvas(QWidget):
             elif self._tool == ROITool.ERASE: self._erase_pts = []
 
     def wheelEvent(self, event) -> None:
-        self._begin_fast_paint()
         delta  = event.angleDelta().y()
         factor = 1.15 if delta > 0 else 1.0 / 1.15
         pos    = event.position()
@@ -993,7 +997,7 @@ class ImageCanvas(QWidget):
             painter.drawEllipse(self._circ_centre, self._circ_radius, self._circ_radius)
 
         elif self._tool == ROITool.ERASE and self._mouse_img:
-            r = self._erase_radius / self._zoom
+            r = self._erase_image_radius()
             painter.setPen(QPen(self._ERASE_COLOR, 1.5 / self._zoom))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(self._mouse_img, r, r)
@@ -1118,14 +1122,19 @@ class ImageCanvas(QWidget):
 
     def _apply_erase(self) -> None:
         if self._image_arr is None or not self._erase_pts or self._roi_mask is None: return
-        H, W = self._image_arr.shape; r = self._erase_radius
+        H, W = self._image_arr.shape
+        r = self._erase_image_radius()
         for pt in self._erase_pts[-2:]:
-            cx, cy = int(pt.x()), int(pt.y())
-            y1, y2 = max(0, cy-r), min(H, cy+r+1)
-            x1, x2 = max(0, cx-r), min(W, cx+r+1)
+            cx, cy = pt.x(), pt.y()
+            y1, y2 = max(0, math.floor(cy-r)), min(H, math.ceil(cy+r)+1)
+            x1, x2 = max(0, math.floor(cx-r)), min(W, math.ceil(cx+r)+1)
             yg, xg = np.ogrid[y1:y2, x1:x2]
             self._roi_mask[y1:y2, x1:x2][(xg-cx)**2+(yg-cy)**2 <= r**2] = False
         self._rebuild_roi_pixmap(); self.roi_changed.emit(self._roi_mask.copy())
+
+    def _erase_image_radius(self) -> float:
+        """Return the fixed screen-space eraser radius in image pixels."""
+        return self._erase_radius / max(self._zoom, 1e-9)
 
     def _merge_mask(self, new_mask: np.ndarray) -> None:
         if self._constraint_mask is not None:

@@ -943,7 +943,12 @@ class ResultsPage(QWidget):
         self._unit_scale_cache.clear()
         # Markers are indexed against the previous run's displacement fields, so
         # they are meaningless for a new sequence.
-        self._canvas.clear_markers()
+        # Do this silently: clear_markers() emits markers_changed, whose slot
+        # renders frame 0 re-entrantly while this page is only half initialised.
+        # That nested QPixmap/render path caused Qt6Core fast-fail exits during
+        # the Analysis -> Results transition.
+        self._canvas.set_markers([])
+        self._canvas.set_streaklines(None)
         self._marker_list.clear()
         # Same reasoning for a stored pair average: its frame indices and its
         # arrays belong to the run that produced them. Keeping it across a

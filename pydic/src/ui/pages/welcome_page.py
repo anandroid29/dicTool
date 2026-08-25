@@ -4,22 +4,21 @@ welcome_page.py — Step 1: Import video or images
 from __future__ import annotations
 import os
 import json
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QObject, QEvent, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QObject, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QFrame, QSizePolicy,
-    QGroupBox, QSpinBox, QRadioButton, QDialog,
-    QDialogButtonBox, QComboBox, QMessageBox, QLineEdit,
-    QDoubleSpinBox, QProgressDialog
+    QMessageBox, QProgressDialog,
 )
 
-from src.core.units import Calibration, LENGTH_UNIT_ORDER
+from src.core.units import Calibration
 
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 from src.ui.components import FooterButton
+from src.ui.image_importer import ImageSequenceImporterDialog
 
 # color shortcuts
 _C_BG      = "#08111d"
@@ -58,59 +57,59 @@ class _HDF5LoadWorker(QObject):
             self.failed.emit(str(exc))
 
 
-class _FocusFilter(QObject):
-    def __init__(self, target_radio: QRadioButton, parent=None):
-        super().__init__(parent)
-        self._target = target_radio
-
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        try:
-            if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.FocusIn, QEvent.Type.Wheel):
-                if not self._target.isChecked():
-                    self._target.setChecked(True)
-        except Exception:
-            pass
-        return False
-
-
 class _ImportCard(QFrame):
     clicked = pyqtSignal()
 
-    def __init__(self, icon: str, title: str, subtitle: str, parent=None):
+    def __init__(self, source_type: str, title: str, subtitle: str,
+                 action: str, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.Box)
-        self.setFixedSize(220, 160)
+        self.setMinimumSize(230, 176)
+        self.setMaximumWidth(310)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._normal_style = (
             f"QFrame {{ background:{_C_CARD}; border:1px solid {_C_BORDER}; "
-            f"border-radius:12px; }} "
+            f"border-radius:14px; }}"
         )
         self._hover_style = (
-            f"QFrame {{ background:#1a2d47; border:2px solid {_C_ACCENT}; "
-            f"border-radius:12px; }} "
+            f"QFrame {{ background:#172842; border:1px solid {_C_ACCENT}; "
+            f"border-radius:14px; }}"
         )
         self.setStyleSheet(self._normal_style)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 22, 20, 22)
-        lay.setSpacing(8)
-        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(9)
 
-        ic = QLabel(icon)
-        ic.setStyleSheet("font-size:34px; background:transparent; border:none;")
-        ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(ic)
+        kind = QLabel(source_type.upper())
+        kind.setStyleSheet(
+            f"color:#93c5fd; background:#102a4c; border:1px solid #214f7f; "
+            "border-radius:5px; padding:3px 8px; font-size:9px; "
+            "font-weight:700; letter-spacing:1px;")
+        kind.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        lay.addWidget(kind, 0, Qt.AlignmentFlag.AlignLeft)
 
         t = QLabel(title)
-        t.setStyleSheet(f"color:{_C_TEXT}; font-size:14px; font-weight:700; background:transparent; border:none;")
-        t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        t.setStyleSheet(
+            f"color:{_C_TEXT}; font-size:17px; font-weight:700; "
+            "background:transparent; border:none;")
         lay.addWidget(t)
 
         s = QLabel(subtitle)
-        s.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px; background:transparent; border:none;")
-        s.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        s.setStyleSheet(
+            f"color:{_C_TEXT2}; font-size:11px; line-height:1.35; "
+            "background:transparent; border:none;")
         s.setWordWrap(True)
         lay.addWidget(s)
+
+        lay.addStretch()
+        action_label = QLabel(action.upper())
+        action_label.setStyleSheet(
+            f"color:{_C_ACCENT}; font-size:10px; font-weight:700; "
+            "letter-spacing:0.8px; background:transparent; border:none;")
+        lay.addWidget(action_label)
 
     def enterEvent(self, e):
         self.setStyleSheet(self._hover_style)
@@ -126,195 +125,8 @@ class _ImportCard(QFrame):
         super().mousePressEvent(e)
 
 
-class ImageLoadSettingsDialog(QDialog):
-    def __init__(self, image_files: List[str], folder: str,
-                 fps_from_meta: Optional[float] = None,
-                 initial_calibration: Optional[Calibration] = None,
-                 parent=None):
-        super().__init__(parent)
-        self._folder = folder
-        self._fps_from_meta = fps_from_meta
-        self._initial_calibration = initial_calibration or Calibration()
-        self.setWindowTitle("Image Loading Settings")
-        self.setMinimumWidth(500)
-        self.setStyleSheet(f"""
-            QDialog {{ background:{_C_BG}; }}
-            QLabel {{ color:{_C_TEXT}; font-size:12px; }}
-            QRadioButton {{ color:{_C_TEXT}; font-size:12px; spacing: 8px; }}
-            QRadioButton::indicator {{ width:16px; height:16px; border-radius:9px; border:2px solid {_C_BORDER}; background:{_C_SURFACE}; }}
-            QRadioButton::indicator:checked {{ background:{_C_ACCENT}; border:3px solid #ffffff; }}
-            QSpinBox {{ background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px; }}
-            QLineEdit {{ background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:6px 10px; border-radius:4px; }}
-            QPushButton {{ background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:6px 12px; border-radius:4px; }}
-            QPushButton:hover {{ background:{_C_BORDER}; border:1px solid {_C_ACCENT}; }}
-        """)
-
-        lay = QVBoxLayout(self)
-        lay.setSpacing(16)
-
-        # 1. ROI Selection
-        roi_lay = QVBoxLayout()
-        roi_lay.addWidget(QLabel("Select an image to use as the ROI Mask (Optional):"))
-
-        roi_row = QHBoxLayout()
-        self.roi_edit = QLineEdit()
-        self.roi_edit.setPlaceholderText("No ROI selected (Draw manually later)")
-        self.roi_edit.setReadOnly(True)
-        roi_row.addWidget(self.roi_edit)
-
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_roi)
-        roi_row.addWidget(browse_btn)
-
-        clear_btn = QPushButton("✕")
-        clear_btn.setFixedWidth(32)
-        clear_btn.clicked.connect(lambda: self.roi_edit.clear())
-        roi_row.addWidget(clear_btn)
-
-        roi_lay.addLayout(roi_row)
-        lay.addLayout(roi_lay)
-
-        # Divider
-        div = QFrame()
-        div.setFrameShape(QFrame.Shape.HLine)
-        div.setStyleSheet(f"background:{_C_BORDER}; max-height:1px;")
-        lay.addWidget(div)
-
-        # 2. Camera FPS Rate
-        # Always editable. A detected value only pre-fills the box: metadata can
-        # carry a container playback rate rather than the true capture rate, and
-        # a locked-in wrong rate silently rescales every velocity and strain rate.
-        fps_lay = QHBoxLayout()
-        fps_lay.addWidget(QLabel("Camera frame rate:"))
-        self.fps_spin = QDoubleSpinBox()
-        self.fps_spin.setRange(0.01, 10000000.0)
-        self.fps_spin.setDecimals(2)
-        self.fps_spin.setValue(
-            self._fps_from_meta if self._fps_from_meta is not None else 1.0)
-        self.fps_spin.setStyleSheet(f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; padding:4px 8px; border-radius:4px;")
-        self.fps_spin.setToolTip(
-            "Sample rate of this already-extracted image sequence, in Hz.\n\n"
-            "This is the number of analysed images per second, after any frame\n"
-            "skipping performed during video extraction. PyDIC uses Δt = 1 / rate\n"
-            "for velocity and strain-rate calculations.\n\n"
-            "A value detected from dic_metadata.json is pre-filled but remains\n"
-            "editable if the metadata is incorrect."
-        )
-        fps_lay.addWidget(self.fps_spin)
-
-        lbl_hz = QLabel("Hz")
-        lbl_hz.setStyleSheet(f"color:{_C_TEXT2};")
-        fps_lay.addWidget(lbl_hz)
-
-        if self._fps_from_meta is not None:
-            det = QLabel(f"detected {self._fps_from_meta:.2f} Hz — override if wrong")
-            det.setStyleSheet(f"color:{_C_SUCCESS}; font-size:11px;")
-            fps_lay.addWidget(det)
-        fps_lay.addStretch()
-        lay.addLayout(fps_lay)
-
-        # 2b. Spatial scale — the space counterpart to the frame rate above.
-        # Without it displacements can only ever be reported in pixels, which is
-        # rarely the unit anyone actually wants to publish.
-        scale_lay = QHBoxLayout()
-        scale_lay.addWidget(QLabel("Pixel size:"))
-        self.px_size_spin = QDoubleSpinBox()
-        self.px_size_spin.setRange(0.0, 1e9)
-        self.px_size_spin.setDecimals(6)
-        initial_unit = self._initial_calibration.display_unit
-        self.px_size_spin.setValue(
-            self._initial_calibration.pixel_size_in(initial_unit) or 0.0)
-        self.px_size_spin.setSpecialValueText("— unknown —")
-        self.px_size_spin.setToolTip(
-            "Physical size of one pixel, so results read in real units.\n"
-            "Leave at 0 to work in pixels; it can also be set later on the\n"
-            "results page without re-running the analysis.")
-        self.px_size_spin.setStyleSheet(
-            f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; "
-            f"padding:4px 8px; border-radius:4px;")
-        scale_lay.addWidget(self.px_size_spin)
-
-        self.px_unit_combo = QComboBox()
-        self.px_unit_combo.addItems(LENGTH_UNIT_ORDER)
-        self.px_unit_combo.setCurrentText(initial_unit)
-        self.px_unit_combo.setStyleSheet(
-            f"background:{_C_SURFACE}; color:{_C_TEXT}; border:1px solid {_C_BORDER}; "
-            f"padding:4px 8px; border-radius:4px;")
-        scale_lay.addWidget(self.px_unit_combo)
-
-        per_lbl = QLabel("per pixel")
-        per_lbl.setStyleSheet(f"color:{_C_TEXT2};")
-        scale_lay.addWidget(per_lbl)
-        scale_lay.addStretch()
-        lay.addLayout(scale_lay)
-
-        # Divider
-        div2 = QFrame()
-        div2.setFrameShape(QFrame.Shape.HLine)
-        div2.setStyleSheet(f"background:{_C_BORDER}; max-height:1px;")
-        lay.addWidget(div2)
-
-        # 3. Step Spinbox
-        step_lay = QHBoxLayout()
-        step_lay.addWidget(QLabel("Load every:"))
-        self.step_spin = QSpinBox()
-        self.step_spin.setRange(1, 1000)
-        self.step_spin.setValue(1)
-        step_lay.addWidget(self.step_spin)
-        lbl1 = QLabel("frame(s)")
-        lbl1.setStyleSheet(f"color:{_C_TEXT2};")
-        step_lay.addWidget(lbl1)
-        step_lay.addStretch()
-        lay.addLayout(step_lay)
-
-        # 4. Max Frames Radio Buttons
-        self.radio_all_frames = QRadioButton("Load all available deformed frames")
-        self.radio_all_frames.setChecked(True)
-        lay.addWidget(self.radio_all_frames)
-
-        limit_lay = QHBoxLayout()
-        self.radio_limit_frames = QRadioButton("Limit maximum deformed frames to:")
-        limit_lay.addWidget(self.radio_limit_frames)
-
-        self.max_frames_spin = QSpinBox()
-        self.max_frames_spin.setRange(1, 999999)
-        self.max_frames_spin.setValue(30)
-        self._spin_focus_filter = _FocusFilter(self.radio_limit_frames, parent=self)
-        self.max_frames_spin.installEventFilter(self._spin_focus_filter)
-
-        limit_lay.addWidget(self.max_frames_spin)
-        limit_lay.addStretch()
-        lay.addLayout(limit_lay)
-
-        # Buttons
-        btns = QDialogButtonBox()
-        btns.setStandardButtons(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-
-    def _browse_roi(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select ROI Mask Image", self._folder,
-            "Images (*.png *.tif *.tiff *.jpg *.jpeg *.bmp);;All Files (*)"
-        )
-        if path:
-            self.roi_edit.setText(path)
-
-    def get_settings(self):
-        step = self.step_spin.value()
-        limit = self.max_frames_spin.value() if self.radio_limit_frames.isChecked() else None
-        roi_path = self.roi_edit.text().strip()
-        # Pre-filled from metadata when present, so this already carries the
-        # detected rate unless the operator changed it.
-        user_fps = self.fps_spin.value()
-        return step, limit, roi_path if roi_path else None, user_fps
-
-    def get_calibration(self):
-        """Calibration chosen in this dialog (uncalibrated when pixel size is 0)."""
-        val = float(self.px_size_spin.value())
-        unit = self.px_unit_combo.currentText()
-        return Calibration.from_pixel_size(val, unit) if val > 0 else Calibration(None, unit)
+# Compatibility name retained for integrations that imported the old dialog.
+ImageLoadSettingsDialog = ImageSequenceImporterDialog
 
 
 class WelcomePage(QWidget):
@@ -339,22 +151,48 @@ class WelcomePage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+        self.setStyleSheet(f"background:{_C_BG};")
 
         hero = QWidget()
-        hero.setStyleSheet(f"background:#0e1c2e;")
+        hero.setObjectName("welcomeHero")
+        hero.setStyleSheet(
+            f"QWidget#welcomeHero {{ background:{_C_SURFACE}; }} "
+            "QWidget#welcomeHero QLabel { background:transparent; }")
         hero_lay = QVBoxLayout(hero)
-        hero_lay.setContentsMargins(60, 40, 60, 30)
-        hero_lay.setSpacing(6)
+        hero_lay.setContentsMargins(64, 30, 64, 28)
+        hero_lay.setSpacing(8)
 
-        logo = QLabel("PyDIC")
+        product = QLabel("PYDIC  /  MEASUREMENT WORKSPACE")
+        product.setStyleSheet(
+            f"color:#93c5fd; font-size:10px; font-weight:700; "
+            "letter-spacing:1.8px;")
+        hero_lay.addWidget(product)
+
+        logo = QLabel("Measure motion. Quantify deformation.")
         logo.setStyleSheet(
-            f"color:{_C_ACCENT}; font-size:38px; font-weight:800; letter-spacing:2px;"
+            f"color:{_C_TEXT}; font-size:30px; font-weight:750;"
         )
         hero_lay.addWidget(logo)
 
-        tagline = QLabel("Digital Image Correlation  ·  Professional Analysis Suite")
-        tagline.setStyleSheet(f"color:{_C_TEXT2}; font-size:14px;")
+        tagline = QLabel(
+            "A focused digital image correlation workflow for displacement, "
+            "velocity, strain rate, and accumulated strain.")
+        tagline.setStyleSheet(f"color:{_C_TEXT2}; font-size:13px;")
+        tagline.setWordWrap(True)
         hero_lay.addWidget(tagline)
+
+        capabilities = QHBoxLayout()
+        capabilities.setSpacing(8)
+        for text in ("DISPLACEMENT", "VELOCITY", "STRAIN RATE", "STRAIN"):
+            chip = QLabel(text)
+            chip.setStyleSheet(
+                "color:#a9bdd4; background:#102239; border:1px solid #1d3d61; "
+                "border-radius:5px; padding:4px 9px; font-size:9px; "
+                "font-weight:650; letter-spacing:0.6px;")
+            chip.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            capabilities.addWidget(chip)
+        capabilities.addStretch()
+        hero_lay.addLayout(capabilities)
         root.addWidget(hero)
 
         sep = QFrame()
@@ -364,51 +202,64 @@ class WelcomePage(QWidget):
 
         body = QWidget()
         body_lay = QVBoxLayout(body)
-        body_lay.setContentsMargins(60, 30, 60, 30)
-        body_lay.setSpacing(24)
+        body_lay.setContentsMargins(64, 28, 64, 28)
+        body_lay.setSpacing(18)
 
-        step_lbl = QLabel("Step 1  —  Import your footage")
-        step_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:13px; font-weight:600;")
-        body_lay.addWidget(step_lbl)
+        section_title = QLabel("Choose a data source")
+        section_title.setStyleSheet(
+            f"color:{_C_TEXT}; font-size:18px; font-weight:700;")
+        body_lay.addWidget(section_title)
+        section_copy = QLabel(
+            "Start from a recording, an extracted image sequence, or a saved "
+            "analysis session.")
+        section_copy.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+        body_lay.addWidget(section_copy)
 
         cards_row = QHBoxLayout()
-        cards_row.setSpacing(24)
-        cards_row.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        cards_row.setSpacing(16)
 
         self._card_video = _ImportCard(
-            "🎬", "Import Video",
-            "MP4 · AVI · MOV · MKV\nAuto-extract frames"
+            "Recording", "Import video",
+            "Select an MP4, AVI, MOV, or MKV recording and extract the frames "
+            "needed for analysis.", "Select video"
         )
         self._card_video.clicked.connect(self._import_video)
         cards_row.addWidget(self._card_video)
 
         self._card_images = _ImportCard(
-            "🖼", "Load Images",
-            "PNG · TIF · JPEG · BMP\nManual selection"
+            "Sequence", "Load image folder",
+            "Use an existing PNG, TIFF, JPEG, or BMP sequence with explicit "
+            "frame-rate and scale settings.", "Select folder"
         )
         self._card_images.clicked.connect(self._load_images)
         cards_row.addWidget(self._card_images)
 
         self._card_hdf5 = _ImportCard(
-            "🗄️", "Load Session",
-            "HDF5 (.h5)\nRestore previous analysis"
+            "Session", "Resume analysis",
+            "Open a saved HDF5 result set and return directly to inspection "
+            "and export.", "Open HDF5"
         )
         self._card_hdf5.clicked.connect(self._load_hdf5)
         cards_row.addWidget(self._card_hdf5)
 
-        cards_row.addStretch()
         body_lay.addLayout(cards_row)
 
         self._status_box = QFrame()
-        self._status_box.setMinimumHeight(80)
+        self._status_box.setMinimumHeight(96)
         self._status_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._status_box.setStyleSheet(
-            f"background:{_C_CARD}; border:1px solid {_C_BORDER}; border-radius:10px;"
+            f"background:#0f2035; border:1px solid #245079; border-radius:12px;"
         )
         self._status_box.setVisible(False)
         status_lay = QVBoxLayout(self._status_box)
-        status_lay.setContentsMargins(20, 16, 20, 16)
-        status_lay.setSpacing(6)
+        status_lay.setContentsMargins(20, 14, 20, 14)
+        status_lay.setSpacing(5)
+
+        status_title = QLabel("DATASET READY")
+        status_title.setStyleSheet(
+            "color:#93c5fd; font-size:9px; font-weight:700; "
+            "letter-spacing:1px; border:none;")
+        status_lay.addWidget(status_title)
 
         self._status_ref = QLabel("")
         self._status_ref.setStyleSheet(f"color:{_C_TEXT}; font-size:12px; border:none;")
@@ -428,12 +279,13 @@ class WelcomePage(QWidget):
         root.addWidget(body, 1)
 
         footer = QWidget()
-        footer.setStyleSheet(f"background:#0e1c2e; border-top:1px solid {_C_BORDER};")
+        footer.setStyleSheet(
+            f"background:{_C_SURFACE}; border-top:1px solid {_C_BORDER};")
         footer_lay = QHBoxLayout(footer)
         footer_lay.setContentsMargins(60, 14, 60, 14)
         footer_lay.addStretch()
 
-        self._next_btn = FooterButton("Define ROI  →")
+        self._next_btn = FooterButton("Continue to ROI")
         self._next_btn.setProperty("class", "accent")
         self._next_btn.setFixedHeight(38)
         self._next_btn.setMinimumWidth(160)
@@ -560,7 +412,9 @@ class WelcomePage(QWidget):
 
             if dlg.exec() == 0:
                 return
-            step, limit, roi_path, user_fps = dlg.get_settings()
+            _step, _limit, roi_path, _source_fps = dlg.get_settings()
+            selected_paths = dlg.selected_paths()
+            effective_fps = dlg.effective_fps()
             self._wizard.analysis.calibration = dlg.get_calibration()
             # Persist immediately. Setting it here and relying on some later
             # save meant a pixel size entered at import was lost if the session
@@ -570,34 +424,21 @@ class WelcomePage(QWidget):
             QMessageBox.critical(self, "Dialog Error", f"Failed to open settings dialog:\n{e}")
             return
 
-        if roi_path:
-            roi_norm = os.path.normpath(roi_path)
-            img_files = [f for f in img_files if os.path.normpath(f) != roi_norm]
-
-        if len(img_files) < 2:
-            QMessageBox.warning(self, "Invalid Selection", "Not enough images remaining after excluding the ROI mask.")
+        if len(selected_paths) < 2:
+            QMessageBox.warning(
+                self, "Invalid Selection",
+                "The selection must contain one reference image and at least "
+                "one deformed image.")
             return
 
-        ref = img_files[0]
-        defs = img_files[1:]
-
-        defs = defs[::step]
-
-        if limit is not None:
-            defs = defs[:limit]
-
-        if len(defs) == 0:
-            QMessageBox.warning(self, "Empty Selection", "Your sampling settings filtered out all deformed frames.")
-            return
-
-        # The dialog's spin box is seeded from metadata, so it is the detected
-        # rate unless the operator overrode it -- preferring original_fps here
-        # would throw that override away.
-        base_fps = user_fps if user_fps is not None else (
-            original_fps if original_fps is not None else 1.0)
+        # The importer returns exactly what its scrubber and playback preview
+        # showed: the first path is the chosen reference, followed by sampled
+        # deformed frames. No second sampling pipeline is applied here.
+        ref = selected_paths[0]
+        defs = selected_paths[1:]
 
         analysis = self._wizard.analysis
-        analysis.fps = base_fps / step
+        analysis.fps = effective_fps
 
         analysis.set_reference(ref)
         analysis.clear_deformed()
