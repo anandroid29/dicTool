@@ -18,15 +18,15 @@ from PyQt6.QtWidgets import (
 from src.core.units import Calibration, LENGTH_UNIT_ORDER
 
 
-_BG = "#08111d"
-_SURFACE = "#0e1c2e"
-_CARD = "#132035"
-_BORDER = "#1e3a5a"
-_ACCENT = "#3b82f6"
+_BG = "#1a1c1e"
+_SURFACE = "#212426"
+_CARD = "#282b2e"
+_BORDER = "#3c4247"
+_ACCENT = "#5a8cb0"
 _TEXT = "#e2e8f0"
 _TEXT2 = "#94a3b8"
-_SUCCESS = "#10b981"
-_ERROR = "#ef4444"
+_SUCCESS = "#6a9c74"
+_ERROR = "#bf6259"
 
 
 def _natural_sort_key(path: str):
@@ -45,7 +45,7 @@ class _SequencePreview(QLabel):
                            QSizePolicy.Policy.Expanding)
         self.setStyleSheet(
             f"background:#050b13; color:{_TEXT2}; border:1px solid {_BORDER}; "
-            "border-radius:9px;")
+            "border-radius:3px;")
         self.setText("No selected frame")
 
     def show_pixmap(self, pixmap: Optional[QPixmap]) -> None:
@@ -100,22 +100,22 @@ class ImageSequenceImporterDialog(QDialog):
             QDialog {{ background:{_BG}; }}
             QLabel {{ color:{_TEXT}; font-size:11px; }}
             QGroupBox {{ color:{_TEXT2}; font-size:10px; font-weight:700;
-                border:1px solid {_BORDER}; border-radius:7px;
+                border:1px solid {_BORDER}; border-radius:3px;
                 margin-top:8px; padding-top:12px; }}
             QGroupBox::title {{ subcontrol-origin:margin; left:9px; }}
             QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {{
                 background:{_SURFACE}; color:{_TEXT}; border:1px solid {_BORDER};
-                border-radius:5px; padding:4px 7px; }}
+                border-radius:3px; padding:4px 7px; }}
             QPushButton {{ background:{_SURFACE}; color:{_TEXT};
-                border:1px solid {_BORDER}; border-radius:5px; padding:5px 12px; }}
+                border:1px solid {_BORDER}; border-radius:3px; padding:5px 12px; }}
             QPushButton:hover {{ background:{_CARD}; border-color:{_ACCENT}; }}
             QPushButton:checked {{ background:{_ACCENT}; color:white; }}
-            QPushButton:disabled {{ color:#475569; border-color:#172842; }}
+            QPushButton:disabled {{ color:#475569; border-color:#31353a; }}
             QCheckBox {{ color:{_TEXT2}; font-size:11px; }}
             QSlider::groove:horizontal {{ background:{_CARD}; height:5px;
                 border-radius:3px; }}
             QSlider::handle:horizontal {{ background:{_ACCENT}; width:13px;
-                margin:-4px 0; border-radius:6px; }}
+                margin:-4px 0; border-radius:3px; }}
         """)
         self._build_ui()
         self._initialise_sequence()

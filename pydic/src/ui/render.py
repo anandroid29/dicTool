@@ -156,16 +156,24 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
     if not valid.any():
         return None
 
-    ys, xs = np.where(valid)
-    ymin, ymax = int(ys.min()), int(ys.max())
-    xmin, xmax = int(xs.min()), int(xs.max())
+    # Bounding box by row/column reduction. np.where materialises one index per
+    # valid pixel -- two arrays the size of the field -- purely to take four
+    # extrema from them, which on a full-frame ROI was among the most expensive
+    # steps in the whole render.
+    rows = valid.any(axis=1)
+    cols = valid.any(axis=0)
+    ymin = int(rows.argmax())
+    ymax = int(len(rows) - 1 - rows[::-1].argmax())
+    xmin = int(cols.argmax())
+    xmax = int(len(cols) - 1 - cols[::-1].argmax())
 
-    cropped = arr[ymin:ymax + 1, xmin:xmax + 1].copy()
-    cropped_mask = valid[ymin:ymax + 1, xmin:xmax + 1]
-
+    # Slice straight to the correlation grid. Materialising the full-resolution
+    # crop first and decimating afterwards allocated and copied `spacing`^2
+    # times more data than is ever read -- at spacing 3 that is nine times the
+    # pixels, on every rendered frame.
     s = max(1, int(spacing))
-    small = cropped[0::s, 0::s]
-    small_mask = cropped_mask[0::s, 0::s]
+    small = arr[ymin:ymax + 1:s, xmin:xmax + 1:s]
+    small_mask = valid[ymin:ymax + 1:s, xmin:xmax + 1:s]
 
     if not small_mask.any():
         return None
@@ -199,15 +207,22 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
         premult_small, (tw, th), interpolation=cv2.INTER_LINEAR)
     if premult.ndim == 2:
         premult = premult[..., None]
-    rgb = np.zeros_like(premult, dtype=np.float32)
-    np.divide(premult, coverage[..., None], out=rgb,
-              where=coverage[..., None] > 1e-6)
-    big = np.zeros((th, tw, 4), dtype=np.float32)
-    big[..., :3] = rgb
-    big[..., 3] = coverage * float(alpha)
 
+    # Un-premultiply by multiplying with a reciprocal computed once in 2-D,
+    # rather than dividing in 3-D under a `where=` mask. A masked ufunc runs a
+    # slow path over every element of the full-size array; the reciprocal is a
+    # third of the work and the multiply is a plain vectorised one. Coverage at
+    # or below the floor yields a reciprocal of exactly zero, so those pixels
+    # come out black-and-transparent exactly as before.
+    inv_coverage = np.where(coverage > 1e-6, 1.0 / np.maximum(coverage, 1e-12), 0.0)
+
+    # Compose straight into the output. The previous version built a full
+    # bounding-box RGBA block and then copied it in, which allocated and copied
+    # the image twice over on every frame.
     out = np.zeros((arr.shape[0], arr.shape[1], 4), np.float32)
-    out[ymin:ymax + 1, xmin:xmax + 1] = big
+    window = out[ymin:ymax + 1, xmin:xmax + 1]
+    np.multiply(premult, inv_coverage[..., None], out=window[..., :3])
+    np.multiply(coverage, float(alpha), out=window[..., 3])
     if roi_mask is not None:
         out[~roi_mask, 3] = 0.0
     out[~np.isfinite(out)] = 0.0
