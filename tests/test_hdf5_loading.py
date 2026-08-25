@@ -50,3 +50,40 @@ def test_hdf5_loader_reports_frame_progress(tmp_path, monkeypatch):
         assert np.allclose(np.asarray(analysis.results[2].u), 2.0)
     finally:
         analysis._release_loaded_hdf5()
+
+
+def test_frame_dynamic_roi_overrides_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    path = tmp_path / "frame_overrides.h5"
+    include = np.zeros((4, 4), dtype=bool)
+    exclude = np.zeros((4, 4), dtype=bool)
+    include[1, 2] = True
+    exclude[2, 1] = True
+
+    analysis = DICAnalysis()
+    analysis._roi_mask = np.ones((4, 4), dtype=bool)
+    analysis.dynamic_frame_overrides = {
+        7: {"threshold": 0.63, "replace": True,
+            "include": include, "exclude": exclude},
+    }
+    analysis.dynamic_future_overrides = {
+        8: {"threshold": 0.58, "replace": True, "include": include},
+        12: {"reset": True},
+    }
+    analysis.export_hdf5(str(path))
+
+    loaded = DICAnalysis()
+    try:
+        loaded.load_hdf5(str(path))
+        entry = loaded.dynamic_frame_overrides[7]
+        assert entry["threshold"] == 0.63
+        assert entry["replace"] is True
+        assert np.array_equal(entry["include"], include)
+        assert np.array_equal(entry["exclude"], exclude)
+        future = loaded.dynamic_future_overrides[8]
+        assert future["threshold"] == 0.58
+        assert future["replace"] is True
+        assert np.array_equal(future["include"], include)
+        assert loaded.dynamic_future_overrides[12] == {"reset": True}
+    finally:
+        loaded._release_loaded_hdf5()

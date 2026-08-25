@@ -2,10 +2,12 @@
 analysis_page.py — Step 5: Live progress during DIC analysis.
 """
 from __future__ import annotations
+import queue
+import threading
 import time
 from typing import TYPE_CHECKING, Optional
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot, QObject
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -27,34 +29,6 @@ _C_DANGER  = "#ef4444"
 
 
 # ---------------------------------------------------------------------------
-# Worker
-# ---------------------------------------------------------------------------
-
-class _Worker(QObject):
-    progress = pyqtSignal(float, str)
-    finished = pyqtSignal()
-    error    = pyqtSignal(str)
-
-    def __init__(self, analysis, seed_xy, use_gpu: bool = False):
-        super().__init__()
-        self._analysis = analysis
-        self._seed_xy  = seed_xy
-        self._use_gpu = use_gpu  # <-- Save it
-
-    @pyqtSlot()
-    def run(self):
-        try:
-            self._analysis.run(
-                progress_cb=lambda f, m: self.progress.emit(f, m),
-                seed_xy=self._seed_xy,
-                use_gpu=self._use_gpu,
-            )
-            self.finished.emit()
-        except Exception as exc:
-            self.error.emit(str(exc))
-
-
-# ---------------------------------------------------------------------------
 # Analysis page
 # ---------------------------------------------------------------------------
 
@@ -64,8 +38,14 @@ class AnalysisPage(QWidget):
     def __init__(self, wizard: "Wizard") -> None:
         super().__init__()
         self._wizard = wizard
-        self._worker: Optional[_Worker] = None
-        self._thread: Optional[QThread] = None
+        self._worker = None
+        self._thread: Optional[threading.Thread] = None
+        self._progress_queue: queue.SimpleQueue[tuple[float, str]] = (
+            queue.SimpleQueue())
+        self._worker_error: Optional[str] = None
+        self._worker_poll = QTimer(self)
+        self._worker_poll.setInterval(30)
+        self._worker_poll.timeout.connect(self._poll_worker)
         self._t_start = 0.0
         self._timer = QTimer(self)
         self._timer.setInterval(500)
@@ -181,11 +161,15 @@ class AnalysisPage(QWidget):
 
     def on_enter(self) -> None:
         """Start the DIC analysis thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
         self._pbar.setValue(0)
         self._status_lbl.setText("Starting…")
         self._cancel_btn.setEnabled(True)
         self._last_thumb_idx = -1
         self._last_shown_frame = -1
+        self._worker_error = None
+        self._progress_queue = queue.SimpleQueue()
         self._t_start = time.perf_counter()
         self._timer.start()
 
@@ -193,17 +177,50 @@ class AnalysisPage(QWidget):
         seed_xy = getattr(self._wizard, "seed_xy", None)
         use_gpu = getattr(self._wizard, "use_gpu", False)
 
-        self._thread = QThread()
-        self._worker = _Worker(analysis, seed_xy, use_gpu)  # <-- Pass to Worker
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.error.connect(self._thread.quit)
-        self._thread.finished.connect(self._thread.deleteLater)
+        # The worker makes no Qt calls. A GUI-owned timer drains its thread-safe
+        # queue and detects completion, so navigation can never depend on a Qt
+        # timer or signal accidentally dispatched from the Python worker thread.
+        self._thread = threading.Thread(
+            target=self._run_analysis,
+            args=(analysis, seed_xy, use_gpu),
+            name="PyDIC-analysis",
+            daemon=True,
+        )
+        self._worker_poll.start()
         self._thread.start()
+
+    def _run_analysis(self, analysis, seed_xy, use_gpu: bool) -> None:
+        try:
+            analysis.run(
+                progress_cb=lambda f, m: self._progress_queue.put(
+                    (float(f), str(m))),
+                seed_xy=seed_xy,
+                use_gpu=use_gpu,
+            )
+        except BaseException as exc:
+            self._worker_error = str(exc) or type(exc).__name__
+
+    def _poll_worker(self) -> None:
+        """Drain progress and complete the run, always on the GUI thread."""
+        latest = None
+        while True:
+            try:
+                latest = self._progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        if latest is not None:
+            self._on_progress(*latest)
+
+        thread = self._thread
+        if thread is None or thread.is_alive():
+            return
+        thread.join(0)
+        self._thread = None
+        self._worker_poll.stop()
+        if self._worker_error is not None:
+            self._on_error(self._worker_error)
+        else:
+            self._on_finished()
 
     @pyqtSlot(float, str)
     def _on_progress(self, frac: float, msg: str) -> None:
@@ -351,6 +368,8 @@ class AnalysisPage(QWidget):
             f"Analysis complete - {n} frame{'s' if n != 1 else ''} processed."
         )
         self._status_lbl.setStyleSheet(f"color:{_C_SUCCESS}; font-size:13px; font-weight:600;")
+        # This method is called only by the GUI-owned poll timer after the
+        # native worker has stopped; navigation is therefore safe and immediate.
         self._wizard.go_results()
 
     @pyqtSlot(str)
@@ -366,6 +385,19 @@ class AnalysisPage(QWidget):
         self._wizard.analysis.cancel()
         self._cancel_btn.setEnabled(False)
         self._status_lbl.setText("Cancelling…")
+
+    def shutdown(self, timeout_ms: int = 5000) -> bool:
+        """Cancel and join the worker before the Qt widget tree is destroyed."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self._worker_poll.stop()
+            return True
+        self._wizard.analysis.cancel()
+        thread.join(max(0, int(timeout_ms)) / 1000.0)
+        stopped = not thread.is_alive()
+        if stopped:
+            self._worker_poll.stop()
+        return stopped
 
     def _tick_elapsed(self) -> None:
         s = int(time.perf_counter() - self._t_start)

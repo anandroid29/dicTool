@@ -106,6 +106,9 @@ def _dynamic_measurement_mask(
     inc_v: np.ndarray,
     include_mask: Optional[np.ndarray] = None,
     exclude_mask: Optional[np.ndarray] = None,
+    frame_include_mask: Optional[np.ndarray] = None,
+    frame_exclude_mask: Optional[np.ndarray] = None,
+    replace_base: bool = False,
 ) -> np.ndarray:
     """Filter one adjacent-frame pair using the current-frame texture mask.
 
@@ -162,6 +165,31 @@ def _dynamic_measurement_mask(
         kept &= ~excluded
     if included is not None:
         kept = in_bounds & (kept | included)
+
+    def _destination_override(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if mask is None:
+            return None
+        arr = np.asarray(mask, dtype=bool)
+        if arr.shape != valid.shape:
+            raise ValueError(
+                "Frame Dynamic ROI override shape does not match result shape.")
+        selected = np.zeros(len(x_ref), dtype=bool)
+        if ib.size:
+            selected[ib] = arr[y_cur, x_cur]
+        return selected
+
+    # Exact-frame decisions are destination-image masks and take precedence
+    # over every global source-space decision. Include still cannot resurrect a
+    # failed solver measurement or a point that moved off-frame.
+    frame_excluded = _destination_override(frame_exclude_mask)
+    frame_included = _destination_override(frame_include_mask)
+    if replace_base:
+        kept = (in_bounds & frame_included
+                if frame_included is not None else np.zeros_like(kept))
+    if frame_excluded is not None:
+        kept &= ~frame_excluded
+    if frame_included is not None:
+        kept = in_bounds & (kept | frame_included)
 
     valid[y_ref[~kept], x_ref[~kept]] = False
     return valid
@@ -263,6 +291,13 @@ class DICAnalysis:
         # Arrays, so they live here rather than in the JSON-serialised params.
         self.dynamic_include_mask: Optional[np.ndarray] = None
         self.dynamic_exclude_mask: Optional[np.ndarray] = None
+        # Exact displayed-frame overrides. Each sparse entry may contain an
+        # ``include`` mask, an ``exclude`` mask and/or a normalised ``threshold``.
+        # Frame 0 is the imported reference; result i enters displayed frame i+1.
+        self.dynamic_frame_overrides: dict[int, dict[str, object]] = {}
+        # Sparse keyframes used as defaults from their displayed frame onward.
+        # Exact-frame entries above are layered on top, so local corrections win.
+        self.dynamic_future_overrides: dict[int, dict[str, object]] = {}
 
         self.last_video_directory: str = os.path.expanduser("~")
         self.last_image_directory: str = os.path.expanduser("~")
@@ -299,6 +334,48 @@ class DICAnalysis:
             fill_holes=getattr(self.params, "dynamic_roi_fill_holes", True),
         )
 
+    def dynamic_threshold_for_frame(self, frame_index: int) -> Optional[float]:
+        """Effective normalised threshold for one displayed sequence frame."""
+        entry = self.dynamic_override_for_frame(frame_index)
+        if "threshold" in entry and entry["threshold"] is not None:
+            return float(np.clip(entry["threshold"], 0.0, 1.0))
+        return getattr(self.params, "dynamic_roi_threshold", None)
+
+    def dynamic_override_for_frame(self, frame_index: int) -> dict[str, object]:
+        """Return inherited future defaults with the exact frame layered last."""
+        index = int(frame_index)
+        future = getattr(self, "dynamic_future_overrides", {})
+        starts = [start for start in future if int(start) <= index]
+        merged = dict(future[max(starts)]) if starts else {}
+        merged.update(getattr(self, "dynamic_frame_overrides", {}).get(index, {}))
+        return merged
+
+    def apply_dynamic_frame_override(
+            self, mask: Optional[np.ndarray], frame_index: int,
+            *, clip_static: bool = False) -> Optional[np.ndarray]:
+        """Apply exact-frame decisions after the global Dynamic ROI base."""
+        if mask is None:
+            return None
+        out = np.asarray(mask, dtype=bool).copy()
+        entry = self.dynamic_override_for_frame(frame_index)
+        exclude = entry.get("exclude")
+        include = entry.get("include")
+        if bool(entry.get("replace", False)):
+            out[:] = False
+        if exclude is not None:
+            arr = np.asarray(exclude, dtype=bool)
+            if arr.shape != out.shape:
+                raise ValueError("Frame Dynamic ROI exclude shape mismatch.")
+            out &= ~arr
+        if include is not None:
+            arr = np.asarray(include, dtype=bool)
+            if arr.shape != out.shape:
+                raise ValueError("Frame Dynamic ROI include shape mismatch.")
+            out |= arr
+        if clip_static and self._roi_mask is not None:
+            out &= self._roi_mask
+        return out
+
     def reference_analysis_mask(self) -> Optional[np.ndarray]:
         """Mask shown by the dynamic-ROI editor on the zero-strain image.
 
@@ -313,8 +390,14 @@ class DICAnalysis:
                   else np.ones(base.shape, dtype=bool))
         roi = self.make_dynamic_roi()
         roi.calibrate(base)
+        frame_index = int(getattr(self, "strain_start_frame", 0))
+        roi.set_threshold_normalised(
+            self.dynamic_threshold_for_frame(frame_index))
         dynamic = roi.mask(base, reference_frame=True)
-        return static.copy() if dynamic is None else np.asarray(dynamic, dtype=bool)
+        if dynamic is None:
+            return static.copy()
+        return self.apply_dynamic_frame_override(
+            dynamic, frame_index, clip_static=True)
 
     def frame_image(self, frame_index: int) -> Optional[np.ndarray]:
         """Load a full-sequence frame where 0 is the imported reference."""
@@ -358,6 +441,8 @@ class DICAnalysis:
         self.strain_start_frame = 0
         self.dynamic_include_mask = None
         self.dynamic_exclude_mask = None
+        self.dynamic_frame_overrides = {}
+        self.dynamic_future_overrides = {}
 
     def add_deformed(self, path: str) -> None:
         # The existing result sequence no longer describes the input list once
@@ -372,6 +457,8 @@ class DICAnalysis:
         self._preview_frame_index = None
         self._preview_frame_image = None
         self.results.clear()
+        self.dynamic_frame_overrides = {}
+        self.dynamic_future_overrides = {}
 
     def set_roi_mask(self, mask: np.ndarray) -> None:
         if self._ref_image is not None and mask.shape != self._ref_image.shape:
@@ -380,6 +467,8 @@ class DICAnalysis:
         self._roi_mask = mask.astype(bool)
         if self._strain_origin_mask is not None:
             self._strain_origin_mask &= self._roi_mask
+        self.dynamic_frame_overrides = {}
+        self.dynamic_future_overrides = {}
         self.results.clear()
 
     def set_strain_origin_mask(self, mask: np.ndarray) -> None:
@@ -423,6 +512,8 @@ class DICAnalysis:
         self._strain_origin_mask = None
         self.dynamic_include_mask = None
         self.dynamic_exclude_mask = None
+        self.dynamic_frame_overrides = {}
+        self.dynamic_future_overrides = {}
         self.results.clear()
 
     @property
@@ -512,11 +603,18 @@ class DICAnalysis:
             # Sample the current dynamic mask at x+du,y+dv only. Accumulated
             # material positions belong exclusively to strain transport and
             # must never decide whether a fresh pairwise measurement survives.
+            frame_index = i + 1
+            dyn_roi.set_threshold_normalised(
+                self.dynamic_threshold_for_frame(frame_index))
             d_mask = dyn_roi.mask(cur, reference_frame=False)
+            frame_override = self.dynamic_override_for_frame(frame_index)
             valid = _dynamic_measurement_mask(
                 valid, d_mask, dic.u, dic.v,
                 include_mask=self.dynamic_include_mask,
-                exclude_mask=self.dynamic_exclude_mask)
+                exclude_mask=self.dynamic_exclude_mask,
+                frame_include_mask=frame_override.get("include"),
+                frame_exclude_mask=frame_override.get("exclude"),
+                replace_base=bool(frame_override.get("replace", False)))
 
             _mask_invalid(valid, dic.u, dic.v, dic.du_dx, dic.du_dy,
                           dic.dv_dx, dic.dv_dy, dic.corr)
@@ -678,13 +776,20 @@ class DICAnalysis:
             # Dynamic ROI rejection must happen BEFORE strain accumulation. In
             # the old order, a subset that left the frame could contribute one
             # huge affine increment permanently and was only hidden afterwards.
+            frame_index = i + 1
+            dyn_roi.set_threshold_normalised(
+                self.dynamic_threshold_for_frame(frame_index))
             d_mask = dyn_roi.mask(cur_image, reference_frame=False)
+            frame_override = self.dynamic_override_for_frame(frame_index)
             measurement_valid = _finite_measurement_mask(
                 np.ones(inc_u.shape, dtype=bool), inc_u, inc_v, corr_f)
             measurement_valid = _dynamic_measurement_mask(
                 measurement_valid, d_mask, inc_u, inc_v,
                 include_mask=self.dynamic_include_mask,
-                exclude_mask=self.dynamic_exclude_mask)
+                exclude_mask=self.dynamic_exclude_mask,
+                frame_include_mask=frame_override.get("include"),
+                frame_exclude_mask=frame_override.get("exclude"),
+                replace_base=bool(frame_override.get("replace", False)))
 
             _mask_invalid(measurement_valid, inc_u, inc_v, inc_du_dx,
                           inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f)
@@ -728,6 +833,20 @@ class DICAnalysis:
             # to leak gigabytes. Persistent solver arrays remain referenced;
             # this releases only blocks that are no longer in use.
             gpu_solver.release_temporary_memory()
+
+        # The GPU solver owns persistent reference coefficients and warm-start
+        # state. Release it before CPU velocity/strain post-processing, whose
+        # host-memory peak otherwise overlaps the still-live CUDA allocations
+        # and pinned-memory pool on long sequences.
+        gpu_solver.release_temporary_memory()
+        del gpu_solver
+        try:
+            import cupy as cp
+            cp.cuda.get_current_stream().synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
 
         if not self._cancel[0] and self.results:
             self._compute_incremental_displacements()
@@ -1449,6 +1568,42 @@ class DICAnalysis:
                     f.create_dataset(
                         name, data=np.asarray(mask, dtype=bool),
                         compression="gzip", compression_opts=4)
+            frame_overrides = getattr(self, "dynamic_frame_overrides", {})
+            if frame_overrides:
+                overrides_group = f.create_group("dynamic_frame_overrides")
+                overrides_group.attrs["semantics"] = "exact_displayed_frame"
+                for frame_index, entry in sorted(frame_overrides.items()):
+                    group = overrides_group.create_group(
+                        f"frame_{int(frame_index):06d}")
+                    if entry.get("threshold") is not None:
+                        group.attrs["threshold"] = float(entry["threshold"])
+                    if "replace" in entry:
+                        group.attrs["replace"] = bool(entry["replace"])
+                    for channel in ("include", "exclude"):
+                        mask = entry.get(channel)
+                        if mask is not None and np.asarray(mask, dtype=bool).any():
+                            group.create_dataset(
+                                channel, data=np.asarray(mask, dtype=bool),
+                                compression="gzip", compression_opts=4)
+            future_overrides = getattr(self, "dynamic_future_overrides", {})
+            if future_overrides:
+                future_group = f.create_group("dynamic_future_overrides")
+                future_group.attrs["semantics"] = "default_from_displayed_frame"
+                for start_frame, entry in sorted(future_overrides.items()):
+                    group = future_group.create_group(
+                        f"from_{int(start_frame):06d}")
+                    if bool(entry.get("reset", False)):
+                        group.attrs["reset"] = True
+                    if entry.get("threshold") is not None:
+                        group.attrs["threshold"] = float(entry["threshold"])
+                    if "replace" in entry:
+                        group.attrs["replace"] = bool(entry["replace"])
+                    for channel in ("include", "exclude"):
+                        mask = entry.get(channel)
+                        if mask is not None and np.asarray(mask, dtype=bool).any():
+                            group.create_dataset(
+                                channel, data=np.asarray(mask, dtype=bool),
+                                compression="gzip", compression_opts=4)
 
             # 3. Save only independent, user-facing data. Velocity and
             # displacement magnitudes are deterministic views of u/v and dt;
@@ -1514,6 +1669,8 @@ class DICAnalysis:
         self.def_paths.clear()
         self._preview_frame_index = None
         self._preview_frame_image = None
+        self.dynamic_frame_overrides = {}
+        self.dynamic_future_overrides = {}
 
         f = h5py.File(path, "r")
         try:
@@ -1586,6 +1743,42 @@ class DICAnalysis:
             self.dynamic_exclude_mask = (
                 f["dynamic_exclude_mask"][:].astype(bool)
                 if "dynamic_exclude_mask" in f else None)
+            if "dynamic_frame_overrides" in f:
+                overrides_group = f["dynamic_frame_overrides"]
+                for key, group in overrides_group.items():
+                    try:
+                        frame_index = int(key.rsplit("_", 1)[-1])
+                    except (TypeError, ValueError):
+                        continue
+                    entry: dict[str, object] = {}
+                    if "threshold" in group.attrs:
+                        entry["threshold"] = float(group.attrs["threshold"])
+                    if "replace" in group.attrs:
+                        entry["replace"] = bool(group.attrs["replace"])
+                    for channel in ("include", "exclude"):
+                        if channel in group:
+                            entry[channel] = group[channel][:].astype(bool)
+                    if entry:
+                        self.dynamic_frame_overrides[frame_index] = entry
+            if "dynamic_future_overrides" in f:
+                future_group = f["dynamic_future_overrides"]
+                for key, group in future_group.items():
+                    try:
+                        start_frame = int(key.rsplit("_", 1)[-1])
+                    except (TypeError, ValueError):
+                        continue
+                    entry: dict[str, object] = {}
+                    if bool(group.attrs.get("reset", False)):
+                        entry["reset"] = True
+                    if "threshold" in group.attrs:
+                        entry["threshold"] = float(group.attrs["threshold"])
+                    if "replace" in group.attrs:
+                        entry["replace"] = bool(group.attrs["replace"])
+                    for channel in ("include", "exclude"):
+                        if channel in group:
+                            entry[channel] = group[channel][:].astype(bool)
+                    if entry:
+                        self.dynamic_future_overrides[start_frame] = entry
 
             # 3. Restore Frame Data
             n_frames = len(frame_keys)
@@ -1938,7 +2131,8 @@ class DynamicROI:
                  include_mask: Optional[np.ndarray] = None,
                  exclude_mask: Optional[np.ndarray] = None,
                  roi_mask: Optional[np.ndarray] = None,
-                 fill_holes: bool = True):
+                 fill_holes: bool = True,
+                 hysteresis: float = 0.03):
         self.method = method
         self.keep_min_area_frac = keep_min_area_frac
         # Fill regions that the texture metric rejected but which are completely
@@ -1960,6 +2154,11 @@ class DynamicROI:
         # default; the dynamic-ROI editor sets it explicitly when the user
         # drags the slider.
         self.threshold = threshold
+        # A small Schmitt-trigger band stops borderline texture pixels from
+        # alternating in/out on successive frames. It does not smooth geometry
+        # or prevent a real scene change from moving the boundary.
+        self.hysteresis = max(0.0, float(hysteresis))
+        self._previous_mask: Optional[np.ndarray] = None
         # Hard user overrides, in REFERENCE-frame coordinates. include wins over
         # exclude wins over the texture metric, so a region the operator marked
         # is never silently reinterpreted frame to frame.
@@ -2014,8 +2213,14 @@ class DynamicROI:
         thr, _ = cv2.threshold(sel8.reshape(-1, 1), 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         self.auto_thresh = float(thr)
-        self.thresh = (self.auto_thresh if self.threshold is None
-                       else float(np.clip(self.threshold, 0.0, 1.0)) * 255.0)
+        self.set_threshold_normalised(self.threshold)
+        self._previous_mask = None
+
+    def set_threshold_normalised(self, threshold: Optional[float]) -> None:
+        """Select the threshold for the next frame without recalibrating scale."""
+        self.threshold = threshold
+        self.thresh = (self.auto_thresh if threshold is None
+                       else float(np.clip(threshold, 0.0, 1.0)) * 255.0)
 
     def _metric8(self, img: np.ndarray, m: Optional[np.ndarray] = None):
         """Texture metric rescaled to uint8 against the calibrated scale."""
@@ -2047,7 +2252,18 @@ class DynamicROI:
         m8 = self._metric8(cur_image)
         if m8 is None:
             return None
-        mask = (m8 >= self.thresh).astype(np.uint8) * 255
+        if (not reference_frame and self._previous_mask is not None and
+                self._previous_mask.shape == m8.shape and self.hysteresis > 0.0):
+            band = self.hysteresis * 255.0
+            # Previously kept pixels use the lower exit threshold; previously
+            # rejected pixels use the upper entry threshold.
+            mask = np.where(
+                self._previous_mask,
+                m8 >= max(0.0, self.thresh - band),
+                m8 >= min(255.0, self.thresh + band),
+            ).astype(np.uint8) * 255
+        else:
+            mask = (m8 >= self.thresh).astype(np.uint8) * 255
 
         # Overrides participate directly in the dense setup preview. During a
         # pair they are applied at source image-space centres by
@@ -2109,6 +2325,8 @@ class DynamicROI:
                 out = out | self.include_mask
                 if self.roi_mask is not None:
                     out = out & self.roi_mask
+        else:
+            self._previous_mask = out.copy()
         return out
 
 
