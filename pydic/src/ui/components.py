@@ -36,7 +36,7 @@ class FooterButton(QPushButton):
                 font-weight: bold;
                 font-size: 14px;
                 padding: 8px 28px;
-                border-radius: 6px;
+                border-radius:3px;
                 border: 1px solid {C_ACCENT_D};
             }}
             FooterButton:hover {{
@@ -168,7 +168,7 @@ class WizardStepper(QWidget):
                 lbl.setStyleSheet(f"""
                     background-color: {C_ACCENT}; color: #ffffff;
                     font-weight: bold; font-size: 13px;
-                    border-radius: 14px; padding: 6px 18px;
+                    border-radius:3px; padding: 6px 18px;
                 """)
             elif i < current_index:
                 lbl.setStyleSheet(f"color: {C_TEXT2}; font-weight: bold; font-size: 13px; padding: 6px 18px;")

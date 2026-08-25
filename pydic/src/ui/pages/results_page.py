@@ -11,6 +11,8 @@ not the fixed reference image.
 """
 from __future__ import annotations
 import os
+import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal
@@ -34,17 +36,23 @@ if TYPE_CHECKING:
 
 from src.ui.image_canvas import ImageCanvas, marker_color
 
-_C_BG      = "#08111d"
-_C_SURFACE = "#0e1c2e"
-_C_CARD    = "#132035"
-_C_RAISED  = "#1a2d47"
-_C_BORDER  = "#1e3a5a"
-_C_ACCENT  = "#3b82f6"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_TEXT3   = "#475569"
-_C_SUCCESS = "#10b981"
-_C_WARN    = "#f59e0b"
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_RAISED, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
+
+_C_ACCENT = C_ACCENT
+_C_BG = C_BG
+_C_BORDER = C_BORDER
+_C_CARD = C_CARD
+_C_RAISED = C_RAISED
+_C_SUCCESS = C_SUCCESS
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+_C_TEXT3 = C_TEXT3
+_C_WARN = C_WARNING
+
+
 
 FIELDS = {
     # Displacement is always the current previous-frame -> current-frame
@@ -237,7 +245,19 @@ class ResultsPage(QWidget):
         # in the sequence to scrub to.
         self._pair_avg = None
         self._pair_list: list = []
+        # Decoded background frames, keyed by path. Playback and scrubbing both
+        # revisit frames constantly, and decoding a PNG per tick is what makes
+        # play stutter -- the decode alone outlasts the frame interval at any
+        # useful rate. Bounded so a long sequence cannot exhaust memory.
+        self._img_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._IMG_CACHE_MAX = 48
+        # Trajectories for (frame, trail, markers). Recomputing them walks the
+        # whole displacement history per frame, which is the second thing that
+        # makes playback with streaklines on unusable.
+        self._traj_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._TRAJ_CACHE_MAX = 64
         self._play_timer = QTimer(self)
+        self._play_timer.setSingleShot(True)
         self._play_timer.setInterval(200)
         self._play_timer.timeout.connect(self._advance)
         self._scrub_timer = QTimer(self)
@@ -273,12 +293,32 @@ class ResultsPage(QWidget):
         root.setSpacing(0)
 
         # ── Top toolbar ───────────────────────────────────────────────
+        # Two rows, split by what they control: the first selects WHAT is being
+        # looked at, the second controls HOW it is drawn. As one row this held
+        # roughly twenty widgets and simply ran off the edge of the window --
+        # "New Session", "Streaklines" and "Flag clipped" were all truncated at
+        # 1500 px, and a fixed-height QHBoxLayout gives no indication that
+        # anything is missing.
         top = QWidget()
-        top.setFixedHeight(52)
         top.setStyleSheet(f"background:{_C_SURFACE}; border-bottom:1px solid {_C_BORDER};")
-        top_lay = QHBoxLayout(top)
-        top_lay.setContentsMargins(16, 0, 16, 0)
+        top_outer = QVBoxLayout(top)
+        top_outer.setContentsMargins(14, 5, 14, 5)
+        top_outer.setSpacing(4)
+
+        top_lay = QHBoxLayout()        # row 1 — what is displayed
+        top_lay.setContentsMargins(0, 0, 0, 0)
         top_lay.setSpacing(8)
+        top_outer.addLayout(top_lay)
+
+        row_sep = QFrame()
+        row_sep.setFrameShape(QFrame.Shape.HLine)
+        row_sep.setStyleSheet(f"background:{_C_BORDER}; max-height:1px; border:none;")
+        top_outer.addWidget(row_sep)
+
+        disp_lay = QHBoxLayout()       # row 2 — how it is drawn
+        disp_lay.setContentsMargins(0, 0, 0, 0)
+        disp_lay.setSpacing(8)
+        top_outer.addLayout(disp_lay)
 
         new_btn = QPushButton("← New Session")
         new_btn.setFixedWidth(120)
@@ -339,7 +379,7 @@ class ResultsPage(QWidget):
             "Click the image to drop a marker · drag to move · right-click or Del to remove")
         self._place_btn.setStyleSheet(
             f"QPushButton{{background:{_C_CARD}; color:{_C_TEXT}; border:1px solid {_C_BORDER};"
-            f" padding:3px 10px; border-radius:4px; font-size:11px;}}"
+            f" padding:3px 10px; border-radius:3px; font-size:11px;}}"
             f"QPushButton:checked{{background:{_C_ACCENT}; color:#ffffff; border:1px solid {_C_ACCENT};"
             f" font-weight:700;}}")
         self._place_btn.toggled.connect(self._on_place_toggled)
@@ -354,7 +394,7 @@ class ResultsPage(QWidget):
         self._clear_markers_btn.setToolTip("Remove all markers")
         self._clear_markers_btn.setStyleSheet(
             f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
-            f" padding:3px 10px; border-radius:4px; font-size:11px;")
+            f" padding:3px 10px; border-radius:3px; font-size:11px;")
         self._clear_markers_btn.clicked.connect(self._clear_markers)
         top_lay.addWidget(self._clear_markers_btn)
 
@@ -388,25 +428,25 @@ class ResultsPage(QWidget):
         # Colormap
         cmap_lbl = QLabel("Colormap:")
         cmap_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
-        top_lay.addWidget(cmap_lbl)
+        disp_lay.addWidget(cmap_lbl)
 
         self._cmap_combo = QComboBox()
         self._cmap_combo.addItems(CMAPS)
         self._cmap_combo.setCurrentText(DEFAULT_CMAP)
         self._cmap_combo.setFixedWidth(100)
         self._cmap_combo.currentTextChanged.connect(self._refresh_overlay)
-        top_lay.addWidget(self._cmap_combo)
+        disp_lay.addWidget(self._cmap_combo)
 
         self._sym_chk = QCheckBox("Sym")
         self._sym_chk.setToolTip("Centre colormap around zero")
         self._sym_chk.stateChanged.connect(self._refresh_overlay)
-        top_lay.addWidget(self._sym_chk)
+        disp_lay.addWidget(self._sym_chk)
 
         scale_lbl = QLabel("Scale:")
         scale_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
-        top_lay.addWidget(scale_lbl)
+        disp_lay.addWidget(scale_lbl)
         for rb in (self._scale_auto_rb, self._scale_global_rb, self._scale_manual_rb):
-            top_lay.addWidget(rb)
+            disp_lay.addWidget(rb)
 
         self._range_min_spin = QDoubleSpinBox()
         self._range_max_spin = QDoubleSpinBox()
@@ -419,7 +459,7 @@ class ResultsPage(QWidget):
             sb.setEnabled(False)
             sb.setKeyboardTracking(False)   # only fire on commit, not per digit
             sb.valueChanged.connect(self._refresh_overlay)
-            top_lay.addWidget(sb)
+            disp_lay.addWidget(sb)
 
         self._range_fit_btn = QPushButton("Fit")
         self._range_fit_btn.setFixedWidth(40)
@@ -427,7 +467,7 @@ class ResultsPage(QWidget):
             "Fill the limits from this frame's data, then keep them pinned.")
         self._range_fit_btn.setEnabled(False)
         self._range_fit_btn.clicked.connect(self._fit_range_to_frame)
-        top_lay.addWidget(self._range_fit_btn)
+        disp_lay.addWidget(self._range_fit_btn)
 
         # ── Robust scaling ────────────────────────────────────────────
         # A few subsets always converge onto noise at an edge or a dropout, and
@@ -436,7 +476,7 @@ class ResultsPage(QWidget):
         # field flattens to one colour, so the default trims the tails.
         cov_lbl = QLabel("Coverage:")
         cov_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
-        top_lay.addWidget(cov_lbl)
+        disp_lay.addWidget(cov_lbl)
 
         self._coverage_combo = QComboBox()
         for text, val in (("100%", 100.0), ("99.5%", 99.5), ("99%", 99.0),
@@ -453,7 +493,7 @@ class ResultsPage(QWidget):
             "still report the true values."
         )
         self._coverage_combo.currentIndexChanged.connect(self._refresh_overlay)
-        top_lay.addWidget(self._coverage_combo)
+        disp_lay.addWidget(self._coverage_combo)
 
         self._clip_chk = QCheckBox("Flag clipped")
         self._clip_chk.setChecked(True)
@@ -462,7 +502,8 @@ class ResultsPage(QWidget):
             "cyan (below), instead of letting them sit at the end colour\n"
             "where they look like legitimate extremes.")
         self._clip_chk.stateChanged.connect(self._refresh_overlay)
-        top_lay.addWidget(self._clip_chk)
+        disp_lay.addWidget(self._clip_chk)
+        disp_lay.addStretch()
 
         root.addWidget(top)
 
@@ -554,7 +595,7 @@ class ResultsPage(QWidget):
         self._probe_lbl.setWordWrap(True)
         self._probe_lbl.setStyleSheet(
             f"color:{_C_TEXT2}; font-size:10px; background:{_C_CARD};"
-            f" border:1px solid {_C_BORDER}; border-radius:4px; padding:6px;"
+            f" border:1px solid {_C_BORDER}; border-radius:3px; padding:6px;"
             f" font-family:'Fira Code','Cascadia Code',monospace;")
         sb_lay.addWidget(self._probe_lbl)
 
@@ -603,14 +644,14 @@ class ResultsPage(QWidget):
         self._marker_hint.setWordWrap(True)
         self._marker_hint.setStyleSheet(
             f"color:{_C_TEXT2}; font-size:10px; background:{_C_CARD};"
-            f" border:1px dashed {_C_BORDER}; border-radius:4px; padding:7px;")
+            f" border:1px dashed {_C_BORDER}; border-radius:3px; padding:7px;")
         mp_lay.addWidget(self._marker_hint)
 
         self._marker_list = QListWidget()
         self._marker_list.setFixedHeight(132)
         self._marker_list.setStyleSheet(
             f"QListWidget{{background:{_C_CARD}; border:1px solid {_C_BORDER};"
-            f" border-radius:4px; font-size:10px; padding:2px;}}"
+            f" border-radius:3px; font-size:10px; padding:2px;}}"
             f"QListWidget::item{{padding:3px 2px;}}"
             f"QListWidget::item:selected{{background:{_C_RAISED}; border-left:2px solid {_C_ACCENT};}}")
         self._marker_list.currentRowChanged.connect(self._canvas.select_marker)
@@ -620,7 +661,7 @@ class ResultsPage(QWidget):
         self._del_marker_btn.setFixedHeight(26)
         self._del_marker_btn.setStyleSheet(
             f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
-            f" border-radius:4px; font-size:10px;")
+            f" border-radius:3px; font-size:10px;")
         self._del_marker_btn.clicked.connect(
             lambda: self._canvas.remove_marker(self._canvas.selected_marker))
         mp_lay.addWidget(self._del_marker_btn)
@@ -648,7 +689,7 @@ class ResultsPage(QWidget):
         self._pair_banner.setWordWrap(True)
         self._pair_banner.setStyleSheet(
             f"color:{_C_SUCCESS}; font-size:10px; background:{_C_CARD};"
-            f" border:1px solid {_C_SUCCESS}; border-radius:4px; padding:6px;")
+            f" border:1px solid {_C_SUCCESS}; border-radius:3px; padding:6px;")
         self._pair_banner.setVisible(False)
         sb_lay.addWidget(self._pair_banner)
 
@@ -656,7 +697,7 @@ class ResultsPage(QWidget):
         self._pair_exit_btn.setFixedHeight(26)
         self._pair_exit_btn.setStyleSheet(
             f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
-            f" border-radius:4px; font-size:10px;")
+            f" border-radius:3px; font-size:10px;")
         self._pair_exit_btn.clicked.connect(self._clear_pair_average)
         self._pair_exit_btn.setVisible(False)
         sb_lay.addWidget(self._pair_exit_btn)
@@ -675,7 +716,7 @@ class ResultsPage(QWidget):
         self._export_progress.setFixedHeight(24)
         self._export_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._export_progress.setStyleSheet(
-            f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: {_C_TEXT}; }}"
+            f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius:3px; color: {_C_TEXT}; }}"
             f"QProgressBar::chunk {{ background: {_C_ACCENT}; border-radius: 3px; }}"
         )
         self._export_progress.hide()
@@ -702,8 +743,8 @@ class ResultsPage(QWidget):
         bot_lay.addWidget(self._reset_view_btn)
         # ──────────────────────────────────────────────────────────────
 
-        prev_btn = self._nav_btn("◀", self._prev_frame)
-        bot_lay.addWidget(prev_btn)
+        self._prev_btn = self._nav_btn("◀", self._prev_frame)
+        bot_lay.addWidget(self._prev_btn)
 
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setMinimum(0)
@@ -711,8 +752,8 @@ class ResultsPage(QWidget):
         self._slider.valueChanged.connect(self._on_slider)
         bot_lay.addWidget(self._slider, 1)
 
-        next_btn = self._nav_btn("▶", self._next_frame)
-        bot_lay.addWidget(next_btn)
+        self._next_btn = self._nav_btn("▶", self._next_frame)
+        bot_lay.addWidget(self._next_btn)
 
         bot_lay.addSpacing(12)
 
@@ -738,9 +779,12 @@ class ResultsPage(QWidget):
         self._fps_spin.setRange(1, 30)
         self._fps_spin.setValue(5)
         self._fps_spin.setFixedWidth(64)
-        self._fps_spin.valueChanged.connect(
-            lambda v: self._play_timer.setInterval(1000 // v)
-        )
+        # The rate is read fresh on every tick by _advance, so changing it
+        # mid-playback takes effect at the next frame without restarting.
+        self._fps_spin.setToolTip(
+            "Playback rate for the frame scrubber.\n"
+            "This is a review speed, unrelated to the capture rate used for "
+            "velocity and strain rate.")
         bot_lay.addWidget(self._fps_spin)
 
         # ── Scale: pixel size and the unit to report in ───────────────
@@ -871,6 +915,7 @@ class ResultsPage(QWidget):
 
     def reset_markers(self) -> None:
         """Drop all marker state. Called when a new session starts."""
+        self._traj_cache.clear()
         self._place_btn.setChecked(False)
         self._streak_chk.setChecked(False)
         self._trail_combo.setCurrentIndex(0)
@@ -909,12 +954,13 @@ class ResultsPage(QWidget):
             self._canvas.set_markers([])
             return
         pts = self._canvas.markers()
-        self._canvas.set_marker_draw_positions(analysis.marker_positions(pts, idx))
         if not pts:
+            self._canvas.set_marker_draw_positions([])
             self._canvas.set_streaklines(None)
             return
         trail = self._trail_combo.currentData() or 0
-        trajs = analysis.get_trajectories_from_seeds(pts, idx, trail)
+        trajs, draw_pts = self._cached_trajectories(pts, idx, trail)
+        self._canvas.set_marker_draw_positions(draw_pts)
         self._canvas.set_streaklines(
             [t["points"] for t in trajs],
             colors=[marker_color(i) for i in range(len(trajs))],
@@ -941,6 +987,10 @@ class ResultsPage(QWidget):
         """Refresh after analysis completes."""
         n = len(self._wizard.analysis.results)
         self._unit_scale_cache.clear()
+        # Both caches are keyed by path and frame index, which a new run reuses
+        # while their contents differ. Clearing here is what stops the previous
+        # sequence's frames and trajectories being served for this one.
+        self._invalidate_caches()
         # Markers are indexed against the previous run's displacement fields, so
         # they are meaningless for a new sequence.
         # Do this silently: clear_markers() emits markers_changed, whose slot
@@ -962,6 +1012,59 @@ class ResultsPage(QWidget):
         self._frame = 0
         self._show_frame(0)
 
+    # ------------------------------------------------------------------
+    # Caches
+    # ------------------------------------------------------------------
+    # Scrubbing and playback revisit the same frames repeatedly. Both caches
+    # are bounded and keyed by exactly what the result depends on, so a stale
+    # entry cannot be served after the thing it was derived from changes.
+
+    def _background_image(self, path: str):
+        """Decoded frame for `path`, from cache when possible."""
+        hit = self._img_cache.get(path)
+        if hit is not None:
+            self._img_cache.move_to_end(path)
+            return hit
+        try:
+            from src.core.analysis import _load_image
+            img = _load_image(path)
+        except Exception as exc:
+            print(f"Failed to load image {path}: {exc}")
+            return None
+        self._img_cache[path] = img
+        while len(self._img_cache) > self._IMG_CACHE_MAX:
+            self._img_cache.popitem(last=False)
+        return img
+
+    def _cached_trajectories(self, pts, idx: int, trail: int):
+        """Marker trajectories, from cache when the inputs are unchanged.
+
+        Keyed on the marker positions themselves, so moving, adding or removing
+        a marker misses the cache rather than redrawing the previous paths.
+        """
+        key = (idx, trail, tuple((round(x, 3), round(y, 3)) for x, y in pts))
+        hit = self._traj_cache.get(key)
+        if hit is not None:
+            self._traj_cache.move_to_end(key)
+            return hit
+        analysis = self._wizard.analysis
+        trajs = analysis.get_trajectories_from_seeds(pts, idx, trail)
+        value = (trajs, analysis.marker_positions(pts, idx))
+        self._traj_cache[key] = value
+        while len(self._traj_cache) > self._TRAJ_CACHE_MAX:
+            self._traj_cache.popitem(last=False)
+        return value
+
+    def _invalidate_caches(self) -> None:
+        """Drop cached frames and trajectories.
+
+        Called whenever the underlying sequence changes. Trajectories also
+        depend on the displacement fields, so a re-analysis must clear them
+        even though the marker positions may be identical.
+        """
+        self._img_cache.clear()
+        self._traj_cache.clear()
+
     def _show_frame(self, idx: int) -> None:
         """
         Load the actual deformed image for frame `idx` and display it as
@@ -974,14 +1077,7 @@ class ResultsPage(QWidget):
 
         # 1. ── Load and display the deformed image ──────────────────
         if idx < len(analysis.def_paths):
-            path = analysis.def_paths[idx]
-
-            try:
-                from src.core.analysis import _load_image
-                img = _load_image(path)
-            except Exception as e:
-                img = None
-                print(f"Failed to load image {path}: {e}")
+            img = self._background_image(analysis.def_paths[idx])
 
             if img is not None:
                 keep = self._canvas._image_arr is not None
@@ -1308,12 +1404,21 @@ class ResultsPage(QWidget):
 
     def _on_slider(self, val: int) -> None:
         self._frame = val
+        # Never scrub out from under a pair average: the slider position is
+        # still meaningful state, but rendering it would replace the average
+        # on screen while the sidebar still described it.
+        if self._pair_avg is not None:
+            return
         # Loading, colouring and uploading a full-resolution frame for every
         # intermediate slider event makes scrubbing lag behind the pointer.
         # Render the most recent position after a very short coalescing window.
         self._scrub_timer.start()
 
     def _render_scrubbed_frame(self) -> None:
+        # A queued scrub can arrive after pair mode was entered; the deferral
+        # is what makes that possible, so the guard belongs here too.
+        if self._pair_avg is not None:
+            return
         self._show_frame(self._frame)
 
     def _sync_field_buttons(self) -> None:
@@ -1402,15 +1507,32 @@ class ResultsPage(QWidget):
             label = ", ".join(f"{a + 1}→{b + 1}" for a, b in self._pair_list[:4])
             if n > 4:
                 label += f", +{n - 4} more"
-            self._pair_banner.setText(
-                f"<b>Averaging {n} frame pair{'s' if n != 1 else ''}</b><br>{label}"
-                f"<br>Cumulative strain unavailable in this mode.")
+            avg = self._pair_avg
+            dt_ms = getattr(avg, "elapsed", 0.0) * 1e3
+            text = (f"<b>Averaging {n} frame pair{'s' if n != 1 else ''}</b>"
+                    f"<br>{label}"
+                    f"<br>Interval {dt_ms:.4g} ms")
+            # Unequal spans change what the displacement means: it is then the
+            # averaged velocity over a representative interval rather than a
+            # motion any single pair measured. Say so where it is being read.
+            if not getattr(avg, "pair_spans_equal", True):
+                text += ("<br><span style='color:" + C_WARNING + "'>"
+                         "Pairs span different durations — displacement is the "
+                         "mean velocity over the mean interval.</span>")
+            text += "<br>Accumulated strain unavailable in this mode."
+            self._pair_banner.setText(text)
 
         # Scrubbing and playback have no meaning for a single averaged field.
+        self._scrub_timer.stop()
         if active and self._play_btn.isChecked():
             self._play_btn.setChecked(False)
             self._toggle_play(False)
-        for w in (self._slider, self._play_btn):
+        # The step buttons have to be disabled with the slider. Disabling a
+        # QSlider only blocks the user dragging it -- setValue() from the step
+        # buttons still goes through and still emits valueChanged, so a click
+        # on the arrows would render a single frame underneath a banner saying
+        # an average was being shown.
+        for w in (self._slider, self._play_btn, self._prev_btn, self._next_btn):
             w.setEnabled(not active)
 
         # Cumulative strain buttons cannot be honoured while averaging.
@@ -1459,15 +1581,38 @@ class ResultsPage(QWidget):
         self._slider.setValue(min(self._slider.maximum(), self._slider.value() + 1))
 
     def _advance(self) -> None:
+        """Show the next frame, then schedule the one after it.
+
+        Self-rescheduling rather than a repeating timer. A repeating timer keeps
+        firing whether or not the previous frame finished drawing, so any frame
+        that overruns the interval -- a large image, a cold cache, a busy
+        machine -- leaves queued timeouts behind it. Those accumulate, the event
+        loop never drains, and the window stops responding to the Stop button
+        that would end it.
+        //
+        Measuring the render and deducting it from the next delay keeps the
+        requested rate when frames are quick, and degrades to "as fast as this
+        machine can draw" when they are not, instead of building a backlog.
+        """
+        if not self._play_btn.isChecked():
+            return
+
+        started = time.perf_counter()
         nxt = self._slider.value() + 1
         if nxt > self._slider.maximum():
             nxt = 0
         self._slider.setValue(nxt)
 
+        target = 1000.0 / max(1, self._fps_spin.value())
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        # A floor of one tick keeps the event loop breathing even when the
+        # render already exceeds the requested interval.
+        self._play_timer.start(int(max(1.0, target - elapsed_ms)))
+
     def _toggle_play(self, checked: bool) -> None:
         if checked:
             self._play_btn.setText("⏹  Stop")
-            self._play_timer.start()
+            self._play_timer.start(int(1000.0 / max(1, self._fps_spin.value())))
         else:
             self._play_btn.setText("▶  Play")
             self._play_timer.stop()
@@ -1572,7 +1717,7 @@ class ResultsPage(QWidget):
         self._export_progress.setValue(0)
         self._export_progress.setFormat("Exporting HDF5... %p%")
         self._export_progress.setStyleSheet(
-            f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: {_C_TEXT}; }}"
+            f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius:3px; color: {_C_TEXT}; }}"
             f"QProgressBar::chunk {{ background: {_C_ACCENT}; border-radius: 3px; }}"
         )
 
@@ -1589,13 +1734,13 @@ class ResultsPage(QWidget):
             self._export_progress.setValue(100)
             self._export_progress.setFormat("Export Complete")
             self._export_progress.setStyleSheet(
-                f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: {_C_TEXT}; }}"
+                f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius:3px; color: {_C_TEXT}; }}"
                 f"QProgressBar::chunk {{ background: {_C_SUCCESS}; border-radius: 3px; }}"
             )
         else:
             self._export_progress.setFormat("Export Failed ✗")
             self._export_progress.setStyleSheet(
-                f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius: 4px; color: red; }}"
+                f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius:3px; color: red; }}"
                 f"QProgressBar::chunk {{ background: {_C_CARD}; }}"
             )
             QMessageBox.warning(self, "Export Error", result_str)
@@ -1606,11 +1751,11 @@ class ResultsPage(QWidget):
     def _apply_tab_style(self) -> None:
         active = (
             f"QToolButton {{ background:{_C_ACCENT}; color:#fff; border:none; "
-            f"border-radius:5px; font-size:10px; font-weight:700; padding:3px 8px; }}"
+            f"border-radius:3px; font-size:10px; font-weight:700; padding:3px 8px; }}"
         )
         inactive = (
             f"QToolButton {{ background:{_C_RAISED}; color:{_C_TEXT2}; "
-            f"border:1px solid {_C_BORDER}; border-radius:5px; "
+            f"border:1px solid {_C_BORDER}; border-radius:3px; "
             f"font-size:10px; padding:3px 8px; }} "
             f"QToolButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }}"
         )
@@ -1630,7 +1775,7 @@ class ResultsPage(QWidget):
         btn.clicked.connect(slot)
         btn.setStyleSheet(
             f"QToolButton {{ background:{_C_CARD}; color:{_C_TEXT2}; "
-            f"border:1px solid {_C_BORDER}; border-radius:5px; font-size:13px; }} "
+            f"border:1px solid {_C_BORDER}; border-radius:3px; font-size:13px; }} "
             f"QToolButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }}"
         )
         return btn
