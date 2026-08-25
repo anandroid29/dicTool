@@ -192,4 +192,9 @@ class Wizard(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.analysis.cancel()
+        # Give the native analysis worker a chance to observe cancellation and
+        # finish before allowing its signal bridge/widget tree to be destroyed.
+        if not self._analysis.shutdown():
+            event.ignore()
+            return
         event.accept()

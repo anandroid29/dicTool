@@ -162,9 +162,16 @@ Available controls are:
 - **Include / Exclude overrides:** draw persistent image-space rectangle,
   polygon, or circle overrides for each adjacent pair. Include wins if both
   channels overlap.
+- **Frame override toolbar:** scrub to any frame with the bottom transport, then
+  draw frame-owned Include/Exclude/Erase corrections or set a threshold used
+  only on that frame. **Replace base** makes the frame Include drawing the
+  complete mask; **Copy previous** duplicates an adjacent frame's correction;
+  **Set → future** stores the current correction once as the inherited default
+  for following frames, while later exact-frame edits still take precedence.
 
-The selected zero-strain-frame preview shown here is also used by the Parameters
-preview. Later Analysis frames show their own measured pairwise masks. A failed
+The full sequence can be played or scrubbed before analysis. Frame overrides
+take precedence over the global base and are stored with HDF5 sessions. The
+selected zero-strain-frame mask is also used by the Parameters preview. A failed
 point in one interval does not disable the corresponding image location in later
 intervals.
 
