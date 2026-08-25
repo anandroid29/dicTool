@@ -18,14 +18,20 @@ if TYPE_CHECKING:
 
 from src.ui.image_canvas import ImageCanvas, ROITool
 
-_C_BG      = "#08111d"
-_C_SURFACE = "#0e1c2e"
-_C_CARD    = "#132035"
-_C_BORDER  = "#1e3a5a"
-_C_ACCENT  = "#3b82f6"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_SUCCESS = "#10b981"
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2
+
+_C_ACCENT = C_ACCENT
+_C_BG = C_BG
+_C_BORDER = C_BORDER
+_C_CARD = C_CARD
+_C_SUCCESS = C_SUCCESS
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+
+
 
 
 def _tool_btn(icon: str, tip: str) -> QToolButton:
@@ -36,7 +42,7 @@ def _tool_btn(icon: str, tip: str) -> QToolButton:
     btn.setFixedSize(44, 44)
     btn.setStyleSheet(
         f"QToolButton {{ background:{_C_CARD}; color:{_C_TEXT2}; "
-        f"border:1px solid {_C_BORDER}; border-radius:8px; font-size:18px; }} "
+        f"border:1px solid {_C_BORDER}; border-radius:3px; font-size:18px; }} "
         f"QToolButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }} "
         f"QToolButton:checked {{ background:{_C_ACCENT}; color:#fff; "
         f"border-color:{_C_ACCENT}; }} "
@@ -184,7 +190,7 @@ class ROIPage(QWidget):
         clr_btn.clicked.connect(self._clear_active_mask)
         clr_btn.setStyleSheet(
             f"QPushButton {{ background:{_C_CARD}; color:{_C_TEXT2}; "
-            f"border:1px solid {_C_BORDER}; border-radius:8px; font-size:16px; }} "
+            f"border:1px solid {_C_BORDER}; border-radius:3px; font-size:16px; }} "
             f"QPushButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }}"
         )
         tb_lay.addWidget(clr_btn)
@@ -389,7 +395,7 @@ class ROIPage(QWidget):
         elif roi_n:
             self._roi_lbl.setText(
                 f"ROI: {roi_n:,} px  ·  draw amber strain-origin line")
-            self._roi_lbl.setStyleSheet("color:#f59e0b; font-size:11px;")
+            self._roi_lbl.setStyleSheet("color:#c2954f; font-size:11px;")
         else:
             self._roi_lbl.setText("Draw the analysis ROI first")
             self._roi_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
@@ -444,7 +450,7 @@ class ROIPage(QWidget):
             sx, sy = self._wizard.seed_xy
             self._canvas.set_seed_xy((sx, sy))
             self._seed_status.setText(f"Seed: ({sx}, {sy})")
-            self._seed_status.setStyleSheet("color:#10b981; font-size:11px;")
+            self._seed_status.setStyleSheet("color:#6a9c74; font-size:11px;")
         else:
             self._seed_status.setText("No seed — will default to ROI centroid")
             self._seed_status.setStyleSheet("color:#94a3b8; font-size:11px;")

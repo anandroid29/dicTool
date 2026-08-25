@@ -27,16 +27,22 @@ from PyQt6.QtWidgets import (
 from src.ui.components import FooterButton
 from src.ui.image_canvas import ImageCanvas, ROITool
 
+# Palette comes from the single source of truth in theme.py. These were
+# duplicated literals, which is why re-theming previously left pages behind.
+from src.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+
+_C_ACCENT = C_ACCENT
+_C_BORDER = C_BORDER
+_C_CARD = C_CARD
+_C_SURFACE = C_SURFACE
+_C_TEXT = C_TEXT
+_C_TEXT2 = C_TEXT2
+_C_TEXT3 = C_TEXT3
+
+
 if TYPE_CHECKING:
     from src.ui.wizard import Wizard
 
-_C_SURFACE = "#0e1c2e"
-_C_CARD    = "#132035"
-_C_BORDER  = "#1e3a5a"
-_C_ACCENT  = "#3b82f6"
-_C_TEXT    = "#e2e8f0"
-_C_TEXT2   = "#94a3b8"
-_C_TEXT3   = "#475569"
 _C_INCLUDE = (16, 185, 129)    # green
 _C_EXCLUDE = (239, 68, 68)     # red
 
@@ -46,7 +52,7 @@ _METHODS = ["None", "Contrast", "Edge Detection", "Hybrid"]
 _CHOICE_STYLE = f"""
 QPushButton {{
     background: {_C_CARD}; color: {_C_TEXT2}; border: 1px solid {_C_BORDER};
-    border-radius: 6px;
+    border-radius:3px;
 }}
 QPushButton:hover {{ border-color: {_C_ACCENT}; color: {_C_TEXT}; }}
 QPushButton:checked {{

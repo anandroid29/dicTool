@@ -1380,44 +1380,131 @@ class DICAnalysis:
             valid=ok, elapsed=dt,
         )
 
-    def average_pairs(self, pairs) -> "PairResult":
-        """Element-wise mean across several frame pairs.
+    # Fields that are rates -- quantities per unit time. These are the only
+    # ones a plain mean is valid on, because their value does not depend on how
+    # long the interval that produced them happened to be.
+    _PAIR_INTENSIVE = ("Vx", "Vy",
+                       "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+                       "Exx_rate", "Exy_rate", "Eyy_rate",
+                       "corr")
 
-        Averaging ignores NaN per pixel, so a point that dropped out during one
-        pair still contributes through the pairs where it was tracked. A point
-        present in no pair stays NaN rather than becoming zero.
+    @staticmethod
+    def _nan_mean(stack) -> tuple:
+        """Per-pixel mean ignoring NaN, plus how many values fed each pixel.
+
+        float64 accumulator regardless of the stored precision: averaging is
+        the step meant to reduce noise, so it must not contribute any of its own.
+        """
+        arr = np.stack(stack).astype(np.float64, copy=False)
+        arr = np.where(np.isfinite(arr), arr, np.nan)
+        counts = np.sum(np.isfinite(arr), axis=0)
+        with np.errstate(invalid="ignore"):
+            summed = np.nansum(arr, axis=0, dtype=np.float64)
+            mean = np.where(counts > 0, summed / np.maximum(counts, 1), np.nan)
+        return mean, counts
+
+    def average_pairs(self, pairs) -> "PairResult":
+        """Combine several frame pairs into one representative measurement.
+
+        Only the rate fields are averaged directly. Displacement is not
+        averageable across pairs of unequal span: a pair covering three
+        intervals accumulates roughly three times the displacement of a
+        one-interval pair, so a plain mean of the two is a mean of
+        incommensurable numbers that corresponds to no interval at all.
+
+        Instead the average describes one representative interval, of the mean
+        pair duration, and displacement is reconstructed from the averaged
+        velocity over that duration. When every pair has the same span -- the
+        usual case -- this is arithmetically identical to averaging the
+        displacements, so nothing changes; when spans differ it is the
+        difference between a defined quantity and a meaningless one.
+
+        Magnitudes (|Δ|, effective velocity, equivalent strain rate) are
+        recomputed from the averaged components rather than averaged
+        themselves. Averaging magnitudes rectifies noise: every fluctuation
+        contributes a positive amount regardless of sign, so the mean of
+        magnitudes is biased high and never cancels. Averaging the signed
+        components first lets it cancel, then the magnitude is taken once.
+
+        Points are averaged over whichever pairs tracked them, so one dropout
+        does not discard the rest; `pair_support` records how many pairs
+        actually contributed to each point.
         """
         pairs = [tuple(p) for p in pairs]
         if not pairs:
             raise ValueError("Select at least one frame pair.")
 
         per_pair = [self.pair_kinematics(i, j) for i, j in pairs]
+        shape = per_pair[0].u.shape
+        nan = lambda: np.full(shape, np.nan)
 
-        out = per_pair[0]
-        if len(per_pair) > 1:
-            for name in self.PAIR_FIELDS:
-                stack = [getattr(p, name) for p in per_pair]
-                stack = [s for s in stack if s is not None]
-                if not stack:
-                    continue
-                with np.errstate(invalid="ignore"):
-                    # all-NaN pixels warn under plain nanmean; they are expected
-                    # here and must stay NaN.
-                    # float64 accumulator, as in pair_kinematics: averaging is
-                    # the step meant to reduce noise, so it must not introduce
-                    # its own at the precision of the stored fields.
-                    arr = np.stack(stack).astype(np.float64, copy=False)
-                    arr = np.where(np.isfinite(arr), arr, np.nan)
-                    counts = np.sum(np.isfinite(arr), axis=0)
-                    summed = np.nansum(arr, axis=0, dtype=np.float64)
-                    mean = np.where(counts > 0, summed / np.maximum(counts, 1), np.nan)
-                setattr(out, name, mean)
-            out.valid = np.any(np.stack([p.valid for p in per_pair]), axis=0)
-            out.elapsed = float(np.mean([p.elapsed for p in per_pair]))
+        # 1. Average the rate fields.
+        averaged = {}
+        support = np.zeros(shape, dtype=np.int32)
+        for name in self._PAIR_INTENSIVE:
+            stack = [getattr(p, name) for p in per_pair]
+            stack = [np.asarray(s) for s in stack if s is not None]
+            if not stack:
+                averaged[name] = None
+                continue
+            mean, counts = self._nan_mean(stack)
+            averaged[name] = mean
+            if name == "Vx":
+                support = counts.astype(np.int32)
+
+        # 2. Representative interval, and the displacement that spans it.
+        T = float(np.mean([p.elapsed for p in per_pair]))
+        Vx, Vy = averaged.get("Vx"), averaged.get("Vy")
+        du = Vx * T if Vx is not None else nan()
+        dv = Vy * T if Vy is not None else nan()
+
+        # 3. Magnitudes from the averaged components, never from averaged
+        #    magnitudes -- see the docstring.
+        with np.errstate(invalid="ignore"):
+            mag = np.sqrt(du ** 2 + dv ** 2)
+            Veff = (np.sqrt(Vx ** 2 + Vy ** 2)
+                    if Vx is not None and Vy is not None else nan())
+
+        Exx_r = averaged.get("Exx_rate")
+        Exy_r = averaged.get("Exy_rate")
+        Eyy_r = averaged.get("Eyy_rate")
+        if Exx_r is not None and Exy_r is not None and Eyy_r is not None:
+            from .strain import von_mises_equivalent
+            Eeff_r = von_mises_equivalent(Exx_r, Eyy_r, Exy_r)
+            # Engineering shear is exactly twice tensor shear, by definition;
+            # deriving it keeps that identity true of the averaged field.
+            Gxy_r = 2.0 * Exy_r
+        else:
+            Eeff_r = Gxy_r = nan()
 
         label = ", ".join(f"{i + 1}→{j + 1}" for i, j in pairs)
-        out.image_path = (f"average of {len(pairs)} pairs [{label}]"
-                          if len(pairs) > 1 else f"pair {label}")
+        # A fresh result. The previous version returned per_pair[0] with its
+        # arrays overwritten, so anything still holding that pair's result saw
+        # it silently become the average.
+        out = PairResult(
+            image_path=(f"average of {len(pairs)} pairs [{label}]"
+                        if len(pairs) > 1 else f"pair {label}"),
+            u=du, v=dv,
+            u_inc=du, v_inc=dv, mag_inc=mag,
+            # Accumulated strain is not defined for an average of arbitrary
+            # pairs; kept explicitly NaN rather than absent so anything reading
+            # these gets "no value" instead of an attribute error.
+            Exx=nan(), Exy=nan(), Eyy=nan(), Eeff=nan(),
+            du_dx=nan(), du_dy=nan(), dv_dx=nan(), dv_dy=nan(),
+            corr=averaged.get("corr"),
+            Vx=Vx, Vy=Vy, Veff=Veff,
+            dVx_dx=averaged.get("dVx_dx"), dVx_dy=averaged.get("dVx_dy"),
+            dVy_dx=averaged.get("dVy_dx"), dVy_dy=averaged.get("dVy_dy"),
+            Exx_rate=Exx_r, Exy_rate=Exy_r, Gxy_rate=Gxy_r,
+            Eyy_rate=Eyy_r, Eeff_rate=Eeff_r,
+            valid=support > 0,
+            elapsed=T,
+        )
+        # Not a PairResult field: attached so the viewer can report how evenly
+        # the pairs actually covered the specimen.
+        out.pair_support = support
+        out.pair_count = len(pairs)
+        out.pair_spans_equal = len({abs(j - i) for i, j in pairs}) == 1
         return out
 
     def get_global_range(self, field: str,
