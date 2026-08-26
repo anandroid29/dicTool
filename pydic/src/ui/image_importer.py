@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import re
 from collections import OrderedDict
 from typing import List, Optional
@@ -90,6 +91,10 @@ class ImageSequenceImporterDialog(QDialog):
         self._updating_selection = False
 
         self._play_timer = QTimer(self)
+        # Single-shot and self-rescheduling: each preview frame decodes an
+        # image, which on a slow disk can outlast the interval. A repeating
+        # timer would queue those overruns until the dialog stopped responding.
+        self._play_timer.setSingleShot(True)
         self._play_timer.timeout.connect(self._advance_preview)
 
         self.setWindowTitle("Load Image Sequence")
@@ -415,19 +420,23 @@ class ImageSequenceImporterDialog(QDialog):
     def _toggle_playback(self, playing: bool) -> None:
         if playing and len(self._selected_indices) >= 2:
             self._play_btn.setText("Pause")
-            self._play_timer.start()
+            self._play_timer.start(self._playback_interval_ms())
         else:
             self._play_btn.setText("Play")
             self._play_timer.stop()
 
+    def _playback_interval_ms(self) -> int:
+        return max(16, int(round(1000.0 / self._preview_fps_spin.value())))
+
     def _update_playback_interval(self, *_args) -> None:
-        self._play_timer.setInterval(max(
-            16, int(round(1000.0 / self._preview_fps_spin.value()))))
+        # Read fresh on each tick, so a rate change applies at the next frame.
+        self._play_timer.setInterval(self._playback_interval_ms())
 
     def _advance_preview(self) -> None:
-        if not self._selected_indices:
+        if not self._play_btn.isChecked() or not self._selected_indices:
             self._play_btn.setChecked(False)
             return
+        started = time.perf_counter()
         position = self._preview_slider.value() + 1
         if position >= len(self._selected_indices):
             if self._loop_check.isChecked():
@@ -436,6 +445,9 @@ class ImageSequenceImporterDialog(QDialog):
                 self._play_btn.setChecked(False)
                 return
         self._preview_slider.setValue(position)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._play_timer.start(
+            int(max(1.0, self._playback_interval_ms() - elapsed_ms)))
 
     def _step_preview(self, delta: int) -> None:
         self._play_btn.setChecked(False)

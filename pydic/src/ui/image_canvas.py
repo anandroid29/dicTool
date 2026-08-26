@@ -214,6 +214,7 @@ class ImageCanvas(QWidget):
     markers_changed  = pyqtSignal(object)   # list[(x, y)] in image coords
     marker_selected  = pyqtSignal(int)      # index, or -1
     marker_requested = pyqtSignal(float, float)  # raw click, page maps to reference
+    undo_availability_changed = pyqtSignal(bool)  # whether undo has anything left
 
     _ROI_FILL_COLOR   = QColor(47, 129, 247,  55)
     _ROI_BORDER_COLOR = QColor(47, 129, 247, 200)
@@ -254,6 +255,14 @@ class ImageCanvas(QWidget):
         self._context_qimg: Optional[QImage] = None
         self._context_px: Optional[QPixmap] = None
         self._constraint_mask: Optional[np.ndarray] = None
+
+        # ── Undo history for the selection tools ──
+        # Snapshots of everything a drawing action can change, taken just
+        # before each change. Masks are stored bit-packed: a bool array is one
+        # byte per pixel, so an unpacked history of a 2 MP image would cost
+        # 2 MB per step and tens of megabytes over a session of drawing.
+        self._undo_stack: List[tuple] = []
+        self._UNDO_MAX = 24
 
         # VISUAL SEED & SUBSET PREVIEW
         self._seed_xy: Optional[Tuple[int, int]] = None
@@ -418,6 +427,10 @@ class ImageCanvas(QWidget):
         self.update()
 
     def clear_roi(self) -> None:
+        # Clearing is the most destructive action here and the easiest to hit
+        # by accident, so it is undoable like everything else.
+        if self._roi_mask is not None or self._seed_xy is not None:
+            self.push_undo_state()
         self._roi_mask = None;
         self._roi_rgba = None;
         self._roi_qimg = None;
@@ -580,6 +593,7 @@ class ImageCanvas(QWidget):
                 vi = pe.hit_vertex(wx, wy, self._zoom, self._pan_x, self._pan_y)
                 if vi is not None:
                     pe.selected = vi;
+                    self.push_undo_state()   # start of a shape edit
                     pe.dragging = True;
                     self.update();
                     return
@@ -588,6 +602,7 @@ class ImageCanvas(QWidget):
                     p1, p2 = pe.pts[ei], pe.pts[(ei + 1) % len(pe.pts)]
                     pe.pts.insert(ei + 1, QPointF(p1.x() + t * (p2.x() - p1.x()), p1.y() + t * (p2.y() - p1.y())))
                     pe.selected = ei + 1;
+                    self.push_undo_state()   # start of a shape edit
                     pe.dragging = True;
                     self.update();
                     return
@@ -609,11 +624,13 @@ class ImageCanvas(QWidget):
             if event.button() == Qt.MouseButton.LeftButton:
                 hi = re.hit_handle(wx, wy, self._zoom, self._pan_x, self._pan_y)
                 if hi is not None:
+                    self.push_undo_state()   # start of a shape edit
                     re.handle = hi;
                     self.update();
                     return
                 img_pt = self._widget_to_image(pos)
                 if img_pt and re.hit_interior(img_pt):
+                    self.push_undo_state()   # start of a shape edit
                     re.moving = True;
                     self._drag_start = pos.toPoint();
                     self.update();
@@ -636,6 +653,7 @@ class ImageCanvas(QWidget):
                 if 0 <= x < W and 0 <= y < H:
                     # ── ONLY place seed if an ROI exists and the point is inside it ──
                     if self._roi_mask is not None and self._roi_mask[y, x]:
+                        self.push_undo_state()
                         self._seed_xy = (x, y)
                         self.seed_placed.emit(x, y)
                         self.update()
@@ -648,6 +666,8 @@ class ImageCanvas(QWidget):
             if self._tool == ROITool.NONE:
                 self._try_enter_edit(pos, img_pt)
             elif self._tool == ROITool.POLYGON:
+                if not self._poly_pts:
+                    self.push_undo_state()
                 if self._poly_snapped and len(self._poly_pts) >= 3:
                     self._commit_polygon();
                     return
@@ -655,16 +675,21 @@ class ImageCanvas(QWidget):
                 self.shape_drawing_changed.emit(True)
                 self.update()
             elif self._tool == ROITool.POLYLINE:
+                if not self._poly_pts:
+                    self.push_undo_state()
                 self._poly_pts.append(img_pt)
                 self.shape_drawing_changed.emit(True)
                 self.update()
             elif self._tool == ROITool.RECTANGLE:
+                self.push_undo_state()
                 self._rect_start = img_pt;
                 self._rect_cur = img_pt
             elif self._tool == ROITool.CIRCLE:
+                self.push_undo_state()
                 self._circ_centre = img_pt;
                 self._circ_radius = 0.0
             elif self._tool == ROITool.ERASE:
+                self.push_undo_state()
                 self._erase_pts = [img_pt]
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -1135,6 +1160,83 @@ class ImageCanvas(QWidget):
     def _erase_image_radius(self) -> float:
         """Return the fixed screen-space eraser radius in image pixels."""
         return self._erase_radius / max(self._zoom, 1e-9)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Undo
+    # ──────────────────────────────────────────────────────────────────
+
+    def push_undo_state(self) -> None:
+        """Record the current selection so the next change can be undone.
+
+        Called immediately before a change, not after, so the stack always
+        holds states to return *to*. A continuous gesture -- an eraser stroke,
+        a rectangle drag -- records once when it starts, so one undo reverts
+        the whole stroke rather than the last few pixels of it.
+        """
+        mask = self._roi_mask
+        packed = None if mask is None else np.packbits(mask)
+        shape = None if mask is None else mask.shape
+        self._undo_stack.append((packed, shape, self._seed_xy))
+        if len(self._undo_stack) > self._UNDO_MAX:
+            self._undo_stack.pop(0)
+        self.undo_availability_changed.emit(True)
+
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    def clear_undo_history(self) -> None:
+        """Drop the history. For a new image, where old masks do not apply."""
+        self._undo_stack.clear()
+        self.undo_availability_changed.emit(False)
+
+    def undo(self) -> bool:
+        """Restore the selection as it was before the last change."""
+        if not self._undo_stack:
+            return False
+        packed, shape, seed = self._undo_stack.pop()
+
+        if packed is None or shape is None:
+            self._roi_mask = None
+        else:
+            # packbits pads to a byte boundary; take back exactly as many bits
+            # as the image had, or the reshape fails on most image sizes.
+            flat = np.unpackbits(packed, count=int(np.prod(shape)))
+            self._roi_mask = flat.reshape(shape).astype(bool)
+
+        # A seed outside the restored ROI would be a state the user could not
+        # have drawn, so it is dropped with the region that contained it.
+        if (seed is not None and self._roi_mask is not None
+                and not self._roi_mask[seed[1], seed[0]]):
+            seed = None
+        self._seed_xy = seed
+
+        # Any half-finished shape belongs to the change being undone.
+        self._poly_pts.clear()
+        self._poly_snapped = False
+        self._poly_edit = None
+        self._rect_edit = None
+        self._rect_start = self._rect_cur = None
+        self._circ_centre = None
+        self._circ_radius = 0.0
+        self._erase_pts = []
+
+        self._rebuild_roi_pixmap()
+        self.update()
+        self.shape_drawing_changed.emit(False)
+
+        # Undoing back to "nothing drawn" restores an internal mask of None,
+        # but roi_changed carries a mask that consumers index and call .shape
+        # on. Emitting None there raised inside the slot, and PyQt aborts the
+        # process on an unhandled exception in a slot -- the window simply
+        # vanished. An all-False mask is the same state expressed as an array.
+        if self._roi_mask is not None:
+            self.roi_changed.emit(self._roi_mask.copy())
+        elif self._image_arr is not None:
+            self.roi_changed.emit(np.zeros(self._image_arr.shape, dtype=bool))
+
+        self.seed_placed.emit(*(self._seed_xy if self._seed_xy else (-1, -1)))
+        self.undo_availability_changed.emit(bool(self._undo_stack))
+        return True
 
     def _merge_mask(self, new_mask: np.ndarray) -> None:
         if self._constraint_mask is not None:
