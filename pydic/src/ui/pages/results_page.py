@@ -1402,36 +1402,21 @@ class ResultsPage(QWidget):
     # Slots
     # ------------------------------------------------------------------
 
-    def _leave_pair_average_for_transport(self) -> bool:
-        """Drop the average because the user asked to see frames.
-
-        Renders the frame at once rather than leaving it to the scrub
-        debounce. Deferring it left the sidebar reading "Average of N pairs"
-        over an image that was no longer the average for as long as the
-        coalescing window lasted. Only the first event of a drag reaches this,
-        so the debounce still does its job for the rest.
-
-        Returns True if an average was dismissed. The pair list survives, so
-        reopening the dialog offers the same selection back with one click.
-        """
-        if self._pair_avg is None:
-            return False
-        self._pair_avg = None
-        self._sync_pair_ui()
-        self._show_frame(self._frame)
-        return True
-
     def _on_slider(self, val: int) -> None:
         self._frame = val
-        self._leave_pair_average_for_transport()
+        # Never scrub out from under a pair average: the slider position is
+        # still meaningful state, but rendering it would replace the average
+        # on screen while the sidebar still described it.
+        if self._pair_avg is not None:
+            return
         # Loading, colouring and uploading a full-resolution frame for every
         # intermediate slider event makes scrubbing lag behind the pointer.
         # Render the most recent position after a very short coalescing window.
         self._scrub_timer.start()
 
     def _render_scrubbed_frame(self) -> None:
-        # A queued scrub can still arrive after the average was restored by
-        # some other path; rendering a frame then would contradict the banner.
+        # A queued scrub can arrive after pair mode was entered; the deferral
+        # is what makes that possible, so the guard belongs here too.
         if self._pair_avg is not None:
             return
         self._show_frame(self._frame)
@@ -1537,24 +1522,18 @@ class ResultsPage(QWidget):
             text += "<br>Accumulated strain unavailable in this mode."
             self._pair_banner.setText(text)
 
-        # An average replaces the frame on screen, so a running playback would
-        # be fighting it. Stop, but leave the control usable -- pressing it
-        # again is a valid way back to the sequence.
+        # Scrubbing and playback have no meaning for a single averaged field.
         self._scrub_timer.stop()
         if active and self._play_btn.isChecked():
             self._play_btn.setChecked(False)
-            self._play_btn.setText("▶  Play")
-            self._play_timer.stop()
-        # The transport stays live. Disabling it created a dead end: pressing
-        # Play after averaging did nothing, with no indication that the average
-        # had to be dismissed first, so it read as the button being broken.
-        # Using the transport now means "show me frames", which is exactly what
-        # it should mean -- it leaves the average and resumes the sequence. The
-        # pair selection is kept, so reopening the dialog restores it.
+            self._toggle_play(False)
+        # The step buttons have to be disabled with the slider. Disabling a
+        # QSlider only blocks the user dragging it -- setValue() from the step
+        # buttons still goes through and still emits valueChanged, so a click
+        # on the arrows would render a single frame underneath a banner saying
+        # an average was being shown.
         for w in (self._slider, self._play_btn, self._prev_btn, self._next_btn):
-            w.setEnabled(True)
-            w.setToolTip("Leaves the frame-pair average and returns to the "
-                         "sequence." if active else "")
+            w.setEnabled(not active)
 
         # Cumulative strain buttons cannot be honoured while averaging.
         for k, btn in self._field_btns.items():
@@ -1595,29 +1574,11 @@ class ResultsPage(QWidget):
         n = len(self._pair_list)
         self._frame_lbl.setText(f"Average of {n} pair{'s' if n != 1 else ''}")
 
-    def _step_frame(self, delta: int) -> None:
-        """Step one frame, leaving a pair average if one is displayed.
-
-        The exit cannot ride on the slider's valueChanged alone: at either end
-        of the sequence setValue is a no-op and emits nothing, so stepping
-        there would otherwise leave the average on screen with no response at
-        all -- the same dead end the disabled transport used to create.
-        """
-        target = int(np.clip(self._slider.value() + delta,
-                             0, self._slider.maximum()))
-        if target == self._slider.value():
-            # At either end there is no frame to move to, but leaving the
-            # average is still the right response to a transport press.
-            self._leave_pair_average_for_transport()
-            return
-        # The slider's own handler leaves the average and renders.
-        self._slider.setValue(target)
-
     def _prev_frame(self) -> None:
-        self._step_frame(-1)
+        self._slider.setValue(max(0, self._slider.value() - 1))
 
     def _next_frame(self) -> None:
-        self._step_frame(+1)
+        self._slider.setValue(min(self._slider.maximum(), self._slider.value() + 1))
 
     def _advance(self) -> None:
         """Show the next frame, then schedule the one after it.
@@ -1650,9 +1611,6 @@ class ResultsPage(QWidget):
 
     def _toggle_play(self, checked: bool) -> None:
         if checked:
-            # Starting playback means the user wants to watch the sequence, so
-            # an average on screen is dismissed rather than blocking the press.
-            self._leave_pair_average_for_transport()
             self._play_btn.setText("⏹  Stop")
             self._play_timer.start(int(1000.0 / max(1, self._fps_spin.value())))
         else:
