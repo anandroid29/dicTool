@@ -10,12 +10,17 @@ This is the correct behaviour — the canvas must show the deformed frame,
 not the fixed reference image.
 """
 from __future__ import annotations
+import importlib.util
 import os
+import shutil
+import tempfile
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal
+from PyQt6.QtCore import (
+    Qt, QTimer, pyqtSlot, QThread, pyqtSignal, QObject, QRunnable, QThreadPool,
+)
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialog,
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
@@ -25,7 +30,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.stats import field_summary
-from src.core.compact_field import finite_values
+from src.core.compact_field import finite_values, CompactField, CompactMask
 from src.core.units import LENGTH_UNIT_ORDER
 from src.ui import render
 from src.ui.components import ResultColorBar
@@ -187,16 +192,24 @@ class ExportWorker(QThread):
     finished_export = pyqtSignal(bool, str)
     progress_export = pyqtSignal(int)
 
-    def __init__(self, analysis, path, parent=None):
+    def __init__(self, analysis, path, temporal_results=None,
+                 temporal_pairs=None, temporal_metadata=None, parent=None):
         super().__init__(parent)
         self.analysis = analysis
         self.path = path
+        self.temporal_results = temporal_results
+        self.temporal_pairs = temporal_pairs
+        self.temporal_metadata = dict(temporal_metadata or {})
 
     def run(self):
         try:
             def prog_cb(frac):
                 self.progress_export.emit(int(frac * 100))
-            self.analysis.export_hdf5(self.path, progress_cb=prog_cb)
+            self.analysis.export_hdf5(
+                self.path, progress_cb=prog_cb,
+                temporal_results=self.temporal_results,
+                temporal_pairs=self.temporal_pairs,
+                temporal_metadata=self.temporal_metadata)
             self.finished_export.emit(True, self.path)
         except Exception as e:
             self.finished_export.emit(False, str(e))
@@ -211,12 +224,15 @@ class _VideoWorker(QThread):
     progress = pyqtSignal(int)
     done = pyqtSignal(bool, str)
 
-    def __init__(self, analysis, spec, path, markers, parent=None):
+    def __init__(self, analysis, spec, path, markers,
+                 temporal_results=None, temporal_pairs=None, parent=None):
         super().__init__(parent)
         self._analysis = analysis
         self._spec = spec
         self._path = path
         self._markers = list(markers or [])
+        self._temporal_results = temporal_results
+        self._temporal_pairs = temporal_pairs
         self.cancel_flag = [False]
 
     def run(self):
@@ -224,11 +240,190 @@ class _VideoWorker(QThread):
             from src.ui.video_export import export_video
             out = export_video(
                 self._analysis, self._spec, self._path, markers=self._markers,
+                results=self._temporal_results, pairs=self._temporal_pairs,
                 progress_cb=lambda f, _m: self.progress.emit(int(f * 100)),
                 cancel_flag=self.cancel_flag)
             self.done.emit(True, out)
         except Exception as e:
             self.done.emit(False, str(e))
+
+
+class _PairTaskSignals(QObject):
+    done = pyqtSignal(int, int, object, str)
+    progress = pyqtSignal(int, int, int, str)
+
+
+class _PairTask(QRunnable):
+    """One pair calculation; emits data only and never touches a QWidget."""
+
+    def __init__(self, analysis, generation: int, index: int, pair,
+                 strain_window: int, use_gpu: bool,
+                 cancel_flag: list,
+                 include_strain: bool = True,
+                 include_rate: bool = True,
+                 cache_path: Optional[str] = None) -> None:
+        super().__init__()
+        self.signals = _PairTaskSignals()
+        self._analysis = analysis
+        self._generation = int(generation)
+        self._index = int(index)
+        self._pair = pair
+        self._strain_window = int(strain_window)
+        self._use_gpu = bool(use_gpu)
+        self._cancel_flag = cancel_flag
+        self._include_strain = bool(include_strain)
+        self._include_rate = bool(include_rate)
+        self._cache_path = cache_path
+
+    def run(self) -> None:
+        try:
+            a, b = self._pair
+            result = self._analysis.pair_kinematics(
+                a, b, strain_window=self._strain_window,
+                use_gpu=self._use_gpu,
+                progress_cb=lambda fraction, message: self.signals.progress.emit(
+                    self._generation, self._index,
+                    int(np.clip(fraction, 0.0, 1.0) * 100), message),
+                cancel_flag=self._cancel_flag,
+                include_strain=self._include_strain,
+                include_rate=self._include_rate)
+            if self._cancel_flag[0]:
+                raise RuntimeError("Temporal calculation cancelled.")
+            if self._cache_path:
+                from src.core.temporal import save_temporal_result
+                result = save_temporal_result(self._cache_path, result)
+            self.signals.done.emit(
+                self._generation, self._index, result, "")
+        except Exception as exc:
+            self.signals.done.emit(
+                self._generation, self._index, None, str(exc))
+
+
+class _TemporalHistorySignals(QObject):
+    progress = pyqtSignal(int, int, str)
+    item_ready = pyqtSignal(int, int)
+    done = pyqtSignal(int, bool, str)
+
+
+class _TemporalHistoryTask(QRunnable):
+    """Derive rate and accumulated strain from averaged velocity frames."""
+
+    def __init__(self, analysis, generation: int, pairs, strain_window: int,
+                 use_gpu: bool, cancel_flag: list, store) -> None:
+        super().__init__()
+        self.signals = _TemporalHistorySignals()
+        self._analysis = analysis
+        self._generation = int(generation)
+        self._pairs = list(pairs)
+        self._strain_window = int(strain_window)
+        self._use_gpu = bool(use_gpu)
+        self._cancel_flag = cancel_flag
+        self._store = store
+
+    def run(self) -> None:
+        try:
+            from src.core.compact_field import CompactField
+            from src.core.strain import compute_velocity_strains
+            from src.core.strain_accum import StrainPathTracker
+            from src.core.temporal import save_temporal_result
+
+            shape = tuple(int(value) for value in self._store[0].u.shape)
+            roi = np.asarray(self._analysis._roi_mask, dtype=bool)
+            origin = getattr(self._analysis, "_strain_origin_mask", None)
+            if origin is None or not np.any(origin):
+                origin = roi
+            tracker = StrainPathTracker(
+                shape, origin, roi,
+                self._analysis.params.subset_radius,
+                self._analysis.params.subset_spacing)
+            persistent = (
+                "Exx_inf", "Eyy_inf", "Exy_inf", "Eeff_inf",
+                "Exx_gl", "Eyy_gl", "Exy_gl")
+            swept = {name: np.full(shape, np.nan, dtype=np.float32)
+                     for name in persistent}
+            encountered = np.zeros(shape, dtype=bool)
+
+            def deposit(snapshot) -> None:
+                new = roi & ~encountered
+                for name in persistent:
+                    new &= np.isfinite(np.asarray(snapshot[name]))
+                if not new.any():
+                    return
+                for name in persistent:
+                    swept[name][new] = np.asarray(snapshot[name])[new]
+                encountered[new] = True
+
+            def accumulated_fields():
+                values = {
+                    "Exx_gl": swept["Exx_gl"],
+                    "Eyy_gl": swept["Eyy_gl"],
+                    "Exy_gl": swept["Exy_gl"],
+                    "Eeff_gl": swept["Eeff_inf"],
+                }
+                complete = np.logical_and.reduce(
+                    [np.isfinite(values[name]) for name in values])
+                indices = np.flatnonzero(complete.reshape(-1)).astype(
+                    np.uint32, copy=False)
+                return {
+                    name: CompactField.from_dense(field, indices=indices)
+                    for name, field in values.items()
+                }
+
+            total = max(1, len(self._pairs))
+            previous_endpoint = None
+            for index, (_start, endpoint) in enumerate(self._pairs):
+                if self._cancel_flag[0]:
+                    raise RuntimeError("Temporal calculation cancelled.")
+                result = self._store[index]
+                valid = np.asarray(result.valid, dtype=bool)
+                rates = compute_velocity_strains(
+                    np.asarray(result.Vx), np.asarray(result.Vy), valid,
+                    self._strain_window,
+                    self._analysis.params.subset_spacing,
+                    use_gpu=self._use_gpu)
+                for name in ("dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+                             "Exx_rate", "Exy_rate", "Eyy_rate",
+                             "Eeff_rate"):
+                    setattr(result, name, np.asarray(rates[name], np.float32))
+                result.Gxy_rate = np.asarray(
+                    2.0 * rates["Exy_rate"], np.float32)
+
+                # The first averaged frame spans its selected pair. Subsequent
+                # sliding frames advance by their endpoint cadence (normally
+                # one source frame); non-overlapping frames advance by a block.
+                if previous_endpoint is None:
+                    step_dt = float(result.elapsed)
+                else:
+                    endpoint_step = int(endpoint) - int(previous_endpoint)
+                    step_dt = (endpoint_step / max(self._analysis.fps, 1e-9)
+                               if endpoint_step > 0 else float(result.elapsed))
+                step_u = np.asarray(result.Vx) * step_dt
+                step_v = np.asarray(result.Vy) * step_dt
+                tracker.seed(valid)
+                deposit(tracker.snapshot())
+                tracker.advance(
+                    step_u, step_v,
+                    np.asarray(rates["dVx_dx"]) * step_dt,
+                    np.asarray(rates["dVx_dy"]) * step_dt,
+                    np.asarray(rates["dVy_dx"]) * step_dt,
+                    np.asarray(rates["dVy_dy"]) * step_dt)
+                deposit(tracker.snapshot())
+                state = accumulated_fields()
+                for name in ("Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"):
+                    setattr(result, name, state[name])
+                result.Exx = result.Exx_gl
+                result.Eyy = result.Eyy_gl
+                result.Exy = result.Exy_gl
+                result.Eeff = result.Eeff_gl
+                save_temporal_result(self._store.path_for(index), result)
+                previous_endpoint = endpoint
+                self.signals.progress.emit(
+                    self._generation, int(100 * (index + 1) / total),
+                    f"Strain rates {index + 1}/{len(self._pairs)}")
+                self.signals.item_ready.emit(self._generation, index)
+            self.signals.done.emit(self._generation, True, "")
+        except Exception as exc:
+            self.signals.done.emit(self._generation, False, str(exc))
 
 
 class ResultsPage(QWidget):
@@ -240,11 +435,37 @@ class ResultsPage(QWidget):
         self._frame  = 0
         self._field  = "Eeff_rate"
         self._unit_scale_cache: dict = {}
-        # Frame-pair average. When set, the viewer shows this instead of a
-        # single frame and the scrubber is inert -- the average has no position
-        # in the sequence to scrub to.
+        # Frame-pair sequence. Each selected interval owns one timeline item;
+        # `_pair_avg` is retained as the current pair result for the existing
+        # display/export paths, not as one average collapsed across all pairs.
+        self._pair_mode = False
         self._pair_avg = None
         self._pair_list: list = []
+        self._pair_cache: "OrderedDict[int, object]" = OrderedDict()
+        self._PAIR_CACHE_MAX = 4
+        self._pair_strain_window = int(
+            getattr(getattr(self._wizard.analysis, "params", None),
+                    "strain_window", 5))
+        self._pair_generation = 0
+        self._pair_cancel_flag = [False]
+        self._pair_queue: "OrderedDict[int, None]" = OrderedDict()
+        self._pair_active: set[tuple[int, int]] = set()
+        self._pair_tasks: dict[tuple[int, int], _PairTask] = {}
+        self._pair_fixed_ranges: dict[tuple, tuple[float, float]] = {}
+        self._pair_sequence_mode = "custom"
+        self._pair_store = None
+        self._pair_store_dirs: dict[int, str] = {}
+        self._pair_retained_generations: set[int] = set()
+        self._pair_bulk_ready: set[int] = set()
+        self._pair_rate_ready: set[int] = set()
+        self._pair_rates_only = False
+        self._pair_history_active = False
+        self._pair_history_task = None
+        self._pending_hdf5_path: Optional[str] = None
+        self._pair_pool = QThreadPool(self)
+        self._pair_pool.setMaxThreadCount(max(1, min(3, os.cpu_count() or 1)))
+        self._single_frame_before_pairs = 0
+        self._pair_frame_before_single = 0
         # Decoded background frames, keyed by path. Playback and scrubbing both
         # revisit frames constantly, and decoding a PNG per tick is what makes
         # play stutter -- the decode alone outlasts the frame interval at any
@@ -669,20 +890,19 @@ class ResultsPage(QWidget):
         self._marker_panel.setVisible(False)
         sb_lay.addWidget(self._marker_panel)
 
-        # ── Frame-pair average ──────────────────────────────────────
+        # ── Smoothed frame-pair sequence ────────────────────────────
         pair_hdr = QLabel("FRAME PAIRS")
         pair_hdr.setStyleSheet(
             f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;")
         sb_lay.addWidget(pair_hdr)
 
-        self._pair_btn = QPushButton("Average frame pairs…")
+        self._pair_btn = QPushButton("Smoothed pair sequence…")
         self._pair_btn.setFixedHeight(30)
         self._pair_btn.setToolTip(
-            "Pick any number of frame pairs and average the displacement,\n"
-            "velocity and strain rate measured across them.\n\n"
-            "Cumulative strain is excluded — it carries the history before\n"
-            "each pair begins, so it cannot be averaged across pairs.")
-        self._pair_btn.clicked.connect(self._open_pair_dialog)
+            "Build a playable sequence of longer frame intervals. Each interval\n"
+            "composes material motion and recomputes velocity, strain rate, and\n"
+            "Green–Lagrange strain.")
+        self._pair_btn.clicked.connect(self._pair_button_clicked)
         sb_lay.addWidget(self._pair_btn)
 
         self._pair_banner = QLabel("")
@@ -701,6 +921,18 @@ class ResultsPage(QWidget):
         self._pair_exit_btn.clicked.connect(self._clear_pair_average)
         self._pair_exit_btn.setVisible(False)
         sb_lay.addWidget(self._pair_exit_btn)
+
+        self._pair_clear_btn = QPushButton("Clear saved temporal data")
+        self._pair_clear_btn.setFixedHeight(26)
+        self._pair_clear_btn.setStyleSheet(
+            f"background:{_C_CARD}; color:{_C_WARN}; border:1px solid {_C_WARN};"
+            f" border-radius:3px; font-size:10px;")
+        self._pair_clear_btn.setToolTip(
+            "Permanently discard the computed temporal cache and pair list.\n"
+            "Back to single frames does not discard them.")
+        self._pair_clear_btn.clicked.connect(self._discard_pair_data)
+        self._pair_clear_btn.setVisible(False)
+        sb_lay.addWidget(self._pair_clear_btn)
 
         sb_lay.addWidget(self._sep())
 
@@ -920,8 +1152,18 @@ class ResultsPage(QWidget):
         self._streak_chk.setChecked(False)
         self._trail_combo.setCurrentIndex(0)
         self._canvas.set_marker_mode(False)
-        self._canvas.clear_markers()
+        # clear_markers() emits markers_changed, whose slot immediately tries
+        # to render trajectories. Wizard.new_session has already replaced the
+        # analysis model at this point, so that re-entrant render mixes the old
+        # Results canvas with an empty new model and can native-crash Qt. Reset
+        # this page-owned state silently, as on_enter() already does.
+        self._canvas.set_markers([])
+        self._canvas.set_marker_draw_positions([])
+        self._canvas.set_streaklines(None)
         self._marker_list.clear()
+        self._del_marker_btn.setEnabled(False)
+        self._marker_hint.setVisible(True)
+        self._marker_count_lbl.setText("0 markers")
 
     def _rebuild_marker_list(self) -> None:
         self._marker_list.blockSignals(True)
@@ -970,6 +1212,11 @@ class ResultsPage(QWidget):
     def on_before_show(self) -> None:
         """Cheap synchronous blanking so no stale frame is ever painted."""
         try:
+            self._play_timer.stop()
+            self._scrub_timer.stop()
+            if self._play_btn.isChecked():
+                self._play_btn.setChecked(False)
+            self._invalidate_pair_jobs()
             self._canvas.clear_result_overlay()
             self._canvas.set_streaklines(None)
             self._canvas.set_markers([])
@@ -1000,17 +1247,46 @@ class ResultsPage(QWidget):
         self._canvas.set_markers([])
         self._canvas.set_streaklines(None)
         self._marker_list.clear()
-        # Same reasoning for a stored pair average: its frame indices and its
+        # Same reasoning for a stored pair sequence: its frame indices and its
         # arrays belong to the run that produced them. Keeping it across a
         # re-analysis would silently show the previous run's numbers.
         self._pair_avg = None
+        self._pair_mode = False
         self._pair_list = []
+        self._pair_sequence_mode = "custom"
+        self._pair_strain_window = int(
+            getattr(getattr(self._wizard.analysis, "params", None),
+                    "strain_window", 5))
+        self._invalidate_pair_jobs()
+        saved_temporal = getattr(self._wizard.analysis, "temporal_results", None)
+        saved_pairs = list(getattr(
+            self._wizard.analysis, "temporal_pairs", []) or [])
+        if saved_temporal is not None and saved_pairs:
+            metadata = dict(getattr(
+                self._wizard.analysis, "temporal_metadata", {}) or {})
+            self._pair_list = saved_pairs
+            self._pair_sequence_mode = str(metadata.get("mode", "custom"))
+            self._pair_strain_window = int(metadata.get(
+                "strain_window", self._pair_strain_window))
+            self._pair_mode = True
+            if int(metadata.get("schema", 0)) >= 4:
+                self._pair_store = saved_temporal
+                self._pair_bulk_ready = set(range(len(saved_pairs)))
+            else:
+                # Older temporal files either reset finite strain at every
+                # window or replayed frames outside the selected range.
+                # Preserve the pair definition but regenerate schema-4 data.
+                self._begin_pair_bulk()
         self._sync_pair_ui()
         self._sync_calibration_controls()
-        self._slider.setMaximum(max(0, n - 1))
+        timeline_n = len(self._pair_list) if self._pair_mode else n
+        self._slider.setMaximum(max(0, timeline_n - 1))
         self._slider.setValue(0)
         self._frame = 0
-        self._show_frame(0)
+        if self._pair_mode:
+            self._show_pair_average()
+        else:
+            self._show_frame(0)
 
     # ------------------------------------------------------------------
     # Caches
@@ -1064,6 +1340,7 @@ class ResultsPage(QWidget):
         """
         self._img_cache.clear()
         self._traj_cache.clear()
+        self._pair_cache.clear()
 
     def _show_frame(self, idx: int) -> None:
         """
@@ -1127,8 +1404,14 @@ class ResultsPage(QWidget):
         results = self._wizard.analysis.results
         if not results:
             return
-        idx = max(0, min(self._frame, len(results) - 1))
-        arr, _ = self._display_array(results[idx])
+        if self._pair_mode:
+            result = self._pair_result_at(self._frame)
+        else:
+            idx = max(0, min(self._frame, len(results) - 1))
+            result = results[idx]
+        if result is None:
+            return
+        arr, _ = self._display_array(result)
         if arr is None:
             return
         vals = finite_values(arr)
@@ -1196,13 +1479,23 @@ class ResultsPage(QWidget):
             lo, hi = analysis.get_global_range(self._field, spec.percentile)
             global_rng = (lo * factor, hi * factor)
         elif spec.mode == "global":
-            # The sequence-wide range is measured on per-frame fields, whose
-            # interval lengths can differ from the selected frame pairs.
-            # Applying it here can flatten the image to one colour, so the
-            # averaged field scales to itself.
-            spec = RangeSpec(mode="auto", vmin=None, vmax=None,
-                             symmetric=spec.symmetric,
-                             percentile=spec.percentile)
+            # Pair fields have different interval semantics from stored
+            # single-frame fields, so their limits cannot use analysis' normal
+            # global range. Establish the limits once from the first displayed
+            # pair and keep them fixed for every subsequent pair. Previously we
+            # silently changed Global back to Auto here, making both overlay and
+            # colourbar jump during playback.
+            factor, _ = self._unit_factor(result=self._pair_avg)
+            key = (self._pair_generation, self._field,
+                   float(spec.percentile), float(factor))
+            global_rng = self._pair_fixed_ranges.get(key)
+            if global_rng is None:
+                seed_spec = RangeSpec(
+                    mode="auto", symmetric=False,
+                    percentile=spec.percentile)
+                global_rng = seed_spec.resolve(arr)
+                if global_rng is not None:
+                    self._pair_fixed_ranges[key] = global_rng
 
         rng = spec.resolve(arr, global_rng)
         if rng is None:
@@ -1404,22 +1697,16 @@ class ResultsPage(QWidget):
 
     def _on_slider(self, val: int) -> None:
         self._frame = val
-        # Never scrub out from under a pair average: the slider position is
-        # still meaningful state, but rendering it would replace the average
-        # on screen while the sidebar still described it.
-        if self._pair_avg is not None:
-            return
         # Loading, colouring and uploading a full-resolution frame for every
         # intermediate slider event makes scrubbing lag behind the pointer.
         # Render the most recent position after a very short coalescing window.
         self._scrub_timer.start()
 
     def _render_scrubbed_frame(self) -> None:
-        # A queued scrub can arrive after pair mode was entered; the deferral
-        # is what makes that possible, so the guard belongs here too.
-        if self._pair_avg is not None:
-            return
-        self._show_frame(self._frame)
+        if self._pair_mode:
+            self._show_pair_average()
+        else:
+            self._show_frame(self._frame)
 
     def _sync_field_buttons(self) -> None:
         """Show only the buttons belonging to the selected category."""
@@ -1448,14 +1735,39 @@ class ResultsPage(QWidget):
         self._refresh_overlay()
 
     def _refresh_overlay(self, *_) -> None:
-        if self._pair_avg is not None:
+        if self._pair_mode:
             self._show_pair_average()
         else:
             self._show_frame(self._frame)
 
     # ------------------------------------------------------------------
-    # Frame-pair average
+    # Smoothed frame-pair sequence
     # ------------------------------------------------------------------
+
+    def _pair_button_clicked(self) -> None:
+        if not self._pair_mode and self._pair_list:
+            self._resume_pair_sequence()
+        else:
+            self._open_pair_dialog()
+
+    def _resume_pair_sequence(self) -> None:
+        """Return to the retained temporal timeline without recalculating it."""
+        if not self._pair_list:
+            self._open_pair_dialog()
+            return
+        self._single_frame_before_pairs = max(
+            0, min(self._slider.value(),
+                   max(0, len(self._wizard.analysis.results) - 1)))
+        self._pair_mode = True
+        index = max(0, min(self._pair_frame_before_single,
+                           len(self._pair_list) - 1))
+        self._slider.blockSignals(True)
+        self._slider.setMaximum(max(0, len(self._pair_list) - 1))
+        self._slider.setValue(index)
+        self._slider.blockSignals(False)
+        self._frame = index
+        self._sync_pair_ui()
+        self._show_pair_average()
 
     def _open_pair_dialog(self) -> None:
         analysis = self._wizard.analysis
@@ -1467,99 +1779,495 @@ class ResultsPage(QWidget):
             return
 
         from src.ui.pages.frame_pair_dialog import FramePairDialog
-        dlg = FramePairDialog(n, analysis.fps, self._pair_list, self)
+        dlg = FramePairDialog(
+            n, analysis.fps, self._pair_list,
+            strain_window=self._pair_strain_window,
+            grid_spacing=analysis.params.subset_spacing,
+            existing_mode=self._pair_sequence_mode,
+            parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         pairs = dlg.pairs()
-        try:
-            avg = analysis.average_pairs(pairs)
-        except Exception as exc:
-            QMessageBox.warning(self, "Frame-Pair Average", str(exc))
+        if not pairs:
             return
-
+        new_window = dlg.strain_window()
+        sequence_mode = dlg.sequence_mode()
+        if (pairs == self._pair_list and
+                new_window == self._pair_strain_window and
+                sequence_mode == self._pair_sequence_mode):
+            self._sync_pair_ui()
+            return
+        self._pair_strain_window = new_window
+        if not self._pair_mode:
+            self._single_frame_before_pairs = max(
+                0, min(self._slider.value(), len(analysis.results) - 1))
         self._pair_list = pairs
-        self._pair_avg = avg
-
-        # Cumulative strain is not defined for an average of pairs, so move off
-        # it rather than showing an all-NaN field with no explanation.
-        if self._field in _ACCUMULATED_STRAIN_FIELDS:
-            self._select_field("mag_inc")
+        self._pair_sequence_mode = sequence_mode
+        self._pair_mode = True
+        self._invalidate_pair_jobs()
+        self._scrub_timer.stop()
+        self._slider.blockSignals(True)
+        self._slider.setMaximum(max(0, len(pairs) - 1))
+        self._slider.setValue(0)
+        self._slider.blockSignals(False)
+        self._frame = 0
 
         self._sync_pair_ui()
+        if self._pair_sequence_mode in ("sliding", "non_overlapping"):
+            self._begin_pair_bulk()
         self._refresh_overlay()
 
     def _clear_pair_average(self) -> None:
+        """Display single frames while retaining temporal data and workers."""
+        if self._play_btn.isChecked():
+            self._play_btn.setChecked(False)
+            self._toggle_play(False)
+        self._pair_frame_before_single = self._frame
+        self._pair_mode = False
         self._pair_avg = None
+        n = len(self._wizard.analysis.results)
+        restored = max(0, min(self._single_frame_before_pairs, max(0, n - 1)))
+        self._slider.blockSignals(True)
+        self._slider.setMaximum(max(0, n - 1))
+        self._slider.setValue(restored)
+        self._slider.blockSignals(False)
+        self._frame = restored
         self._sync_pair_ui()
         self._refresh_overlay()
 
+    def _discard_pair_data(self) -> None:
+        """Explicit UI action that permanently drops the temporal cache."""
+        if self._pair_mode:
+            self._clear_pair_average()
+        self._invalidate_pair_jobs()
+        self._pair_list = []
+        self._pair_sequence_mode = "custom"
+        self._pair_frame_before_single = 0
+        self._sync_pair_ui()
+
     def _sync_pair_ui(self) -> None:
-        """Show the averaging state and lock out controls it makes meaningless."""
-        active = self._pair_avg is not None
+        """Show pair-sequence state while keeping its timeline interactive."""
+        active = self._pair_mode
         self._pair_banner.setVisible(active)
         self._pair_exit_btn.setVisible(active)
+        self._pair_clear_btn.setVisible(bool(self._pair_list))
+        self._scale_global_rb.setText("Pair-fixed" if active else "Global")
+        self._scale_global_rb.setToolTip(
+            "Keep the limits established by the first displayed pair so the "
+            "playable pair sequence remains directly comparable."
+            if active else
+            "Fix the scale to the min/max across the whole sequence.")
         self._pair_btn.setText(
-            "Edit frame pairs…" if active else "Average frame pairs…")
+            "Edit pair sequence…" if active else
+            ("Return to temporal sequence" if self._pair_list else
+             "Smoothed pair sequence…"))
 
         if active:
             n = len(self._pair_list)
             label = ", ".join(f"{a + 1}→{b + 1}" for a, b in self._pair_list[:4])
             if n > 4:
                 label += f", +{n - 4} more"
-            avg = self._pair_avg
-            dt_ms = getattr(avg, "elapsed", 0.0) * 1e3
-            text = (f"<b>Averaging {n} frame pair{'s' if n != 1 else ''}</b>"
+            spans = [abs(b - a) for a, b in self._pair_list]
+            dt_ms = (float(np.mean(spans)) /
+                     max(float(self._wizard.analysis.fps), 1e-9) * 1e3)
+            text = (f"<b>Playing {n} smoothed pair{'s' if n != 1 else ''}</b>"
                     f"<br>{label}"
-                    f"<br>Interval {dt_ms:.4g} ms")
-            # Unequal spans change what the displacement means: it is then the
-            # averaged velocity over a representative interval rather than a
-            # motion any single pair measured. Say so where it is being read.
-            if not getattr(avg, "pair_spans_equal", True):
+                    f"<br>Mean interval {dt_ms:.4g} ms"
+                    f" · spatial strain radius {self._pair_strain_window} px")
+            if len(set(spans)) > 1:
                 text += ("<br><span style='color:" + C_WARNING + "'>"
-                         "Pairs span different durations — displacement is the "
-                         "mean velocity over the mean interval.</span>")
-            text += "<br>Accumulated strain unavailable in this mode."
+                         "Pairs span different durations; compare velocity and "
+                         "strain rate rather than raw displacement.</span>")
+            text += ("<br>Rate is calculated from each smoothed interval. "
+                     "Green–Lagrange strain retains the accumulated selected "
+                     "history through the interval endpoint. Pair-fixed "
+                     "colour limits stay constant during playback.")
+            text += f"<br>Processing backend: {self._pair_backend_text()}."
+            if self._pair_sequence_mode in ("sliding", "non_overlapping"):
+                mode_label = ("sliding" if self._pair_sequence_mode == "sliding"
+                              else "non-overlapping")
+                if self._pair_rates_only:
+                    rate_ready = len(self._pair_rate_ready)
+                    phase = (f"calculated strain rates "
+                             f"{len(self._pair_bulk_ready)}/{n}"
+                             if self._pair_history_active else
+                             f"velocity averages {rate_ready}/{n}; "
+                             "strain rate hidden")
+                    text += (f"<br>{mode_label.title()} preprocessing: "
+                             f"{phase}.")
+                else:
+                    ready = len(self._pair_bulk_ready)
+                    text += (f"<br>{mode_label.title()} preprocessing: "
+                             f"{ready}/{n} ready for seeking and export.")
             self._pair_banner.setText(text)
 
-        # Scrubbing and playback have no meaning for a single averaged field.
-        self._scrub_timer.stop()
-        if active and self._play_btn.isChecked():
-            self._play_btn.setChecked(False)
-            self._toggle_play(False)
-        # The step buttons have to be disabled with the slider. Disabling a
-        # QSlider only blocks the user dragging it -- setValue() from the step
-        # buttons still goes through and still emits valueChanged, so a click
-        # on the arrows would render a single frame underneath a banner saying
-        # an average was being shown.
         for w in (self._slider, self._play_btn, self._prev_btn, self._next_btn):
-            w.setEnabled(not active)
+            w.setEnabled(True)
 
-        # Cumulative strain buttons cannot be honoured while averaging.
         for k, btn in self._field_btns.items():
             if k in _ACCUMULATED_STRAIN_FIELDS:
-                btn.setEnabled(not active)
-                btn.setToolTip(
-                    "Not available while averaging frame pairs — cumulative "
-                    "strain includes the history before each pair begins."
-                    if active else "")
+                btn.setEnabled(True)
+                btn.setToolTip("")
 
-    def _show_pair_average(self) -> None:
-        """Render the averaged field over the reference image.
+    def _invalidate_pair_jobs(self) -> None:
+        """Forget work whose sequence or spatial window is no longer current."""
+        old_generation = self._pair_generation
+        # Running QRunnables cannot be removed from QThreadPool. Give them a
+        # cooperative stop token so New Session and pair edits return promptly
+        # instead of leaving a full strain-history replay consuming the GUI's
+        # process for minutes.
+        self._pair_cancel_flag[0] = True
+        self._pair_cancel_flag = [False]
+        self._pair_generation += 1
+        self._pair_queue.clear()
+        self._pair_cache.clear()
+        self._pair_fixed_ranges.clear()
+        self._pair_avg = None
+        self._pair_store = None
+        self._pair_bulk_ready.clear()
+        self._pair_rate_ready.clear()
+        self._pair_rates_only = False
+        self._pair_history_active = False
+        self._pair_history_task = None
+        self._cleanup_pair_store_dirs(exclude_generation=old_generation)
 
-        The reference is the right backdrop here: an average spans several
-        intervals, so no single deformed frame is the one it belongs to.
-        """
+    def _cleanup_pair_store_dirs(self, exclude_generation: Optional[int] = None) -> None:
+        """Remove retired exact temp directories once no worker can write them."""
+        for generation, directory in list(self._pair_store_dirs.items()):
+            if generation == self._pair_generation:
+                continue
+            if generation in self._pair_retained_generations:
+                continue
+            if generation == exclude_generation and any(
+                    key[0] == generation for key in self._pair_active):
+                continue
+            if any(key[0] == generation for key in self._pair_active):
+                continue
+            shutil.rmtree(directory, ignore_errors=True)
+            self._pair_store_dirs.pop(generation, None)
+
+    def _begin_pair_bulk(self) -> None:
+        """Queue every generated temporal pair and expose aggregate progress."""
+        from src.core.temporal import TemporalResultSequence
+
+        directory = tempfile.mkdtemp(prefix="pydic_temporal_")
+        self._pair_store = TemporalResultSequence(directory, self._pair_list)
+        self._pair_store_dirs[self._pair_generation] = directory
+        self._pair_bulk_ready.clear()
+        self._pair_rate_ready.clear()
+        self._pair_rates_only = True
+        self._pair_history_active = False
+        self._export_progress.show()
+        self._export_progress.setValue(0)
+        self._export_progress.setFormat(
+            f"Temporal 0/{len(self._pair_list)} · %p%")
+        for index in range(len(self._pair_list)):
+            self._request_pair(index, priority=(index == self._frame))
+        self._sync_pair_ui()
+
+    def _pair_use_gpu(self) -> bool:
         analysis = self._wizard.analysis
-        res = self._pair_avg
-        if res is None:
+        available = bool(
+            getattr(analysis, "prefer_gpu", False) and
+            getattr(analysis, "last_backend", "cpu") == "gpu" and
+            importlib.util.find_spec("cupy") is not None)
+        if not available or not getattr(analysis, "results", None):
+            return False
+
+        # CuPy filters win only after transfer/launch overhead is amortised.
+        # Use the same finite-support crop estimate as strain.py. A small ROI on
+        # a large camera frame must not serialize the queue as a "GPU" job that
+        # the strain routine will immediately send back to CPU.
+        result = analysis.results[min(1, len(analysis.results) - 1)]
+        shape = tuple(int(v) for v in result.u.shape)
+        valid = getattr(result, "valid", None)
+        if isinstance(valid, CompactMask):
+            indices = valid.indices
+        elif isinstance(result.u, CompactField):
+            indices = result.u.indices
+        else:
+            mask = (np.asarray(valid, dtype=bool) if valid is not None else
+                    (np.isfinite(result.u) & np.isfinite(result.v)))
+            indices = np.flatnonzero(mask.reshape(-1))
+        if not len(indices):
+            return False
+        ys = np.asarray(indices, dtype=np.int64) // shape[1]
+        xs = np.asarray(indices, dtype=np.int64) % shape[1]
+        pad = (int(self._pair_strain_window) +
+               max(0, int(analysis.params.subset_spacing) // 2) + 1)
+        height = min(shape[0], int(ys.max()) + pad + 1) - max(
+            0, int(ys.min()) - pad)
+        width = min(shape[1], int(xs.max()) + pad + 1) - max(
+            0, int(xs.min()) - pad)
+        return height * width >= 512 * 512
+
+    def _pair_backend_text(self) -> str:
+        if self._pair_use_gpu():
+            return "CuPy GPU derivatives for large spatial fits"
+        if importlib.util.find_spec("cupy") is None:
+            return "multithreaded CPU (CuPy unavailable)"
+        if not bool(getattr(self._wizard.analysis, "prefer_gpu", False)):
+            return "multithreaded CPU (GPU disabled)"
+        if getattr(self._wizard.analysis, "last_backend", "cpu") == "gpu":
+            return "multithreaded CPU (CuPy available; ROI below GPU crossover)"
+        return "multithreaded CPU (source analysis was CPU)"
+
+    def _pair_worker_limit(self) -> int:
+        analysis = self._wizard.analysis
+        # A changed spatial window replays one shared accumulated-strain
+        # history. Additional workers would only wait on that cache lock and
+        # waste memory; after the replay, the queued pair products are cheap.
+        if (not self._pair_rates_only and
+                int(self._pair_strain_window) !=
+                int(analysis.params.effective_strain_window())):
+            return 1
+        # h5py-backed lazy fields share one open file handle. They still run off
+        # the GUI thread, but concurrent reads are deliberately serialized.
+        if bool(getattr(analysis, "hdf5_lazy", False)) or self._pair_use_gpu():
+            return 1
+        return max(1, min(3, (os.cpu_count() or 2) // 2 or 1))
+
+    def _request_pair(self, index: int, priority: bool = True) -> None:
+        if not self._pair_list or (not self._pair_mode and self._pair_store is None):
+            return
+        index = max(0, min(int(index), len(self._pair_list) - 1))
+        key = (self._pair_generation, index)
+        if index in self._pair_cache or key in self._pair_active:
+            return
+        if self._pair_store is not None and self._pair_store.has(index):
+            return
+        if index in self._pair_queue:
+            if priority:
+                self._pair_queue.move_to_end(index, last=False)
+        else:
+            self._pair_queue[index] = None
+            if priority:
+                self._pair_queue.move_to_end(index, last=False)
+        self._pump_pair_workers()
+
+    def _pump_pair_workers(self) -> None:
+        limit = self._pair_worker_limit()
+        while self._pair_queue and len(self._pair_active) < limit:
+            index, _ = self._pair_queue.popitem(last=False)
+            if (not self._pair_list or
+                    (not self._pair_mode and self._pair_store is None) or
+                    not (0 <= index < len(self._pair_list))):
+                continue
+            generation = self._pair_generation
+            key = (generation, index)
+            if key in self._pair_active or index in self._pair_cache:
+                continue
+            task = _PairTask(
+                self._wizard.analysis, generation, index,
+                self._pair_list[index], self._pair_strain_window,
+                self._pair_use_gpu(),
+                self._pair_cancel_flag,
+                include_strain=not self._pair_rates_only,
+                include_rate=not self._pair_rates_only,
+                cache_path=(self._pair_store.path_for(index)
+                            if self._pair_store is not None else None))
+            task.signals.done.connect(self._on_pair_ready)
+            task.signals.progress.connect(self._on_pair_progress)
+            self._pair_active.add(key)
+            self._pair_tasks[key] = task
+            self._pair_pool.start(task)
+
+    @pyqtSlot(int, int, int, str)
+    def _on_pair_progress(self, generation: int, _index: int,
+                          percent: int, message: str) -> None:
+        if generation != self._pair_generation or self._pair_store is None:
+            return
+        self._export_progress.show()
+        self._export_progress.setValue(max(0, min(100, int(percent))))
+        self._export_progress.setFormat(f"{message} · %p%")
+
+    def _start_temporal_history_phase(self) -> None:
+        if (self._pair_history_active or not self._pair_rates_only or
+                self._pair_store is None or
+                len(self._pair_rate_ready) != len(self._pair_list)):
+            return
+        self._pair_history_active = True
+        self._export_progress.setValue(0)
+        self._export_progress.setFormat("Strain rates 0/"
+                                        f"{len(self._pair_list)} · %p%")
+        self._pair_fixed_ranges.clear()
+        task = _TemporalHistoryTask(
+            self._wizard.analysis, self._pair_generation, self._pair_list,
+            self._pair_strain_window, self._pair_use_gpu(),
+            self._pair_cancel_flag, self._pair_store)
+        task.signals.progress.connect(self._on_temporal_history_progress)
+        task.signals.item_ready.connect(self._on_temporal_derived_item_ready)
+        task.signals.done.connect(self._on_temporal_history_done)
+        self._pair_history_task = task
+        self._pair_pool.start(task)
+
+    @pyqtSlot(int, int, str)
+    def _on_temporal_history_progress(self, generation: int, percent: int,
+                                      message: str) -> None:
+        if generation != self._pair_generation:
+            return
+        self._export_progress.setValue(max(0, min(100, int(percent))))
+        self._export_progress.setFormat(f"{message} · %p%")
+
+    @pyqtSlot(int, int)
+    def _on_temporal_derived_item_ready(self, generation: int,
+                                        index: int) -> None:
+        """Expose each newly calculated rate/strain frame immediately."""
+        if generation != self._pair_generation:
+            return
+        self._pair_bulk_ready.add(int(index))
+        self._pair_cache.pop(int(index), None)
+        if self._pair_mode and int(index) == self._frame:
+            result = self._pair_result_at(index)
+            if result is not None:
+                self._render_pair_result(index, result)
+        self._sync_pair_ui()
+
+    @pyqtSlot(int, bool, str)
+    def _on_temporal_history_done(self, generation: int, ok: bool,
+                                  error: str) -> None:
+        if generation != self._pair_generation:
+            return
+        self._pair_history_active = False
+        self._pair_history_task = None
+        if not ok:
+            self._export_progress.setFormat("Temporal strain-rate failed ✗")
+            if self._pair_mode:
+                self._frame_lbl.setText(
+                    f"Temporal strain-rate failed: {error}")
+            return
+        self._pair_rates_only = False
+        self._pair_bulk_ready = set(range(len(self._pair_list)))
+        self._pair_cache.clear()
+        self._export_progress.setValue(100)
+        self._export_progress.setFormat("Temporal sequence ready")
+        QTimer.singleShot(2500, self._export_progress.hide)
+        strain_cache = getattr(
+            self._wizard.analysis, "_temporal_strain_cache", None)
+        if strain_cache is not None:
+            strain_cache.clear()
+        if self._pair_mode:
+            self._show_pair_average()
+        if self._pending_hdf5_path:
+            path = self._pending_hdf5_path
+            self._pending_hdf5_path = None
+            self._start_hdf5_worker(path)
+        self._sync_pair_ui()
+
+    @pyqtSlot(int, int, object, str)
+    def _on_pair_ready(self, generation: int, index: int,
+                       result, error: str) -> None:
+        key = (generation, index)
+        self._pair_active.discard(key)
+        self._pair_tasks.pop(key, None)
+        self._cleanup_pair_store_dirs()
+        if generation != self._pair_generation:
+            self._pump_pair_workers()
             return
 
-        ref = analysis.reference_image
-        if ref is not None:
+        if error:
+            if self._pair_mode and index == self._frame:
+                self._pair_avg = None
+                self._frame_lbl.setText(
+                    f"Pair {index + 1} failed: {error}")
+                self._canvas.set_result_overlay_rgba(None)
+                if self._play_btn.isChecked():
+                    self._play_btn.setChecked(False)
+                    self._toggle_play(False)
+            if self._pair_store is not None:
+                self._export_progress.setFormat("Temporal preprocessing failed ✗")
+            self._pump_pair_workers()
+            return
+
+        if self._pair_store is not None and self._pair_rates_only:
+            self._pair_rate_ready.add(index)
+            total = max(1, len(self._pair_list))
+            ready = len(self._pair_rate_ready)
+            self._export_progress.setValue(int(100 * ready / total))
+            self._export_progress.setFormat(
+                f"Velocity averages {ready}/{total} · %p%")
+            self._sync_pair_ui()
+        elif self._pair_store is not None:
+            self._pair_bulk_ready.add(index)
+
+        self._pair_cache[index] = result
+        self._pair_cache.move_to_end(index)
+        while len(self._pair_cache) > self._PAIR_CACHE_MAX:
+            self._pair_cache.popitem(last=False)
+
+        if self._pair_mode and index == self._frame:
+            self._render_pair_result(index, result)
+            self._prefetch_pair_neighbors(index)
+            if self._play_btn.isChecked():
+                self._play_timer.start(
+                    int(1000.0 / max(1, self._fps_spin.value())))
+        self._start_temporal_history_phase()
+        self._pump_pair_workers()
+
+    def _prefetch_pair_neighbors(self, index: int) -> None:
+        n = len(self._pair_list)
+        if n < 2:
+            return
+        self._request_pair((index + 1) % n, priority=False)
+        if n > 2:
+            self._request_pair((index - 1) % n, priority=False)
+
+    def _pair_result_at(self, index: int):
+        """Return a cached pair immediately or queue it without blocking Qt."""
+        if not self._pair_mode or not self._pair_list:
+            return None
+        index = max(0, min(int(index), len(self._pair_list) - 1))
+        hit = self._pair_cache.get(index)
+        if hit is not None:
+            self._pair_cache.move_to_end(index)
+            return hit
+        if self._pair_store is not None and self._pair_store.has(index):
+            try:
+                hit = self._pair_store[index]
+                self._pair_cache[index] = hit
+                self._pair_cache.move_to_end(index)
+                while len(self._pair_cache) > self._PAIR_CACHE_MAX:
+                    self._pair_cache.popitem(last=False)
+                return hit
+            except Exception as exc:
+                self._frame_lbl.setText(f"Could not read temporal pair: {exc}")
+        self._request_pair(index, priority=True)
+        return None
+
+    def _show_pair_average(self) -> None:
+        """Render the current smoothed pair on its ending-frame image."""
+        analysis = self._wizard.analysis
+        res = self._pair_result_at(self._frame)
+        if res is None:
+            self._pair_avg = None
+            a, b = self._pair_list[self._frame]
+            img = (self._background_image(analysis.def_paths[b])
+                   if b < len(analysis.def_paths) else analysis.reference_image)
+            if img is not None:
+                self._canvas.set_image(
+                    img, keep_view=self._canvas._image_arr is not None,
+                    display_scale=0.45)
+            self._canvas.set_result_overlay_rgba(None)
+            self._frame_lbl.setText(
+                f"Calculating pair {self._frame + 1} / {len(self._pair_list)}"
+                f"   ·   {a + 1}→{b + 1}…")
+            return
+        self._render_pair_result(self._frame, res)
+        self._prefetch_pair_neighbors(self._frame)
+
+    def _render_pair_result(self, index: int, res) -> None:
+        """Render an already-computed pair; this always runs on Qt's thread."""
+        analysis = self._wizard.analysis
+        self._pair_avg = res
+
+        a, b = self._pair_list[index]
+        img = (self._background_image(analysis.def_paths[b])
+               if b < len(analysis.def_paths) else analysis.reference_image)
+        if img is not None:
             keep = self._canvas._image_arr is not None
             self._canvas.set_image(
-                ref, keep_view=keep, display_scale=0.45)
+                img, keep_view=keep, display_scale=0.45)
 
         arr, _ = self._display_array(res)
         if arr is not None and finite_values(arr).size:
@@ -1572,7 +2280,8 @@ class ResultsPage(QWidget):
 
         self._update_stats(res)
         n = len(self._pair_list)
-        self._frame_lbl.setText(f"Average of {n} pair{'s' if n != 1 else ''}")
+        self._frame_lbl.setText(
+            f"Pair {index + 1} / {n}   ·   {a + 1}→{b + 1}")
 
     def _prev_frame(self) -> None:
         self._slider.setValue(max(0, self._slider.value() - 1))
@@ -1602,6 +2311,19 @@ class ResultsPage(QWidget):
         if nxt > self._slider.maximum():
             nxt = 0
         self._slider.setValue(nxt)
+        # Slider changes are normally coalesced for interactive dragging. During
+        # playback, render this tick synchronously so a costly pair calculation
+        # cannot be skipped by the next timer tick repeatedly restarting the
+        # scrub timer. The elapsed render time is deducted below.
+        self._scrub_timer.stop()
+        self._render_scrubbed_frame()
+
+        # An uncached pair is now running on a worker. Do not queue timer ticks
+        # while it is pending; _on_pair_ready resumes playback after rendering
+        # the requested item. This prevents playback from racing ahead and
+        # showing a result under the wrong slider position.
+        if self._pair_mode and self._pair_avg is None:
+            return
 
         target = 1000.0 / max(1, self._fps_spin.value())
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -1612,7 +2334,11 @@ class ResultsPage(QWidget):
     def _toggle_play(self, checked: bool) -> None:
         if checked:
             self._play_btn.setText("⏹  Stop")
-            self._play_timer.start(int(1000.0 / max(1, self._fps_spin.value())))
+            if self._pair_mode and self._pair_result_at(self._frame) is None:
+                self._show_pair_average()
+            else:
+                self._play_timer.start(
+                    int(1000.0 / max(1, self._fps_spin.value())))
         else:
             self._play_btn.setText("▶  Play")
             self._play_timer.stop()
@@ -1641,7 +2367,26 @@ class ResultsPage(QWidget):
         from src.ui.pages.video_export_dialog import VideoExportDialog
         from src.ui.video_export import CODECS, export_video
 
-        dlg = VideoExportDialog(FIELDS, CMAPS, len(analysis.results),
+        temporal_export = (
+            self._pair_mode and
+            self._pair_sequence_mode in ("sliding", "non_overlapping"))
+        if temporal_export and (
+                self._pair_store is None or
+                len(self._pair_bulk_ready) != len(self._pair_list)):
+            if self._pair_store is not None:
+                for index in range(len(self._pair_list)):
+                    if not self._pair_store.has(index):
+                        self._request_pair(index, priority=False)
+            QMessageBox.information(
+                self, "Temporal preprocessing",
+                "The sliding/non-overlapping temporal sequence is still being "
+                "calculated. The progress bar will say ‘Temporal sequence "
+                "ready’ when averaged video export is available.")
+            return
+        export_count = (len(self._pair_list) if temporal_export
+                        else len(analysis.results))
+
+        dlg = VideoExportDialog(FIELDS, CMAPS, export_count,
                                 self._field, self._cmap_combo.currentText(),
                                 fps=float(self._fps_spin.value()), parent=self)
         # Carry the on-screen colour range into panel 1 so "export what I'm
@@ -1684,12 +2429,25 @@ class ResultsPage(QWidget):
         trail = self._trail_combo.currentData() or 0
         spec.trail = trail
 
-        self._video_worker = _VideoWorker(analysis, spec, path, markers, self)
+        self._video_worker = _VideoWorker(
+            analysis, spec, path, markers,
+            temporal_results=(self._pair_store if temporal_export else None),
+            temporal_pairs=(self._pair_list if temporal_export else None),
+            parent=self)
+        self._video_store_generation = (
+            self._pair_generation if temporal_export else None)
+        if self._video_store_generation is not None:
+            self._pair_retained_generations.add(self._video_store_generation)
         self._video_worker.progress.connect(self._export_progress.setValue)
         self._video_worker.done.connect(self._on_video_done)
         self._video_worker.start()
 
     def _on_video_done(self, ok: bool, msg: str) -> None:
+        generation = getattr(self, "_video_store_generation", None)
+        if generation is not None:
+            self._pair_retained_generations.discard(generation)
+            self._video_store_generation = None
+            self._cleanup_pair_store_dirs()
         self._export_progress.setValue(100 if ok else 0)
         self._export_progress.setFormat("Video export complete" if ok else "Video export failed ✗")
         QTimer.singleShot(2500, self._export_progress.hide)
@@ -1713,6 +2471,23 @@ class ResultsPage(QWidget):
         self._wizard.analysis.last_hdf5_directory = os.path.dirname(path)
         self._wizard.analysis.save_settings()
 
+        if self._pair_mode and (
+                self._pair_store is None or
+                len(self._pair_bulk_ready) != len(self._pair_list)):
+            self._pending_hdf5_path = path
+            if self._pair_store is None:
+                self._begin_pair_bulk()
+            else:
+                for index in range(len(self._pair_list)):
+                    if not self._pair_store.has(index):
+                        self._request_pair(index, priority=False)
+            self._export_progress.show()
+            self._export_progress.setFormat("Preparing temporal HDF5 data… %p%")
+            return
+
+        self._start_hdf5_worker(path)
+
+    def _start_hdf5_worker(self, path: str) -> None:
         self._export_progress.show()
         self._export_progress.setValue(0)
         self._export_progress.setFormat("Exporting HDF5... %p%")
@@ -1721,7 +2496,20 @@ class ResultsPage(QWidget):
             f"QProgressBar::chunk {{ background: {_C_ACCENT}; border-radius: 3px; }}"
         )
 
-        self._export_worker = ExportWorker(self._wizard.analysis, path, self)
+        temporal_results = self._pair_store if self._pair_mode else None
+        metadata = ({
+            "mode": self._pair_sequence_mode,
+            "strain_window": self._pair_strain_window,
+        } if temporal_results is not None else {})
+        self._export_worker = ExportWorker(
+            self._wizard.analysis, path,
+            temporal_results=temporal_results,
+            temporal_pairs=(self._pair_list if temporal_results is not None else None),
+            temporal_metadata=metadata, parent=self)
+        self._hdf_store_generation = (
+            self._pair_generation if temporal_results is not None else None)
+        if self._hdf_store_generation is not None:
+            self._pair_retained_generations.add(self._hdf_store_generation)
         self._export_worker.progress_export.connect(self._on_export_progress)
         self._export_worker.finished_export.connect(self._on_export_finished)
         self._export_worker.start()
@@ -1730,6 +2518,11 @@ class ResultsPage(QWidget):
         self._export_progress.setValue(val)
 
     def _on_export_finished(self, success, result_str):
+        generation = getattr(self, "_hdf_store_generation", None)
+        if generation is not None:
+            self._pair_retained_generations.discard(generation)
+            self._hdf_store_generation = None
+            self._cleanup_pair_store_dirs()
         if success:
             self._export_progress.setValue(100)
             self._export_progress.setFormat("Export Complete")

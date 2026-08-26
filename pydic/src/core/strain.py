@@ -56,6 +56,7 @@ def compute_velocity_strains(
     valid_mask: np.ndarray,
     strain_window: int,
     grid_spacing: int = 1,
+    use_gpu: bool = False,
 ) -> dict[str, np.ndarray]:
     """Fit velocity gradients using finite points from one material region.
 
@@ -69,11 +70,81 @@ def compute_velocity_strains(
     k_ramp  = np.arange(-r, r + 1, dtype=np.float64)
     k_ramp2 = k_ramp ** 2
 
-    valid = (np.asarray(valid_mask, dtype=bool) &
-             np.isfinite(Vx) & np.isfinite(Vy))
+    valid_full = (np.asarray(valid_mask, dtype=bool) &
+                  np.isfinite(Vx) & np.isfinite(Vy))
+
+    # DIC fields are sparse and the ROI is often a small fraction of a full-HD
+    # image. Running every separable correlation across the whole sensor was the
+    # reason a frame-pair sequence appeared to hang. Crop to the finite support,
+    # retaining enough invalid padding that constant-zero boundary conditions
+    # produce exactly the same fit at every valid subset centre.
+    yy, xx = np.nonzero(valid_full)
+    full_shape = Vx.shape
+    if not yy.size:
+        names = ("Exx_rate", "Exy_rate", "Gxy_rate", "Eyy_rate", "Eeff_rate",
+                 "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy")
+        return {name: np.full(full_shape, np.nan, dtype=np.float64)
+                for name in names}
+    grow = max(0, int(grid_spacing) // 2)
+    pad = r + grow + 1
+    y0, y1 = max(0, int(yy.min()) - pad), min(full_shape[0], int(yy.max()) + pad + 1)
+    x0, x1 = max(0, int(xx.min()) - pad), min(full_shape[1], int(xx.max()) + pad + 1)
+    crop = np.s_[y0:y1, x0:x1]
+    Vx = np.asarray(Vx)[crop]
+    Vy = np.asarray(Vy)[crop]
+    valid = valid_full[crop]
+
+    # GPU startup and host/device transfer cost more than the filters on a
+    # small crop. Only use CuPy for a genuinely large finite-support box; any
+    # missing package, driver, or cupyx feature falls back to the identical CPU
+    # calculation. Pair playback passes the user's existing GPU preference.
+    gpu_enabled = bool(use_gpu and Vx.size >= 512 * 512)
+    cp = cp_correlate1d = None
+    gpu_arrays: dict[int, object] = {}
+    gpu_kernels: dict[bytes, object] = {}
+    if gpu_enabled:
+        try:
+            import cupy as cp  # type: ignore[no-redef]
+            from cupyx.scipy.ndimage import correlate1d as cp_correlate1d  # type: ignore[no-redef]
+            # This is the first operation that authoritatively validates the
+            # CUDA runtime/device instead of merely finding the Python module.
+            cp.cuda.runtime.getDeviceCount()
+        except Exception:
+            gpu_enabled = False
+            cp = cp_correlate1d = None
 
     def sep_corr(arr: np.ndarray, ky: np.ndarray, kx: np.ndarray) -> np.ndarray:
-        """Applies a 2D correlation by separating it into two O(N) 1D correlations."""
+        """Apply a separable 2-D correlation on the selected backend."""
+        nonlocal gpu_enabled
+        if gpu_enabled:
+            try:
+                key = id(arr)
+                gpu_arr = gpu_arrays.get(key)
+                if gpu_arr is None:
+                    gpu_arr = cp.asarray(arr, dtype=cp.float64)
+                    gpu_arrays[key] = gpu_arr
+
+                def gpu_kernel(kernel):
+                    kkey = np.asarray(kernel, dtype=np.float64).tobytes()
+                    value = gpu_kernels.get(kkey)
+                    if value is None:
+                        value = cp.asarray(kernel, dtype=cp.float64)
+                        gpu_kernels[kkey] = value
+                    return value
+
+                temp = cp_correlate1d(
+                    gpu_arr, gpu_kernel(ky), axis=0,
+                    mode='constant', cval=0.0)
+                out = cp_correlate1d(
+                    temp, gpu_kernel(kx), axis=1,
+                    mode='constant', cval=0.0)
+                return cp.asnumpy(out)
+            except Exception as exc:
+                # A low-memory device or incompatible cupyx build should make
+                # this one calculation slower, never make pair strain fail.
+                print(f"[Pair strain] GPU filters unavailable ({exc}); using CPU.")
+                gpu_enabled = False
+                gpu_arrays.clear()
         temp = correlate1d(arr, ky, axis=0, mode='constant', cval=0.0)
         return correlate1d(temp, kx, axis=1, mode='constant', cval=0.0)
 
@@ -83,6 +154,7 @@ def compute_velocity_strains(
     # Usually one or two components. Each pass remains separable O(N), while
     # the component restriction prevents a least-squares plane crossing a cut.
     for component_id in range(1, n_components + 1):
+        gpu_arrays.clear()
         component = valid & (labels == component_id)
         if np.count_nonzero(component) < 6:
             continue
@@ -143,4 +215,16 @@ def compute_velocity_strains(
                   dVy_dx=dVy_dx, dVy_dy=dVy_dy)
     for values in result.values():
         values[~np.isfinite(values)] = np.nan
-    return result
+
+    # Restore the public full-image shape. Several result names intentionally
+    # alias the same derivative array; preserve those aliases while expanding.
+    expanded: dict[str, np.ndarray] = {}
+    by_id: dict[int, np.ndarray] = {}
+    for name, values in result.items():
+        shared = by_id.get(id(values))
+        if shared is None:
+            shared = np.full(full_shape, np.nan, dtype=np.float64)
+            shared[crop] = values
+            by_id[id(values)] = shared
+        expanded[name] = shared
+    return expanded

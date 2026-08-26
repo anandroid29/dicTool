@@ -75,34 +75,53 @@ class ViewRenderer:
     """
 
     def __init__(self, analysis, markers: Optional[Sequence] = None,
-                 trail: int = 0) -> None:
+                 trail: int = 0, results=None, pairs=None) -> None:
         self.analysis = analysis
+        self.results = analysis.results if results is None else results
+        self.pairs = None if pairs is None else list(pairs)
         self.markers = list(markers or [])
         self.trail = int(trail)
         self._img_cache: dict = {}
+        self._result_cache: dict = {}
         self._traj_cache: dict = {}
         self._unit_cache: dict = {}
+        self._global_cache: dict = {}
+
+    def _source_index(self, idx: int) -> int:
+        return int(self.pairs[idx][1]) if self.pairs is not None else int(idx)
+
+    def _result(self, idx: int):
+        if idx not in self._result_cache:
+            if len(self._result_cache) >= 2:
+                self._result_cache.clear()
+            self._result_cache[idx] = self.results[idx]
+        return self._result_cache[idx]
 
     # -- data access ------------------------------------------------------
     def _deformed(self, idx: int) -> Optional[np.ndarray]:
-        if idx in self._img_cache:
-            return self._img_cache[idx]
+        source = self._source_index(idx)
+        if source in self._img_cache:
+            return self._img_cache[source]
         from src.core.analysis import _load_image
         try:
-            img = _load_image(self.analysis.results[idx].image_path)
+            if self.pairs is not None and source < len(self.analysis.def_paths):
+                path = self.analysis.def_paths[source]
+            else:
+                path = self.analysis.results[source].image_path
+            img = _load_image(path)
         except Exception:
             img = None
         # Only the two most recent frames are worth keeping; a full-sequence
         # cache is what turns a long export into an out-of-memory crash.
         if len(self._img_cache) > 2:
             self._img_cache.clear()
-        self._img_cache[idx] = img
+        self._img_cache[source] = img
         return img
 
     def field_array(self, idx: int, field: str) -> Tuple[Optional[np.ndarray], str]:
         """Field in display units, plus its unit label."""
         from src.ui.pages.results_page import FIELDS
-        res = self.analysis.results[idx]
+        res = self._result(idx)
         arr = getattr(res, field, None)
         base = FIELDS.get(field, ("", ""))[1]
         if (arr is not None and bool(getattr(self.analysis, "hdf5_lazy", False))
@@ -122,32 +141,59 @@ class ViewRenderer:
         if cached is not None:
             return cached
         factor_unit = cal.factor_and_unit(field, base)
-        if cal.calibrated and self.analysis.results:
+        if cal.calibrated and self.results:
             if bool(getattr(self.analysis, "hdf5_lazy", False)) and native_arr is not None:
                 values = np.asarray(native_arr)
                 finite = np.abs(values[np.isfinite(values)])
                 magnitude = (float(np.percentile(finite, 99.0))
                              if finite.size else 0.0)
             else:
-                lo, hi = self.analysis.get_global_range(field, 99.0)
+                lo, hi = self._native_global_range(field, 99.0)
                 magnitude = max(abs(float(lo)), abs(float(hi)))
             factor_unit = cal.compact_factor_and_unit(field, magnitude, base)
         self._unit_cache[key] = factor_unit
         return factor_unit
 
     def global_range(self, field: str) -> Tuple[float, float]:
-        lo, hi = self.analysis.get_global_range(field)
+        lo, hi = self._native_global_range(field, 100.0)
         from src.ui.pages.results_page import FIELDS
         factor, _ = self._field_factor_and_unit(
             field, FIELDS.get(field, ("", ""))[1])
         return lo * factor, hi * factor
+
+    def _native_global_range(self, field: str, coverage: float) -> Tuple[float, float]:
+        key = (field, float(coverage))
+        cached = self._global_cache.get(key)
+        if cached is not None:
+            return cached
+        if self.results is self.analysis.results:
+            value = self.analysis.get_global_range(field, coverage)
+            self._global_cache[key] = value
+            return value
+        from src.core.stats import robust_limits
+        pooled = []
+        stride = max(1, len(self.results) // 200)
+        for idx in range(0, len(self.results), stride):
+            field_values = getattr(self._result(idx), field, None)
+            if field_values is None:
+                continue
+            values = finite_values(field_values)
+            if values.size > 50_000:
+                values = values[::values.size // 50_000 + 1]
+            if values.size:
+                pooled.append(values)
+        limits = robust_limits(np.concatenate(pooled), coverage) if pooled else None
+        value = limits if limits is not None else (0.0, 1.0)
+        self._global_cache[key] = value
+        return value
 
     def _trajectories(self, idx: int):
         key = (idx, self.trail)
         if key not in self._traj_cache:
             self._traj_cache.clear()
             self._traj_cache[key] = self.analysis.get_trajectories_from_seeds(
-                self.markers, idx, self.trail) if self.markers else []
+                self.markers, self._source_index(idx), self.trail
+            ) if self.markers else []
         return self._traj_cache[key]
 
     # -- rendering --------------------------------------------------------
@@ -214,11 +260,13 @@ class ViewRenderer:
 def export_video(analysis, spec: ExportSpec, path: str,
                  markers: Optional[Sequence] = None,
                  progress_cb: Optional[Callable[[float, str], None]] = None,
-                 cancel_flag: Optional[list] = None) -> str:
+                 cancel_flag: Optional[list] = None,
+                 results=None, pairs=None) -> str:
     """Render frames [first, last] and write them out. Returns the output path."""
     if not _HAVE_CV2:
         raise RuntimeError("OpenCV is required for video export.")
-    n = len(analysis.results)
+    export_results = analysis.results if results is None else results
+    n = len(export_results)
     if n == 0:
         raise RuntimeError("No results to export.")
 
@@ -227,7 +275,8 @@ def export_video(analysis, spec: ExportSpec, path: str,
     if last < first:
         raise ValueError("Empty frame range.")
 
-    renderer = ViewRenderer(analysis, markers, spec.trail)
+    renderer = ViewRenderer(
+        analysis, markers, spec.trail, results=export_results, pairs=pairs)
     cancel_flag = cancel_flag if cancel_flag is not None else [False]
 
     probe = renderer.render_frame(first, spec)

@@ -359,7 +359,9 @@ def draw_colorbar(rgb: np.ndarray, cmap_name: str, vmin: float, vmax: float,
         return rgb
     h, w = rgb.shape[:2]
     cap = 7 if (clipped_low or clipped_high) else 0
-    bar_w = max(40, w - 2 * margin - 2 * cap)
+    # Never make the ramp wider than the image. The old 40-pixel minimum
+    # overflowed small exported panels before they were fitted into a mosaic.
+    bar_w = max(1, w - 2 * margin - 2 * cap)
     ramp = np.linspace(0.0, 1.0, bar_w, dtype=np.float32)[None, :]
     cols = (get_cmap(cmap_name, 256)(ramp)[..., :3] * 255).astype(np.uint8)
     bar = np.repeat(cols, height, axis=0)
