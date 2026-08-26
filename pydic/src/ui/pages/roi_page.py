@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFrame, QToolButton, QButtonGroup,
@@ -20,7 +21,7 @@ from src.ui.image_canvas import ImageCanvas, ROITool
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2
+from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_ACCENT = C_ACCENT
 _C_BG = C_BG
@@ -30,6 +31,7 @@ _C_SUCCESS = C_SUCCESS
 _C_SURFACE = C_SURFACE
 _C_TEXT = C_TEXT
 _C_TEXT2 = C_TEXT2
+_C_TEXT3 = C_TEXT3
 
 
 
@@ -183,6 +185,22 @@ class ROIPage(QWidget):
 
         tb_lay.addStretch()
 
+        # Undo. Drawing tools are direct-manipulation and easy to misfire --
+        # a stray click drops a region or moves the seed with no way back
+        # short of clearing everything and starting again.
+        self._undo_btn = QPushButton("↶")
+        self._undo_btn.setToolTip("Undo the last region, erase stroke or seed  (Ctrl+Z)")
+        self._undo_btn.setFixedSize(44, 36)
+        self._undo_btn.setEnabled(False)
+        self._undo_btn.clicked.connect(self._undo)
+        self._undo_btn.setStyleSheet(
+            f"QPushButton {{ background:{_C_CARD}; color:{_C_TEXT2}; "
+            f"border:1px solid {_C_BORDER}; border-radius:3px; font-size:16px; }} "
+            f"QPushButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }} "
+            f"QPushButton:disabled {{ color:{_C_TEXT3}; }}"
+        )
+        tb_lay.addWidget(self._undo_btn)
+
         # Clear button
         clr_btn = QPushButton("⟳")
         clr_btn.setToolTip("Clear the mask currently being edited")
@@ -203,6 +221,13 @@ class ROIPage(QWidget):
                                    QSizePolicy.Policy.Expanding)
         self._canvas.roi_changed.connect(self._on_roi_changed)
         self._canvas.seed_placed.connect(self._on_seed_placed)
+        self._canvas.undo_availability_changed.connect(self._undo_btn.setEnabled)
+
+        # Ctrl+Z as well as the button. WindowShortcut scope keeps it inert on
+        # the other wizard steps, which have nothing to undo.
+        self._undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
+        self._undo_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._undo_shortcut.activated.connect(self._undo)
         self._canvas.set_roi_tool(ROITool.RECTANGLE)
         main_lay.addWidget(self._canvas, 1)
 
@@ -418,6 +443,9 @@ class ROIPage(QWidget):
             if self._canvas._image_arr is not img:
                 self._canvas.set_image(img)
                 self._canvas.zoom_fit()
+                # Masks from a different frame are not states this image could
+                # be undone to.
+                self._canvas.clear_undo_history()
 
         # Restore ROI Mask & update labels
         mask = (analysis.strain_origin_mask if self._editing_origin
@@ -493,9 +521,21 @@ class ROIPage(QWidget):
                 self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
 
     def _on_seed_placed(self, x: int, y: int) -> None:
+        # Negative coordinates mean the seed was removed rather than placed --
+        # undo emits that when the region containing the seed is restored away.
+        if x < 0 or y < 0:
+            self._wizard.seed_xy = None
+            self._seed_status.setText("No seed — will default to ROI centroid")
+            self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
+            return
         self._wizard.seed_xy = (x, y)
         self._seed_status.setText(f"Seed: ({x}, {y})")
         self._seed_status.setStyleSheet(f"color:{_C_SUCCESS}; font-size:11px;")
+
+    def _undo(self) -> None:
+        """Step back one drawing action on the canvas."""
+        if self._canvas.undo():
+            self._refresh_mask_status()
 
     def _use_full(self) -> None:
         self._set_edit_channel(False)
