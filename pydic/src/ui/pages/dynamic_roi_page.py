@@ -16,7 +16,6 @@ frame to frame.
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
-import time
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut
@@ -99,11 +98,6 @@ class DynamicROIPage(QWidget):
         self._refresh_timer.setInterval(60)
         self._refresh_timer.timeout.connect(self._refresh)
         self._play_timer = QTimer(self)
-        # Self-rescheduling rather than repeating. Each preview frame rebuilds
-        # a texture mask, which can outlast the interval on a large image; a
-        # repeating timer would queue those overruns until the event loop
-        # stopped draining and the transport no longer responded.
-        self._play_timer.setSingleShot(True)
         self._play_timer.timeout.connect(self._play_next_frame)
         self._build_ui()
         self._install_shortcuts()
@@ -231,15 +225,6 @@ class DynamicROIPage(QWidget):
         self._clear_frame_btn.setFixedHeight(30)
         self._clear_frame_btn.clicked.connect(self._clear_frame_override)
         fbar.addWidget(self._clear_frame_btn)
-
-        # Include/exclude overrides are drawn the same way the ROI is, so an
-        # accidental region needs the same way back.
-        self._undo_btn = QPushButton("↶ Undo")
-        self._undo_btn.setFixedHeight(30)
-        self._undo_btn.setEnabled(False)
-        self._undo_btn.setToolTip("Undo the last drawn override region  (Ctrl+Z)")
-        self._undo_btn.clicked.connect(self._undo)
-        fbar.addWidget(self._undo_btn)
         root.addWidget(frame_bar)
 
         body = QWidget()
@@ -251,12 +236,7 @@ class DynamicROIPage(QWidget):
         self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._canvas.seed_enabled = False
         self._canvas.roi_changed.connect(self._on_canvas_roi)
-        self._canvas.undo_availability_changed.connect(self._undo_btn.setEnabled)
         body_lay.addWidget(self._canvas, 1)
-
-        self._undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
-        self._undo_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self._undo_shortcut.activated.connect(self._undo)
 
         right = QWidget()
         right.setFixedWidth(_PANEL_W)
@@ -897,16 +877,6 @@ class DynamicROIPage(QWidget):
         if not entry:
             self._frame_overrides.pop(self._preview_frame, None)
 
-    def _undo(self) -> None:
-        """Step back one drawn override region.
-
-        The canvas owns the geometry, so undoing there and letting the normal
-        roi_changed path run keeps the stored override in step -- writing the
-        restored mask back by hand would be a second way to update it, and the
-        two would drift.
-        """
-        self._canvas.undo()
-
     def _clear_frame_override(self) -> None:
         self._play_timer.stop()
         self._frame_overrides.pop(self._preview_frame, None)
@@ -984,16 +954,13 @@ class DynamicROIPage(QWidget):
             self._preview_frame + int(delta),
             self._frame_slider.minimum(), self._frame_slider.maximum())))
 
-    def _playback_interval_ms(self) -> float:
-        fps = max(0.1, float(getattr(self._wizard.analysis, "fps", 10.0)))
-        return float(np.clip(1000.0 / fps, 35, 400))
-
     def _toggle_playback(self) -> None:
         if self._play_timer.isActive():
             self._play_timer.stop()
             self._play_btn.setText("▶")
             return
-        self._play_timer.start(int(self._playback_interval_ms()))
+        fps = max(0.1, float(getattr(self._wizard.analysis, "fps", 10.0)))
+        self._play_timer.start(int(np.clip(1000.0 / fps, 35, 400)))
         self._play_btn.setText("❚❚")
 
     def _play_next_frame(self) -> None:
@@ -1001,13 +968,7 @@ class DynamicROIPage(QWidget):
             self._play_timer.stop()
             self._play_btn.setText("▶")
             return
-        started = time.perf_counter()
         self._frame_slider.setValue(self._preview_frame + 1)
-        # Deduct the render from the next delay, so a slow frame costs time
-        # rather than accumulating a backlog behind it.
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        self._play_timer.start(
-            int(max(1.0, self._playback_interval_ms() - elapsed_ms)))
 
     # --------------------------------------------------------------- preview
     def _commit_to_analysis(self) -> None:
