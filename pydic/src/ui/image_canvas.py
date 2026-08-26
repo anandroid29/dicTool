@@ -1223,8 +1223,17 @@ class ImageCanvas(QWidget):
         self._rebuild_roi_pixmap()
         self.update()
         self.shape_drawing_changed.emit(False)
-        self.roi_changed.emit(
-            None if self._roi_mask is None else self._roi_mask.copy())
+
+        # Undoing back to "nothing drawn" restores an internal mask of None,
+        # but roi_changed carries a mask that consumers index and call .shape
+        # on. Emitting None there raised inside the slot, and PyQt aborts the
+        # process on an unhandled exception in a slot -- the window simply
+        # vanished. An all-False mask is the same state expressed as an array.
+        if self._roi_mask is not None:
+            self.roi_changed.emit(self._roi_mask.copy())
+        elif self._image_arr is not None:
+            self.roi_changed.emit(np.zeros(self._image_arr.shape, dtype=bool))
+
         self.seed_placed.emit(*(self._seed_xy if self._seed_xy else (-1, -1)))
         self.undo_availability_changed.emit(bool(self._undo_stack))
         return True

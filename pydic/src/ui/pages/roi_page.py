@@ -183,23 +183,36 @@ class ROIPage(QWidget):
         )
         tb_lay.addWidget(self._seed_btn)
 
-        tb_lay.addStretch()
+        tb_lay.addSpacing(12)
 
-        # Undo. Drawing tools are direct-manipulation and easy to misfire --
-        # a stray click drops a region or moves the seed with no way back
-        # short of clearing everything and starting again.
+        # Undo sits with the tools, not at the far bottom of the column.
+        # Parked below a stretch it was several hundred pixels from the actions
+        # it reverses and read as part of the footer, so it went unnoticed --
+        # an undo nobody can find is the same as no undo. Same 44x44 footprint
+        # as the tools, and a label, because a bare glyph is not self-evident.
+        edit_lbl = QLabel("History")
+        edit_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:9px;")
+        edit_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb_lay.addWidget(edit_lbl)
+
         self._undo_btn = QPushButton("↶")
-        self._undo_btn.setToolTip("Undo the last region, erase stroke or seed  (Ctrl+Z)")
-        self._undo_btn.setFixedSize(44, 36)
+        self._undo_btn.setToolTip(
+            "Undo the last region, erase stroke or seed  (Ctrl+Z)")
+        self._undo_btn.setFixedSize(44, 44)
         self._undo_btn.setEnabled(False)
         self._undo_btn.clicked.connect(self._undo)
+        # The accent border when there is something to undo is the cue that
+        # the action is available at all.
         self._undo_btn.setStyleSheet(
-            f"QPushButton {{ background:{_C_CARD}; color:{_C_TEXT2}; "
-            f"border:1px solid {_C_BORDER}; border-radius:3px; font-size:16px; }} "
-            f"QPushButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }} "
-            f"QPushButton:disabled {{ color:{_C_TEXT3}; }}"
+            f"QPushButton {{ background:{_C_CARD}; color:{_C_TEXT}; "
+            f"border:1px solid {_C_ACCENT}; border-radius:3px; font-size:20px; }} "
+            f"QPushButton:hover {{ background:{_C_ACCENT}; color:#fff; }} "
+            f"QPushButton:disabled {{ background:{_C_CARD}; color:{_C_TEXT3}; "
+            f"border:1px solid {_C_BORDER}; }}"
         )
         tb_lay.addWidget(self._undo_btn)
+
+        tb_lay.addStretch()
 
         # Clear button
         clr_btn = QPushButton("⟳")
@@ -500,6 +513,15 @@ class ROIPage(QWidget):
         self._refresh_mask_status()
 
     def _on_roi_changed(self, mask: np.ndarray) -> None:
+        # Defence in depth for the crash above: an exception raised in a Qt
+        # slot is not caught anywhere and takes the process with it, so this
+        # entry point must not assume it was handed an array.
+        if mask is None:
+            img = self._canvas._image_arr
+            if img is None:
+                return
+            mask = np.zeros(img.shape, dtype=bool)
+
         if self._editing_origin:
             self._wizard.analysis.set_strain_origin_mask(mask)
             clipped = self._wizard.analysis.strain_origin_mask
@@ -514,7 +536,10 @@ class ROIPage(QWidget):
         # Verify existing seed is still inside the newly edited ROI
         if getattr(self._wizard, 'seed_xy', None) is not None:
             sx, sy = self._wizard.seed_xy
-            if not mask[sy, sx]:
+            h, w = mask.shape
+            # A seed outside the array is as invalid as one outside the mask,
+            # and indexing it would raise rather than simply drop the seed.
+            if not (0 <= sy < h and 0 <= sx < w) or not mask[sy, sx]:
                 self._wizard.seed_xy = None
                 self._canvas.set_seed_xy(None)
                 self._seed_status.setText("No seed — will default to ROI centroid")
