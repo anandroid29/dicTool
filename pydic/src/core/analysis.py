@@ -6,6 +6,8 @@ Fixed: Survival rate denominator uses valid ROI subset count to prevent false Au
 from __future__ import annotations
 import importlib.util
 import os, time
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 import numpy as np
@@ -246,6 +248,15 @@ class PairResult:
     Eeff_gl: Optional[np.ndarray] = None
 
 
+@dataclass(frozen=True)
+class _CroppedTemporalField:
+    """Dense finite-support crop used by the sliding gradient LRU cache."""
+    shape: tuple[int, int]
+    y0: int
+    x0: int
+    values: np.ndarray
+
+
 class DICAnalysis:
     def __init__(self) -> None:
         self.ref_path:  Optional[str]      = None
@@ -264,6 +275,9 @@ class DICAnalysis:
         self.strain_start_frame: int = 0
         self.params:  DICParams      = DICParams()
         self.results: List[PairResult] = []
+        self.temporal_results = None
+        self.temporal_pairs: list[tuple[int, int]] = []
+        self.temporal_metadata: dict = {}
         self.fps: float = 1.0
         # Spatial calibration. Uncalibrated by default: the solver is pixel-native
         # and stays that way -- this only affects how results are presented.
@@ -1291,13 +1305,10 @@ class DICAnalysis:
     # ------------------------------------------------------------------
     # Frame-pair analysis
     # ------------------------------------------------------------------
-    # A "pair" is two frames (i, j) treated as one measurement interval. Every
-    # quantity below is derived from that interval alone, so several pairs drawn
-    # from different parts of a sequence can be averaged into one field.
-    #
-    # Accumulated strain is deliberately absent. A selected interval can combine
-    # immediate displacements and rates, but its accumulated history is not an
-    # independent measurement that can be averaged across arbitrary pairs.
+    # A "pair" is two frames (i, j) treated as one temporally smoothed
+    # measurement interval. Displacement, velocity and strain rate describe that
+    # interval. Accumulated strain remains the history state at endpoint j; a
+    # sliding window must never reset or double-count that state.
 
     PAIR_FIELDS = ("u", "v", "u_inc", "v_inc", "mag_inc",
                    "Vx", "Vy", "Veff",
@@ -1308,11 +1319,223 @@ class DICAnalysis:
         """Elapsed time between two frames, in seconds."""
         return abs(j - i) / max(self.fps, 1e-9)
 
-    def pair_kinematics(self, i: int, j: int) -> "PairResult":
-        """Displacement, velocity and strain rate between frames i and j.
+    def _pair_step_gradients(
+            self, result: "PairResult", strain_window: int,
+            use_gpu: bool) -> dict[str, _CroppedTemporalField]:
+        """Spatially fit one immediate interval once per window/backend.
 
-        u/v and u_inc/v_inc both carry the pair's own displacement: an isolated
-        interval has no "cumulative" value distinct from its own increment.
+        Sliding temporal windows reuse most constituent intervals. Without this
+        cache, a span-4 sequence fitted nearly every interval four times. The
+        finite-support crops keep the cache bounded and can be sampled without
+        expanding full NaN images.
+        """
+        cache = getattr(self, "_temporal_gradient_cache", None)
+        lock = getattr(self, "_temporal_gradient_lock", None)
+        if cache is None or lock is None:
+            cache = OrderedDict()
+            lock = threading.RLock()
+            self._temporal_gradient_cache = cache
+            self._temporal_gradient_lock = lock
+        key = (id(result), int(strain_window), bool(use_gpu))
+        with lock:
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+                return hit
+
+            from .strain import compute_velocity_strains
+            valid = (np.asarray(result.valid, dtype=bool)
+                     if result.valid is not None else
+                     (np.isfinite(result.u) & np.isfinite(result.v)))
+            fitted = compute_velocity_strains(
+                np.asarray(result.u), np.asarray(result.v), valid,
+                strain_window, self.params.subset_spacing, use_gpu=use_gpu)
+            names = ("dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy")
+            dense = [np.asarray(fitted[name]) for name in names]
+            complete = np.logical_and.reduce(
+                [np.isfinite(values) for values in dense])
+            rows = complete.any(axis=1)
+            cols = complete.any(axis=0)
+            if rows.any() and cols.any():
+                y0, y1 = int(rows.argmax()), int(len(rows) - rows[::-1].argmax()) + 1
+                x0, x1 = int(cols.argmax()), int(len(cols) - cols[::-1].argmax()) + 1
+            else:
+                y0 = y1 = x0 = x1 = 0
+            packed = {}
+            for name, values in zip(names, dense):
+                crop = values[y0:y1, x0:x1].astype(np.float32, copy=True)
+                if crop.size:
+                    crop[~complete[y0:y1, x0:x1]] = np.nan
+                packed[name] = _CroppedTemporalField(
+                    values.shape, y0, x0, crop)
+            cache[key] = packed
+            # Enough for several neighboring windows without turning a
+            # full-sequence preprocessing run into another result-sized store.
+            while len(cache) > 24:
+                cache.popitem(last=False)
+            return packed
+
+    @staticmethod
+    def _dense_temporal_gradient(field: _CroppedTemporalField) -> np.ndarray:
+        """Expand one cached crop only for the path-transport step using it."""
+        dense = np.full(field.shape, np.nan, dtype=np.float32)
+        height, width = field.values.shape
+        if height and width:
+            dense[field.y0:field.y0 + height,
+                  field.x0:field.x0 + width] = field.values
+        return dense
+
+    def _temporal_accumulated_strains(
+            self, strain_window: int,
+            use_gpu: bool,
+            progress_cb: Optional[Callable[[float, str], None]] = None,
+            cancel_flag: Optional[list] = None,
+            min_frame: Optional[int] = None,
+            max_frame: Optional[int] = None,
+            ) -> tuple[dict[str, object], ...]:
+        """Return analysis-history strain at every temporal endpoint.
+
+        The selected temporal range owns its strain history. It starts from
+        zero at that range's first displayed frame, consumes only the following
+        measured increments, and remains cumulative across sliding outputs.
+        """
+        names = ("Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl")
+        if cancel_flag is not None and cancel_flag[0]:
+            raise RuntimeError("Temporal calculation cancelled.")
+        limit = (len(self.results) if max_frame is None else
+                 min(len(self.results), max(0, int(max_frame)) + 1))
+        configured_start = int(np.clip(
+            getattr(self, "strain_start_frame", 0), 0, len(self.results)))
+        first = configured_start if min_frame is None else max(
+            configured_start, min(len(self.results), max(0, int(min_frame))))
+        selected_results = self.results[first:limit]
+        original_window = self.params.effective_strain_window()
+        if (min_frame is None and int(strain_window) == original_window and
+                all(all(getattr(result, name, None) is not None
+                        for name in names) for result in self.results[:limit])):
+            return tuple({name: getattr(result, name) for name in names}
+                         for result in self.results[:limit])
+
+        cache = getattr(self, "_temporal_strain_cache", None)
+        lock = getattr(self, "_temporal_strain_lock", None)
+        if cache is None or lock is None:
+            cache = OrderedDict()
+            lock = threading.RLock()
+            self._temporal_strain_cache = cache
+            self._temporal_strain_lock = lock
+        result_signature = (
+            id(self.results), len(self.results),
+            id(self.results[0]) if self.results else 0,
+            id(self.results[-1]) if self.results else 0,
+        )
+        key = (result_signature, first, limit,
+               int(strain_window), bool(use_gpu),
+               int(getattr(self, "strain_start_frame", 0)),
+               id(getattr(self, "_strain_origin_mask", None)))
+        with lock:
+            if cancel_flag is not None and cancel_flag[0]:
+                raise RuntimeError("Temporal calculation cancelled.")
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+                return hit
+
+            if self._roi_mask is None:
+                return tuple()
+            from .strain_accum import StrainPathTracker
+
+            origin = getattr(self, "_strain_origin_mask", None)
+            if origin is None or not np.any(origin):
+                origin = self._roi_mask
+            tracker = StrainPathTracker(
+                self._roi_mask.shape, origin, self._roi_mask,
+                self.params.subset_radius, self.params.subset_spacing)
+            persistent = (
+                "Exx_inf", "Eyy_inf", "Exy_inf", "Eeff_inf",
+                "Exx_gl", "Eyy_gl", "Exy_gl")
+            swept = {name: np.full(self._roi_mask.shape, np.nan,
+                                   dtype=np.float32)
+                     for name in persistent}
+            encountered = np.zeros(self._roi_mask.shape, dtype=bool)
+
+            def deposit(snapshot) -> None:
+                new = self._roi_mask & ~encountered
+                for name in persistent:
+                    new &= np.isfinite(np.asarray(snapshot[name]))
+                if not new.any():
+                    return
+                for name in persistent:
+                    swept[name][new] = np.asarray(snapshot[name])[new]
+                encountered[new] = True
+
+            def packed_snapshot() -> dict[str, CompactField]:
+                values = {
+                    "Exx_gl": swept["Exx_gl"],
+                    "Eyy_gl": swept["Eyy_gl"],
+                    "Exy_gl": swept["Exy_gl"],
+                    "Eeff_gl": swept["Eeff_inf"],
+                }
+                complete = np.logical_and.reduce(
+                    [np.isfinite(values[name]) for name in names])
+                indices = np.flatnonzero(complete.reshape(-1)).astype(
+                    np.uint32, copy=False)
+                return {
+                    name: CompactField.from_dense(values[name], indices=indices)
+                    for name in names
+                }
+
+            blank = {name: CompactField.empty(self._roi_mask.shape)
+                     for name in names}
+            sequence = [blank for _ in range(first)]
+            count = len(selected_results)
+            for offset, result in enumerate(selected_results):
+                if cancel_flag is not None and cancel_flag[0]:
+                    raise RuntimeError("Temporal calculation cancelled.")
+                if progress_cb:
+                    progress_cb(
+                        offset / max(1, count),
+                        f"Strain history {offset + 1}/{count}")
+
+                pair_valid = (result.valid if result.valid is not None else
+                              (np.isfinite(result.u) & np.isfinite(result.v)))
+                tracker.seed(pair_valid)
+                deposit(tracker.snapshot())
+                gradients = self._pair_step_gradients(
+                    result, int(strain_window), use_gpu=use_gpu)
+                if cancel_flag is not None and cancel_flag[0]:
+                    raise RuntimeError("Temporal calculation cancelled.")
+                tracker.advance(
+                    np.asarray(result.u), np.asarray(result.v),
+                    *(self._dense_temporal_gradient(gradients[name])
+                      for name in ("dVx_dx", "dVx_dy",
+                                   "dVy_dx", "dVy_dy")))
+                deposit(tracker.snapshot())
+                sequence.append(packed_snapshot())
+
+            stored = tuple(sequence)
+            if progress_cb:
+                progress_cb(1.0, "Accumulated strain history ready")
+            cache[key] = stored
+            while len(cache) > 2:
+                cache.popitem(last=False)
+            return stored
+
+    def pair_kinematics(
+            self, i: int, j: int, strain_window: Optional[int] = None,
+            use_gpu: bool = False,
+            progress_cb: Optional[Callable[[float, str], None]] = None,
+            cancel_flag: Optional[list] = None,
+            include_strain: bool = True,
+            include_rate: bool = True,
+            ) -> "PairResult":
+        """Material-path kinematics between displayed frames ``i`` and ``j``.
+
+        Each adjacent displacement is sampled at the point's advected position,
+        so the returned displacement maps material coordinates on frame ``i``
+        to frame ``j``. Temporal strain rate is derived from that complete
+        interval map. Accumulated Green--Lagrange strain is the analysis-history
+        state at endpoint ``j``; it is never reset at ``i`` or averaged across
+        overlapping windows.
         """
         n = len(self.results)
         if not (0 <= i < n and 0 <= j < n):
@@ -1323,27 +1546,109 @@ class DICAnalysis:
             i, j = j, i
 
         # Result k is the interval entering displayed frame k. Therefore the
-        # displacement from displayed frame i to j is the sum of intervals
-        # i+1..j, not the difference between two already-incremental fields.
+        # motion from displayed frame i to j consumes intervals i+1..j.
         interval_results = self.results[i + 1:j + 1]
-        u_stack = np.stack([np.where(np.isfinite(r.u), r.u, np.nan)
-                            for r in interval_results])
-        v_stack = np.stack([np.where(np.isfinite(r.v), r.v, np.nan)
-                            for r in interval_results])
-        valid_stack = []
-        for r in interval_results:
-            rv = np.isfinite(r.u) & np.isfinite(r.v)
-            if r.valid is not None:
-                rv &= r.valid
-            valid_stack.append(rv)
-        ok = np.all(np.stack(valid_stack), axis=0)
-        # Accumulate in float64 even though the stored fields are float32.
-        # A pair spanning hundreds of intervals adds hundreds of float32 values
-        # per pixel, and that error compounds with the number of intervals;
-        # widening the accumulator costs one temporary and removes it. The
-        # result is stored back at the field precision.
-        du = np.where(ok, np.sum(u_stack, axis=0, dtype=np.float64), np.nan)
-        dv = np.where(ok, np.sum(v_stack, axis=0, dtype=np.float64), np.nan)
+        shape = self.results[0].u.shape
+        radius = max(0, int(self.params.subset_radius))
+        spacing = max(1, int(self.params.subset_spacing))
+        from .strain import compute_velocity_strains
+        pair_window = self.params.effective_strain_window(window=strain_window)
+        grid_x = np.arange(radius, shape[1] - radius, spacing, dtype=np.int32)
+        grid_y = np.arange(radius, shape[0] - radius, spacing, dtype=np.int32)
+        gx, gy = np.meshgrid(grid_x, grid_y)
+        source_ok = (self._roi_mask[gy, gx] if self._roi_mask is not None
+                     else np.ones(gx.shape, dtype=bool))
+        x0 = gx[source_ok].astype(np.float64)
+        y0 = gy[source_ok].astype(np.float64)
+        x, y = x0.copy(), y0.copy()
+        alive = np.ones(x.size, dtype=bool)
+
+        def sample(field, qx_pixels, qy_pixels):
+            """Strict bilinear sampling on the sparse regular DIC lattice."""
+            out = np.full(qx_pixels.size, np.nan, dtype=np.float64)
+            good = np.zeros(qx_pixels.size, dtype=bool)
+            if field is None or not grid_x.size or not grid_y.size:
+                return out, good
+            qx = (qx_pixels - radius) / spacing
+            qy = (qy_pixels - radius) / spacing
+            inside = ((qx >= 0.0) & (qx <= grid_x.size - 1) &
+                      (qy >= 0.0) & (qy <= grid_y.size - 1))
+            rows = np.where(inside)[0]
+            if not rows.size:
+                return out, good
+            xq, yq = qx[rows], qy[rows]
+            ix0 = np.floor(xq).astype(np.intp)
+            iy0 = np.floor(yq).astype(np.intp)
+            ix1 = np.minimum(ix0 + 1, grid_x.size - 1)
+            iy1 = np.minimum(iy0 + 1, grid_y.size - 1)
+            tx, ty = xq - ix0, yq - iy0
+            tx[ix0 == ix1] = 0.0
+            ty[iy0 == iy1] = 0.0
+            corner_y = np.column_stack((
+                grid_y[iy0], grid_y[iy0], grid_y[iy1], grid_y[iy1]))
+            corner_x = np.column_stack((
+                grid_x[ix0], grid_x[ix1], grid_x[ix0], grid_x[ix1]))
+            corner_flat = corner_y * field.shape[1] + corner_x
+            if isinstance(field, CompactField):
+                flat = corner_flat.reshape(-1).astype(np.uint32, copy=False)
+                pos = np.searchsorted(field.indices, flat)
+                exists = ((pos < field.indices.size) &
+                          (field.indices[np.minimum(pos, max(0, field.indices.size - 1))]
+                           == flat)) if field.indices.size else np.zeros(flat.size, bool)
+                gathered = np.full(flat.size, np.nan, dtype=np.float64)
+                if exists.any():
+                    gathered[exists] = field.values[pos[exists]]
+                samples = gathered.reshape(-1, 4)
+            elif isinstance(field, _CroppedTemporalField):
+                ly = corner_y - field.y0
+                lx = corner_x - field.x0
+                crop_h, crop_w = field.values.shape
+                in_crop = ((ly >= 0) & (ly < crop_h) &
+                           (lx >= 0) & (lx < crop_w))
+                samples = np.full(corner_y.shape, np.nan, dtype=np.float64)
+                if in_crop.any():
+                    samples[in_crop] = field.values[ly[in_crop], lx[in_crop]]
+            else:
+                arr = np.asarray(field)
+                samples = arr.reshape(-1)[corner_flat].astype(
+                    np.float64, copy=False)
+            weights = np.column_stack((
+                (1.0 - tx) * (1.0 - ty), tx * (1.0 - ty),
+                (1.0 - tx) * ty, tx * ty,
+            ))
+            needed = weights > 1e-12
+            usable = np.all(~needed | np.isfinite(samples), axis=1)
+            vals = np.sum(np.where(needed, samples, 0.0) * weights, axis=1)
+            usable &= np.isfinite(vals)
+            out[rows[usable]] = vals[usable]
+            good[rows[usable]] = True
+            return out, good
+
+        # Compose displacement along each material path. A failed interpolation
+        # ends only that path; it does not force unrelated subset centres out.
+        for res in interval_results:
+            if cancel_flag is not None and cancel_flag[0]:
+                raise RuntimeError("Temporal calculation cancelled.")
+            rows = np.where(alive)[0]
+            if not rows.size:
+                break
+            uu, gu = sample(res.u, x[rows], y[rows])
+            vv, gv = sample(res.v, x[rows], y[rows])
+            keep = gu & gv
+            alive[rows[~keep]] = False
+            kept = rows[keep]
+            x[kept] += uu[keep]
+            y[kept] += vv[keep]
+
+        du = np.full(shape, np.nan, dtype=np.float64)
+        dv = np.full(shape, np.nan, dtype=np.float64)
+        ok = np.zeros(shape, dtype=bool)
+        if alive.any():
+            sx = x0[alive].astype(np.intp)
+            sy = y0[alive].astype(np.intp)
+            du[sy, sx] = x[alive] - x0[alive]
+            dv[sy, sx] = y[alive] - y0[alive]
+            ok[sy, sx] = True
         with np.errstate(invalid="ignore"):
             mag = np.sqrt(du ** 2 + dv ** 2)
 
@@ -1352,33 +1657,84 @@ class DICAnalysis:
         with np.errstate(invalid="ignore"):
             Veff = np.sqrt(Vx ** 2 + Vy ** 2)
 
-        # Rates come from this pair's own mean velocity field, so they describe
-        # the interval rather than borrowing a neighbouring frame's derivative.
-        from .strain import compute_velocity_strains
-        roi = self._roi_mask if self._roi_mask is not None else np.ones(du.shape, dtype=bool)
-        rate_valid = roi & np.isfinite(Vx) & np.isfinite(Vy)
-        rates = compute_velocity_strains(
-            Vx, Vy, rate_valid, self.params.effective_strain_window(),
-            self.params.subset_spacing)
+        if include_rate:
+            # Temporal smoothing is applied to velocity first. Refit every rate
+            # component from that averaged velocity field, using the
+            # pair-specific spatial window.
+            from .strain import compute_velocity_strains
+            rates = compute_velocity_strains(
+                Vx, Vy, ok, pair_window, spacing, use_gpu=use_gpu)
+            dVx_dx = rates["dVx_dx"]
+            dVx_dy = rates["dVx_dy"]
+            dVy_dx = rates["dVy_dx"]
+            dVy_dy = rates["dVy_dy"]
+            Exx_rate = rates["Exx_rate"]
+            Exy_rate = rates["Exy_rate"]
+            Eyy_rate = rates["Eyy_rate"]
+            Eeff_rate = rates["Eeff_rate"]
+            h11, h12 = dVx_dx * dt, dVx_dy * dt
+            h21, h22 = dVy_dx * dt, dVy_dy * dt
+        else:
+            # Phase one of bulk smoothing exposes velocity only. Rate and
+            # strain remain genuinely absent until all velocity averages exist.
+            empty = CompactField.empty(shape)
+            dVx_dx = dVx_dy = dVy_dx = dVy_dy = empty
+            Exx_rate = Exy_rate = Eyy_rate = Eeff_rate = empty
+            h11 = h12 = h21 = h22 = empty
 
-        nan = np.full(du.shape, np.nan)
-        return PairResult(
+        if include_strain:
+            # Accumulated strain belongs to the complete analysis history
+            # ending at j, not merely to this smoothing window i→j.
+            strain_sequence = self._temporal_accumulated_strains(
+                pair_window, use_gpu=use_gpu, progress_cb=progress_cb,
+                cancel_flag=cancel_flag, min_frame=i + 1, max_frame=j)
+            endpoint = strain_sequence[j]
+            Exx_gl = endpoint["Exx_gl"]
+            Eyy_gl = endpoint["Eyy_gl"]
+            Exy_gl = endpoint["Exy_gl"]
+            Eeff_gl = endpoint["Eeff_gl"]
+        else:
+            # Bulk preprocessing deliberately completes every averaged velocity
+            # and derived rate before its one shared history pass. Empty compact
+            # fields keep the intermediate pair disk format valid.
+            Exx_gl = CompactField.empty(shape)
+            Eyy_gl = CompactField.empty(shape)
+            Exy_gl = CompactField.empty(shape)
+            Eeff_gl = CompactField.empty(shape)
+
+        # Pair timelines can contain hundreds of items. Match normal result
+        # storage precision and share aliases instead of retaining duplicate
+        # float64 arrays for every displayed quantity.
+        du, dv, mag = map(_result_f32, (du, dv, mag))
+        Vx, Vy, Veff = map(_result_f32, (Vx, Vy, Veff))
+        h11, h12, h21, h22 = map(_result_f32, (h11, h12, h21, h22))
+        dVx_dx, dVx_dy, dVy_dx, dVy_dy = map(
+            _result_f32, (dVx_dx, dVx_dy, dVy_dx, dVy_dy))
+        Exx_rate, Exy_rate, Eyy_rate, Eeff_rate = map(
+            _result_f32, (Exx_rate, Exy_rate, Eyy_rate, Eeff_rate))
+        Exx_gl, Exy_gl, Eyy_gl, Eeff_gl = map(
+            _result_f32, (Exx_gl, Exy_gl, Eyy_gl, Eeff_gl))
+
+        out = PairResult(
             image_path=f"pair {i + 1}→{j + 1}",
             u=du, v=dv,
             u_inc=du, v_inc=dv, mag_inc=mag,
-            Exx=nan.copy(), Exy=nan.copy(), Eyy=nan.copy(), Eeff=nan.copy(),
-            du_dx=nan.copy(), du_dy=nan.copy(),
-            dv_dx=nan.copy(), dv_dy=nan.copy(),
-            corr=(np.where(ok, np.asarray(self.results[j].corr), np.nan)
-                  if self.results[j].corr is not None else None),
+            Exx=Exx_gl, Exy=Exy_gl, Eyy=Eyy_gl, Eeff=Eeff_gl,
+            du_dx=h11, du_dy=h12, dv_dx=h21, dv_dy=h22,
+            corr=None,
             Vx=Vx, Vy=Vy, Veff=Veff,
-            dVx_dx=rates["dVx_dx"], dVx_dy=rates["dVx_dy"],
-            dVy_dx=rates["dVy_dx"], dVy_dy=rates["dVy_dy"],
-            Exx_rate=rates["Exx_rate"], Exy_rate=rates["Exy_rate"],
-            Gxy_rate=rates["Gxy_rate"],
-            Eyy_rate=rates["Eyy_rate"], Eeff_rate=rates["Eeff_rate"],
+            dVx_dx=dVx_dx, dVx_dy=dVx_dy,
+            dVy_dx=dVy_dx, dVy_dy=dVy_dy,
+            Exx_rate=Exx_rate, Exy_rate=Exy_rate,
+            Gxy_rate=_result_f32(2.0 * Exy_rate),
+            Eyy_rate=Eyy_rate, Eeff_rate=Eeff_rate,
             valid=ok, elapsed=dt,
+            Exx_gl=Exx_gl, Exy_gl=Exy_gl,
+            Eyy_gl=Eyy_gl, Eeff_gl=Eeff_gl,
         )
+        out.pair_start = i
+        out.pair_end = j
+        return out
 
     # Fields that are rates -- quantities per unit time. These are the only
     # ones a plain mean is valid on, because their value does not depend on how
@@ -1596,7 +1952,11 @@ class DICAnalysis:
             np.savetxt(os.path.join(directory, f"{base}_{name}.csv"), out,
                        delimiter=",", header=header)
 
-    def export_hdf5(self, path: str, progress_cb: Optional[Callable[[float], None]] = None) -> None:
+    def export_hdf5(
+            self, path: str,
+            progress_cb: Optional[Callable[[float], None]] = None,
+            temporal_results=None, temporal_pairs=None,
+            temporal_metadata: Optional[dict] = None) -> None:
         import h5py
         with h5py.File(path, "w") as f:
             # 1. Save Global Attributes
@@ -1720,25 +2080,65 @@ class DICAnalysis:
                            for idx, vals in packed]
                 return common, aligned
 
-            for i, res in enumerate(self.results):
-                if progress_cb:
-                    progress_cb(i / len(self.results))
-                g = f.create_group(f"frame_{i:04d}")
-                g.attrs["image_path"] = res.image_path
-                g.attrs["elapsed_s"] = res.elapsed
+            def write_result_group(group, res) -> None:
+                group.attrs["image_path"] = res.image_path
+                group.attrs["elapsed_s"] = res.elapsed
                 shape = getattr(res.u, "shape", None)
                 if shape is None:
                     shape = self._roi_mask.shape
-                g.attrs["field_shape"] = np.asarray(shape, dtype=np.int64)
+                group.attrs["field_shape"] = np.asarray(shape, dtype=np.int64)
                 for prefix, names in (("valid", measurement_fields),
                                       ("rate", rate_fields),
                                       ("strain", strain_fields)):
                     indices, values = packed_common(res, names)
-                    g.create_dataset(f"{prefix}_indices", data=indices,
-                                     compression="gzip", compression_opts=4)
+                    group.create_dataset(
+                        f"{prefix}_indices", data=indices,
+                        compression="gzip", compression_opts=4)
                     for name, data in zip(names, values):
-                        g.create_dataset(name, data=np.asarray(data, np.float32),
-                                         compression="gzip", compression_opts=4)
+                        group.create_dataset(
+                            name, data=np.asarray(data, np.float32),
+                            compression="gzip", compression_opts=4)
+
+            temporal_count = (len(temporal_results)
+                              if temporal_results is not None else 0)
+            total_items = max(1, len(self.results) + temporal_count)
+
+            for i, res in enumerate(self.results):
+                if progress_cb:
+                    progress_cb(i / total_items)
+                g = f.create_group(f"frame_{i:04d}")
+                write_result_group(g, res)
+
+            if temporal_count:
+                temporal = f.create_group("temporal_sequence")
+                temporal.attrs["schema"] = 4
+                temporal.attrs["complete"] = True
+                temporal.attrs["count"] = temporal_count
+                temporal.attrs["semantics"] = (
+                    "velocity_average_then_rate_then_accumulated_strain")
+                temporal.attrs["rate_semantics"] = (
+                    "symmetric_gradient_of_composed_interval_mean_velocity")
+                temporal.attrs["strain_semantics"] = (
+                    "green_lagrange_history_of_temporally_averaged_frames")
+                for name, value in dict(temporal_metadata or {}).items():
+                    if value is not None:
+                        temporal.attrs[str(name)] = value
+                pairs = (list(temporal_pairs) if temporal_pairs is not None
+                         else [(getattr(temporal_results[i], "pair_start", -1),
+                                getattr(temporal_results[i], "pair_end", -1))
+                               for i in range(temporal_count)])
+                temporal.create_dataset(
+                    "pairs", data=np.asarray(pairs, dtype=np.int64))
+                for i in range(temporal_count):
+                    if progress_cb:
+                        progress_cb((len(self.results) + i) / total_items)
+                    res = temporal_results[i]
+                    group = temporal.create_group(f"pair_{i:06d}")
+                    group.attrs["pair_start"] = int(pairs[i][0])
+                    group.attrs["pair_end"] = int(pairs[i][1])
+                    write_result_group(group, res)
+            if progress_cb:
+                progress_cb(1.0)
 
     def load_hdf5(
             self, path: str,
@@ -1754,6 +2154,9 @@ class DICAnalysis:
         self._release_loaded_hdf5()
         self.results.clear()
         self.def_paths.clear()
+        self.temporal_results = None
+        self.temporal_pairs = []
+        self.temporal_metadata = {}
         self._preview_frame_index = None
         self._preview_frame_image = None
         self.dynamic_frame_overrides = {}
@@ -1987,6 +2390,22 @@ class DICAnalysis:
                     # simply leave this optional compatibility field unavailable.
                     res.Gxy_inf = None if lazy else 2.0 * res.Exy
                     res.Eeff_inf = res.Eeff
+
+            if "temporal_sequence" in f:
+                from .temporal import HDF5TemporalResultSequence
+                temporal = f["temporal_sequence"]
+                pairs = [tuple(int(v) for v in row)
+                         for row in temporal["pairs"][:]]
+                metadata = {}
+                for name, value in temporal.attrs.items():
+                    if isinstance(value, bytes):
+                        value = value.decode("utf-8", errors="replace")
+                    elif isinstance(value, np.generic):
+                        value = value.item()
+                    metadata[str(name)] = value
+                self.temporal_pairs = pairs
+                self.temporal_metadata = metadata
+                self.temporal_results = HDF5TemporalResultSequence(path, pairs)
 
         except Exception:
             f.close()

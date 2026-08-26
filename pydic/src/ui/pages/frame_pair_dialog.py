@@ -1,14 +1,9 @@
 """
-frame_pair_dialog.py — pick frame pairs to average.
+frame_pair_dialog.py — build a playable sequence of smoothed frame intervals.
 
-A "pair" is two frames treated as one measurement interval. Averaging several
-of them beats reading a single interval when the per-frame signal is noisy:
-displacement between two adjacent high-speed frames is often a fraction of a
-pixel, so correlation noise is a large share of it, and averaging K independent
-pairs cuts that noise roughly as sqrt(K) while leaving the underlying motion.
-
-Only interval quantities are offered. Cumulative strain is not averageable
-across pairs -- see DICAnalysis.PAIR_FIELDS for why.
+A "pair" is two displayed frames treated as one longer measurement interval.
+Sliding pairs such as 1→4, 2→5, 3→6 retain temporal playback while reducing the
+share of each measurement contributed by adjacent-frame correlation noise.
 """
 from __future__ import annotations
 
@@ -62,9 +57,12 @@ class FramePairDialog(QDialog):
     out; everything shown to the user is 1-based to match the results view."""
 
     def __init__(self, n_frames: int, fps: float = 1.0,
-                 existing: List[Tuple[int, int]] | None = None, parent=None) -> None:
+                 existing: List[Tuple[int, int]] | None = None,
+                 strain_window: int = 5, grid_spacing: int = 1,
+                 existing_mode: str = "custom",
+                 parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Frame-Pair Average")
+        self.setWindowTitle("Smoothed Frame-Pair Sequence")
         self.setMinimumWidth(520)
         self.setModal(True)
         self.setStyleSheet(
@@ -84,6 +82,10 @@ class FramePairDialog(QDialog):
         self._n = int(n_frames)
         self._fps = float(fps) if fps and fps > 0 else 1.0
         self._pairs: List[Tuple[int, int]] = list(existing or [])
+        self._sequence_mode = (existing_mode if existing_mode in
+                               ("sliding", "non_overlapping") else "custom")
+        self._initial_strain_window = max(0, int(strain_window))
+        self._grid_spacing = max(1, int(grid_spacing))
 
         self._build_ui()
         self._refresh_list()
@@ -95,15 +97,15 @@ class FramePairDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
-        title = QLabel("Average across frame pairs")
+        title = QLabel("Build a smoothed frame-pair sequence")
         title.setStyleSheet(f"color:{_C_TEXT}; font-size:15px; font-weight:700;")
         root.addWidget(title)
 
         sub = QLabel(
-            "Each pair is one measurement interval. Displacement, velocity and "
-            "strain rate are computed per pair and then averaged.<br>"
-            "<b>Cumulative strain is excluded</b> — it carries the whole history "
-            "before the pair starts, so averaging it across pairs is meaningless."
+            "Each pair becomes one item on the Results timeline. A wider pair "
+            "averages motion over a longer interval, reducing frame-to-frame "
+            "noise. Green–Lagrange strain is recomputed from that pair's composed "
+            "displacement rather than copied from either endpoint."
         )
         sub.setWordWrap(True)
         sub.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
@@ -176,18 +178,44 @@ class FramePairDialog(QDialog):
         self._bulk_span.setStyleSheet(_SPIN)
         bg.addWidget(self._bulk_span, 0, 5)
 
-        seq_btn = QPushButton("Add sequential")
+        seq_btn = QPushButton("Add sliding")
         seq_btn.setStyleSheet(_BTN)
-        seq_btn.setToolTip("(1→2), (2→3), (3→4) …  — overlapping intervals")
+        seq_btn.setToolTip(
+            "Advance one frame at a time: (1→4), (2→5), (3→6) …")
         seq_btn.clicked.connect(lambda: self._add_bulk(overlap=True))
         bg.addWidget(seq_btn, 1, 0, 1, 3)
 
         blk_btn = QPushButton("Add non-overlapping")
         blk_btn.setStyleSheet(_BTN)
-        blk_btn.setToolTip("(1→2), (3→4), (5→6) …  — independent intervals")
+        blk_btn.setToolTip(
+            "Advance by the span without gaps: (1→4), (4→7), (7→10) …")
         blk_btn.clicked.connect(lambda: self._add_bulk(overlap=False))
         bg.addWidget(blk_btn, 1, 3, 1, 3)
         root.addWidget(bulk_grp)
+
+        # Temporal smoothing and spatial derivative smoothing are independent.
+        # Keeping this value local to the pair sequence lets a user recalculate
+        # pair strains with more/less spatial support without changing the
+        # strain window used by the original single-frame analysis.
+        strain_grp = QGroupBox("Spatial strain recalculation")
+        sg = QGridLayout(strain_grp)
+        sg.setSpacing(8)
+        sg.addWidget(QLabel("Pair strain half-window"), 0, 0)
+        self._strain_window = QSpinBox()
+        self._strain_window.setRange(0, 2000)
+        self._strain_window.setValue(self._initial_strain_window)
+        self._strain_window.setSuffix(" px")
+        self._strain_window.setStyleSheet(_SPIN)
+        self._strain_window.setToolTip(
+            "Spatial least-squares radius used only when recomputing strain for\n"
+            "this temporal pair sequence. It does not alter single-frame strain.")
+        self._strain_window.valueChanged.connect(self._sync_strain_note)
+        sg.addWidget(self._strain_window, 0, 1)
+        self._strain_note = QLabel("")
+        self._strain_note.setWordWrap(True)
+        self._strain_note.setStyleSheet(f"color:{_C_TEXT2}; font-size:10px;")
+        sg.addWidget(self._strain_note, 1, 0, 1, 2)
+        root.addWidget(strain_grp)
 
         # ── Current pairs ──────────────────────────────────────────────
         root.addWidget(QLabel("Selected pairs"))
@@ -218,7 +246,7 @@ class FramePairDialog(QDialog):
         cancel.setStyleSheet(_BTN)
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
-        self._ok_btn = QPushButton("Average")
+        self._ok_btn = QPushButton("Show sequence")
         self._ok_btn.setStyleSheet(_BTN_ACCENT)
         self._ok_btn.setDefault(True)
         self._ok_btn.clicked.connect(self._accept_if_valid)
@@ -226,6 +254,7 @@ class FramePairDialog(QDialog):
         root.addLayout(btn_row)
 
         self._sync_add_note()
+        self._sync_strain_note()
 
     # -- helpers --------------------------------------------------------
 
@@ -247,6 +276,17 @@ class FramePairDialog(QDialog):
             self._add_note.setText(
                 f"Δt = {self._interval_text(a, b)}  ·  spans {abs(b - a)} frame(s)")
 
+    def _sync_strain_note(self) -> None:
+        requested = self._strain_window.value()
+        minimum = self._grid_spacing
+        effective = max(requested, minimum)
+        points = 2 * (effective // self._grid_spacing) + 1
+        note = (f"Effective radius {effective} px · {points} nominal grid points "
+                "per axis. Temporal pairing and this spatial fit are both applied.")
+        if requested < minimum:
+            note += f" Values below {minimum} px are safely clamped."
+        self._strain_note.setText(note)
+
     def _add(self, a0: int, b0: int) -> bool:
         """Add one 0-based pair, normalised and de-duplicated."""
         if a0 == b0:
@@ -265,6 +305,7 @@ class FramePairDialog(QDialog):
         if not self._add(a, b):
             QMessageBox.information(self, "PyDIC", "That pair is already in the list.")
             return
+        self._sequence_mode = "custom"
         self._refresh_list()
 
     def _add_bulk(self, overlap: bool) -> None:
@@ -276,7 +317,13 @@ class FramePairDialog(QDialog):
                 self, "PyDIC", "The end frame must come after the start frame.")
             return
 
-        stride = span if overlap else span * 2
+        # Sliding windows move by one displayed frame. Disjoint windows share
+        # only their boundary frame, so their *time intervals* do not overlap:
+        # 1→4 covers intervals 1→2, 2→3, 3→4 and the next begins at frame 4.
+        # The previous span/span*2 rule produced 1→4, 4→7 for "sequential" and
+        # 1→4, 7→10 for "non-overlapping", which both skipped requested starts.
+        stride = 1 if overlap else span
+        was_empty = not self._pairs
         added = 0
         start = lo
         while start + span <= hi:
@@ -289,6 +336,8 @@ class FramePairDialog(QDialog):
                 self, "PyDIC",
                 "No new pairs — that range and span produced nothing not already listed.")
             return
+        self._sequence_mode = (
+            "sliding" if overlap else "non_overlapping") if was_empty else "custom"
         self._refresh_list()
 
     def _remove_selected(self) -> None:
@@ -296,10 +345,12 @@ class FramePairDialog(QDialog):
         for r in rows:
             if 0 <= r < len(self._pairs):
                 del self._pairs[r]
+        self._sequence_mode = "custom"
         self._refresh_list()
 
     def _clear(self) -> None:
         self._pairs.clear()
+        self._sequence_mode = "custom"
         self._refresh_list()
 
     def _refresh_list(self) -> None:
@@ -315,11 +366,8 @@ class FramePairDialog(QDialog):
         if n == 0:
             self._count_lbl.setText("No pairs selected")
         else:
-            # sqrt(K) is the noise reduction from averaging K independent
-            # intervals; worth stating because it is the reason to add more.
             self._count_lbl.setText(
-                f"{n} pair{'s' if n != 1 else ''}"
-                + (f"  ·  ~{n ** 0.5:.1f}× less noise than one pair" if n > 1 else ""))
+                f"{n} timeline pair{'s' if n != 1 else ''}")
         self._ok_btn.setEnabled(n > 0)
 
     def _accept_if_valid(self) -> None:
@@ -333,3 +381,11 @@ class FramePairDialog(QDialog):
     def pairs(self) -> List[Tuple[int, int]]:
         """Selected pairs as 0-based (a, b) frame indices."""
         return list(self._pairs)
+
+    def strain_window(self) -> int:
+        """Requested spatial half-window for pair-only strain recalculation."""
+        return int(self._strain_window.value())
+
+    def sequence_mode(self) -> str:
+        """How the current list was generated: bulk temporal or hand-picked."""
+        return self._sequence_mode
