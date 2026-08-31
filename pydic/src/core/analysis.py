@@ -1212,6 +1212,77 @@ class DICAnalysis:
         w = 1.0 / d2k
         return float((vk * w).sum() / w.sum())
 
+    # Displacement fields are measured on the IMMEDIATELY PRECEDING frame
+    # (``run_rg_dic(prev_image, cur, ...)``), so ``results[i].u[y, x]`` is the
+    # motion of whatever material occupies pixel (x, y) *in frame i* -- an
+    # updated-Lagrangian field living on a configuration that moves every frame.
+    # Following a material point therefore means re-sampling at its CURRENT
+    # position each step. Sampling at the fixed seed instead reads the velocity
+    # of whatever later flows through the seed, which in orthogonal cutting is
+    # the steady incoming feed: markers then run straight through the shear zone
+    # instead of turning up the chip. StrainPathTracker.advance already advects
+    # this way; these helpers keep the marker tracer consistent with it.
+
+    def _advect_step(self, res, x: float, y: float
+                     ) -> Optional[tuple[float, float]]:
+        """
+        Move one material point through a single measured interval.
+
+        Returns the new (x, y), or None if the point could not be tracked.
+        """
+        spacing = max(1, int(getattr(self.params, "subset_spacing", 3)))
+        base = max(4, spacing * 3)
+        # A point crossing the shear zone can pass through a thin gap in the
+        # correlated grid -- a band of dropouts along the shear plane, or the
+        # ragged chip boundary. Giving up at the first miss truncates exactly
+        # the trajectories the user cares about, so widen the search before
+        # declaring the point lost. The cap keeps this local: beyond a few
+        # subset spacings there is no longer any measurement to attribute.
+        for search in (base, base * 2, base * 4):
+            u = self._sample_sparse(res.u, x, y, search=search)
+            v = self._sample_sparse(res.v, x, y, search=search)
+            if np.isfinite(u) and np.isfinite(v):
+                nx, ny = float(x + u), float(y + v)
+                if not (np.isfinite(nx) and np.isfinite(ny)):
+                    return None
+                if self._ref_shape is not None:
+                    H, W = self._ref_shape
+                    if not (0.0 <= nx <= W - 1.0 and 0.0 <= ny <= H - 1.0):
+                        return None
+                return nx, ny
+        return None
+
+    @property
+    def _ref_shape(self) -> Optional[tuple[int, int]]:
+        """Image shape used to keep advected points on-screen, if known."""
+        img = getattr(self, "_ref_image", None)
+        if img is not None:
+            return img.shape[0], img.shape[1]
+        if self.results:
+            arr = getattr(self.results[0], "valid", None)
+            shape = getattr(arr, "shape", None)
+            if shape is not None and len(shape) == 2:
+                return int(shape[0]), int(shape[1])
+        return None
+
+    def _advect_path(self, sx: float, sy: float, last: int
+                     ) -> tuple[list[tuple[float, float]], Optional[int]]:
+        """
+        Trace one material point from its reference seed through frame ``last``.
+
+        Returns (points, lost_at). ``points`` always starts at the seed, so it
+        has one more entry than the number of intervals successfully traversed.
+        """
+        pts: list[tuple[float, float]] = [(float(sx), float(sy))]
+        x, y = float(sx), float(sy)
+        for i in range(0, last + 1):
+            nxt = self._advect_step(self.results[i], x, y)
+            if nxt is None:
+                return pts, i
+            x, y = nxt
+            pts.append((x, y))
+        return pts, None
+
     def reference_from_current(self, x: float, y: float, frame_idx: int
                               ) -> Optional[tuple[tuple[float, float], float]]:
         """
@@ -1227,24 +1298,102 @@ class DICAnalysis:
         if not self.results:
             return None
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
-        u_total = np.zeros_like(self.results[0].u, dtype=float)
-        v_total = np.zeros_like(self.results[0].v, dtype=float)
-        v = np.ones_like(self.results[0].u, dtype=bool)
-        for res in self.results[:idx + 1]:
-            here = np.isfinite(res.u) & np.isfinite(res.v)
-            if res.valid is not None:
-                here &= res.valid
-            v &= here
-            u_total[here] += res.u[here]
-            v_total[here] += res.v[here]
-        if not v.any():
-            return None
-        ys, xs = np.nonzero(v)
-        cx = xs + u_total[ys, xs]
-        cy = ys + v_total[ys, xs]
-        d2 = (cx - x) ** 2 + (cy - y) ** 2
-        i = int(np.argmin(d2))
-        return (float(xs[i]), float(ys[i])), float(np.sqrt(d2[i]))
+
+        # Inverting the forward map by shooting: guess a reference seed, advect
+        # it with the same code the trajectories use, and correct the guess by
+        # the miss vector. The forward map is close to a translation locally, so
+        # this converges in a handful of iterations -- and, unlike summing the
+        # per-frame fields at a fixed grid index, it never adds displacements
+        # that were measured on different configurations.
+        best = self._shoot_to(x, y, idx, float(x), float(y))
+        if best is not None and best[1] < 1.0:
+            return best
+
+        # Miss-vector correction assumes the forward map is locally a
+        # translation. That holds for feed-dominated cutting flow but degrades
+        # under large rotation, and it needs a starting guess that tracks at
+        # all. Fall back to a search over the measured grid of the FIRST frame
+        # -- the only frame whose coordinates are reference coordinates -- and
+        # refine the winner by shooting again.
+        first = self.results[0]
+        valid = getattr(first, "valid", None)
+        here = np.isfinite(np.asarray(first.u)) & np.isfinite(np.asarray(first.v))
+        if valid is not None:
+            here &= np.asarray(valid, dtype=bool)
+        if here.any():
+            ys, xs = np.nonzero(here)
+            # Coarse candidate net over the whole measured domain: the material
+            # now under the cursor may have travelled a long way from its origin,
+            # so candidates near the click are not necessarily the right ones.
+            step = max(1, len(xs) // 256)
+            for j in range(0, len(xs), step):
+                sx, sy = float(xs[j]), float(ys[j])
+                pts, lost_at = self._advect_path(sx, sy, idx)
+                if lost_at is not None:
+                    continue
+                lx, ly = pts[-1]
+                cand = ((sx, sy), float(np.hypot(lx - x, ly - y)))
+                if best is None or cand[1] < best[1]:
+                    best = cand
+            if best is not None:
+                refined = self._shoot_to(x, y, idx, best[0][0], best[0][1])
+                if refined is not None and refined[1] < best[1]:
+                    best = refined
+                # Shooting can stall when the map rotates strongly, because the
+                # miss vector then points the wrong way. A contracting pattern
+                # search makes no assumption about the map's orientation, so it
+                # finishes what the miss-vector step cannot.
+                best = self._pattern_search(x, y, idx, best)
+        return best
+
+    def _pattern_search(self, x: float, y: float, idx: int,
+                        best: tuple[tuple[float, float], float]
+                        ) -> tuple[tuple[float, float], float]:
+        """Contracting local search for the seed whose path ends nearest (x, y)."""
+        (bx, by), berr = best
+        step = float(max(4, int(getattr(self.params, "subset_spacing", 3)) * 2))
+        while step > 0.25 and berr > 1e-3:
+            improved = False
+            for dx, dy in ((step, 0.0), (-step, 0.0), (0.0, step), (0.0, -step),
+                           (step, step), (step, -step), (-step, step), (-step, -step)):
+                cx, cy = bx + dx, by + dy
+                if self._ref_shape is not None:
+                    H, W = self._ref_shape
+                    if not (0.0 <= cx <= W - 1.0 and 0.0 <= cy <= H - 1.0):
+                        continue
+                pts, lost_at = self._advect_path(cx, cy, idx)
+                if lost_at is not None:
+                    continue
+                lx, ly = pts[-1]
+                err = float(np.hypot(lx - x, ly - y))
+                if err < berr:
+                    bx, by, berr, improved = cx, cy, err, True
+            if not improved:
+                step *= 0.5
+        return (bx, by), berr
+
+    def _shoot_to(self, x: float, y: float, idx: int, gx: float, gy: float
+                  ) -> Optional[tuple[tuple[float, float], float]]:
+        """Refine a reference-seed guess so that it advects onto (x, y)."""
+        best: Optional[tuple[tuple[float, float], float]] = None
+        for _ in range(12):
+            pts, lost_at = self._advect_path(gx, gy, idx)
+            if lost_at is not None:
+                break
+            lx, ly = pts[-1]
+            dx, dy = x - lx, y - ly
+            residual = float(np.hypot(dx, dy))
+            if best is None or residual < best[1]:
+                best = ((gx, gy), residual)
+            if residual < 1e-3:
+                break
+            gx += dx
+            gy += dy
+            if self._ref_shape is not None:
+                H, W = self._ref_shape
+                gx = min(max(gx, 0.0), W - 1.0)
+                gy = min(max(gy, 0.0), H - 1.0)
+        return best
 
     def marker_positions(self, seeds, frame_idx: int) -> list[Optional[tuple[float, float]]]:
         """Where each reference-frame marker sits on the displayed frame."""
@@ -1253,17 +1402,8 @@ class DICAnalysis:
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
         out = []
         for (sx, sy) in seeds:
-            u_total = v_total = 0.0
-            valid = True
-            for res in self.results[:idx + 1]:
-                u = self._sample_sparse(res.u, sx, sy)
-                v = self._sample_sparse(res.v, sx, sy)
-                if not (np.isfinite(u) and np.isfinite(v)):
-                    valid = False
-                    break
-                u_total += u
-                v_total += v
-            out.append((float(sx + u_total), float(sy + v_total)) if valid else None)
+            pts, lost_at = self._advect_path(sx, sy, idx)
+            out.append(pts[-1] if lost_at is None else None)
         return out
 
     def get_trajectories_from_seeds(self, seeds, max_frame: int, trail: int = 0
@@ -1285,18 +1425,7 @@ class DICAnalysis:
         last = min(int(max_frame), len(self.results) - 1)
         out: list[dict] = []
         for (sx, sy) in seeds:
-            pts: list[tuple[float, float]] = [(float(sx), float(sy))]
-            lost_at = None
-            u_total = v_total = 0.0
-            for i in range(0, last + 1):
-                u = self._sample_sparse(self.results[i].u, sx, sy)
-                v = self._sample_sparse(self.results[i].v, sx, sy)
-                if not (np.isfinite(u) and np.isfinite(v)):
-                    lost_at = i
-                    break
-                u_total += u
-                v_total += v
-                pts.append((float(sx + u_total), float(sy + v_total)))
+            pts, lost_at = self._advect_path(sx, sy, last)
             if trail and trail > 0 and len(pts) > trail + 1:
                 pts = pts[-(trail + 1):]
             out.append({"points": pts, "lost_at": lost_at,
