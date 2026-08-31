@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy,
     QFileDialog, QMessageBox, QSpinBox, QToolButton, QProgressDialog, QProgressBar,
     QListWidget, QListWidgetItem, QGroupBox, QGridLayout, QDoubleSpinBox,
-    QRadioButton, QButtonGroup,
+    QRadioButton, QButtonGroup, QScrollArea, QMenu,
 )
 
 from src.core.stats import field_summary
@@ -501,7 +501,10 @@ class ResultsPage(QWidget):
         ):
             rb.setToolTip(tip)
             self._scale_group.addButton(rb)
-        self._scale_auto_rb.setChecked(True)
+        # Fixed by default. Rescaling per frame makes a colour mean something
+        # different on every frame, so a feature appears to pulse when only the
+        # scale moved. Auto stays available for inspecting one frame closely.
+        self._scale_global_rb.setChecked(True)
         self._scale_group.buttonToggled.connect(self._on_scale_mode_changed)
         self._build_ui()
 
@@ -717,7 +720,10 @@ class ResultsPage(QWidget):
         disp_lay.addWidget(self._coverage_combo)
 
         self._clip_chk = QCheckBox("Flag clipped")
-        self._clip_chk.setChecked(True)
+        # Off by default. With marks on, every value past the trimmed limits is
+        # painted magenta, so a normal hot spot flashes as if it were an error.
+        # The colourbar reports the fraction outside the range either way.
+        self._clip_chk.setChecked(False)
         self._clip_chk.setToolTip(
             "Draw values above the range in magenta and below it in cyan,\n"
             "so clipping is visible instead of blending into the end\n"
@@ -745,15 +751,37 @@ class ResultsPage(QWidget):
                                    QSizePolicy.Policy.Expanding)
         body_lay.addWidget(self._canvas, 1)
 
-        # Right sidebar
-        sidebar = QWidget()
-        sidebar.setFixedWidth(220)
+        # Right sidebar.
+        #
+        # The panel holds more than fits on a short screen -- markers and the
+        # frame-pair controls both appear conditionally -- and a plain layout
+        # answers that by squeezing widgets until they are unreadable and
+        # clipping whatever is left. Scrolling instead keeps every control at
+        # its natural size and reachable.
+        sidebar = QScrollArea()
+        sidebar.setWidgetResizable(True)
+        sidebar.setFixedWidth(232)
+        sidebar.setFrameShape(QFrame.Shape.NoFrame)
+        sidebar.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         sidebar.setStyleSheet(
-            f"background:{_C_SURFACE}; border-left:1px solid {_C_BORDER};"
-        )
-        sb_lay = QVBoxLayout(sidebar)
-        sb_lay.setContentsMargins(16, 20, 16, 20)
-        sb_lay.setSpacing(14)
+            f"QScrollArea{{background:{_C_SURFACE};"
+            f" border-left:1px solid {_C_BORDER};}}"
+            f"QScrollBar:vertical{{background:{_C_SURFACE}; width:9px; margin:0;}}"
+            f"QScrollBar::handle:vertical{{background:{_C_BORDER};"
+            f" border-radius:4px; min-height:28px;}}"
+            f"QScrollBar::handle:vertical:hover{{background:{_C_TEXT3};}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
+            f"QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{{background:none;}}")
+
+        sidebar_body = QWidget()
+        sidebar_body.setStyleSheet(f"background:{_C_SURFACE};")
+        sidebar.setWidget(sidebar_body)
+        sb_lay = QVBoxLayout(sidebar_body)
+        sb_lay.setContentsMargins(16, 18, 12, 18)
+        sb_lay.setSpacing(12)
 
         # Stats
         stats_head_row = QHBoxLayout()
@@ -842,13 +870,6 @@ class ResultsPage(QWidget):
 
         sb_lay.addWidget(self._sep())
 
-        # Export
-        exp_hdr = QLabel("EXPORT")
-        exp_hdr.setStyleSheet(
-            f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;"
-        )
-        sb_lay.addWidget(exp_hdr)
-
         # ── Marker panel (visible only while Streaklines is on) ──
         self._marker_panel = QWidget()
         mp_lay = QVBoxLayout(self._marker_panel)
@@ -887,17 +908,16 @@ class ResultsPage(QWidget):
             lambda: self._canvas.remove_marker(self._canvas.selected_marker))
         mp_lay.addWidget(self._del_marker_btn)
 
-        self._marker_csv_btn = QPushButton("Export temporal data (CSV)…")
-        self._marker_csv_btn.setFixedHeight(26)
-        self._marker_csv_btn.setToolTip(
-            "Write each marker's full history to one spreadsheet.\n"
-            "One row per frame per marker, with position and every\n"
-            "field sampled at that point.")
-        self._marker_csv_btn.setStyleSheet(
-            f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
-            f" border-radius:3px; font-size:10px;")
-        self._marker_csv_btn.clicked.connect(self._export_marker_timeseries)
-        mp_lay.addWidget(self._marker_csv_btn)
+        self._marker_plot_btn = QPushButton("Plot against time…")
+        self._marker_plot_btn.setFixedHeight(26)
+        self._marker_plot_btn.setToolTip(
+            "Plot any field at these markers over the sequence.\n"
+            "Curves are named per marker and can be saved as an image or CSV.")
+        self._marker_plot_btn.setStyleSheet(
+            f"background:{_C_CARD}; color:{_C_ACCENT}; border:1px solid {_C_ACCENT};"
+            f" border-radius:3px; font-size:10px; font-weight:600;")
+        self._marker_plot_btn.clicked.connect(self._plot_marker_timeseries)
+        mp_lay.addWidget(self._marker_plot_btn)
 
         self._marker_panel.setVisible(False)
         sb_lay.addWidget(self._marker_panel)
@@ -948,13 +968,40 @@ class ResultsPage(QWidget):
 
         sb_lay.addWidget(self._sep())
 
-        for label, slot in [("CSV (this frame)", self._export_csv),
-                             ("HDF5 (all frames)", self._export_hdf5),
-                             ("Video / image sequence…", self._export_video)]:
-            btn = QPushButton(label)
-            btn.setFixedHeight(30)
-            btn.clicked.connect(slot)
-            sb_lay.addWidget(btn)
+        # One button, one menu. Four stacked export buttons pushed the panel
+        # past the window on a short screen, and they are used occasionally
+        # rather than continuously, so they do not need to be permanently on
+        # display.
+        exp2_hdr = QLabel("EXPORT")
+        exp2_hdr.setStyleSheet(
+            f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;")
+        sb_lay.addWidget(exp2_hdr)
+
+        self._export_menu = QMenu(self)
+        self._act_export_csv = self._export_menu.addAction(
+            "This frame, as CSV…", self._export_csv)
+        self._act_export_hdf5 = self._export_menu.addAction(
+            "All frames, as HDF5…", self._export_hdf5)
+        self._act_export_video = self._export_menu.addAction(
+            "Video or image sequence…", self._export_video)
+        self._export_menu.addSeparator()
+        self._act_export_marker_csv = self._export_menu.addAction(
+            "Marker time series, as CSV…", self._export_marker_timeseries)
+        self._act_plot_markers = self._export_menu.addAction(
+            "Plot markers against time…", self._plot_marker_timeseries)
+
+        self._export_btn = QToolButton()
+        self._export_btn.setText("Export…")
+        self._export_btn.setFixedHeight(30)
+        self._export_btn.setMenu(self._export_menu)
+        self._export_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._export_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._export_btn.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                       QSizePolicy.Policy.Fixed)
+        self._export_btn.setToolTip("Save results, or plot marker histories.")
+        sb_lay.addWidget(self._export_btn)
 
         self._export_progress = QProgressBar()
         self._export_progress.setFixedHeight(24)
@@ -1499,12 +1546,19 @@ class ResultsPage(QWidget):
             factor, _ = self._unit_factor(result=self._pair_avg)
             key = (self._pair_generation, self._field,
                    float(spec.percentile), float(factor))
+            seed_spec = RangeSpec(
+                mode="auto", symmetric=False, percentile=spec.percentile)
             global_rng = self._pair_fixed_ranges.get(key)
             if global_rng is None:
-                seed_spec = RangeSpec(
-                    mode="auto", symmetric=False,
-                    percentile=spec.percentile)
-                global_rng = seed_spec.resolve(arr)
+                # Establish the range once and keep it: a scale that moves
+                # between pairs makes a feature pulse when only the mapping
+                # changed. Seed it from pairs sampled across the whole
+                # sequence, because the first pair alone routinely
+                # under-covers -- the shear zone intensifies later, and every
+                # subsequent pair then sits past the top of the scale.
+                global_rng = self._pair_sequence_range(seed_spec, factor)
+                if global_rng is None:
+                    global_rng = seed_spec.resolve(arr)
                 if global_rng is not None:
                     self._pair_fixed_ranges[key] = global_rng
 
@@ -1589,6 +1643,49 @@ class ResultsPage(QWidget):
         if arr is None or factor == 1.0:
             return arr, unit
         return arr * factor, unit
+
+    #: Pairs sampled when establishing the fixed colour range. Enough to cover
+    #: how the field evolves, few enough that entering pair mode stays instant.
+    _PAIR_RANGE_SAMPLES = 12
+
+    def _pair_sequence_range(self, seed_spec, factor: float):
+        """
+        Colour limits covering the pair sequence, from already-computed pairs.
+
+        Only pairs present on disk are read, so this never triggers
+        computation and never blocks: if nothing has been precomputed the
+        caller falls back to the pair on screen.
+        """
+        store = self._pair_store
+        if store is None:
+            return None
+        try:
+            total = len(store)
+        except Exception:
+            return None
+        if total <= 0:
+            return None
+
+        step = max(1, total // self._PAIR_RANGE_SAMPLES)
+        lo = hi = None
+        for index in range(0, total, step):
+            try:
+                if not store.has(index):
+                    continue
+                res = store[index]
+            except Exception:
+                continue
+            arr = getattr(res, self._field, None)
+            if arr is None:
+                continue
+            rng = seed_spec.resolve(np.asarray(arr) * factor)
+            if rng is None:
+                continue
+            lo = rng[0] if lo is None else min(lo, rng[0])
+            hi = rng[1] if hi is None else max(hi, rng[1])
+        if lo is None or hi is None or not (np.isfinite(lo) and np.isfinite(hi)):
+            return None
+        return (float(lo), float(hi))
 
     def _update_colorbar(self, cmap, vmin, vmax,
                          below: int = 0, above: int = 0, total: int = 0):
@@ -2398,6 +2495,39 @@ class ResultsPage(QWidget):
                 "then plot any field against time_s.")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
+
+    def _plot_marker_timeseries(self) -> None:
+        """Open the temporal plot for the markers currently placed."""
+        analysis = self._wizard.analysis
+        pts = self._canvas.markers
+        if not pts:
+            QMessageBox.information(
+                self, "No markers",
+                "Enable Place markers, then click the points you want to plot.")
+            return
+        if not analysis.results:
+            QMessageBox.information(self, "Nothing to plot", "Run an analysis first.")
+            return
+        try:
+            from src.ui.pages.marker_plot_dialog import MarkerPlotDialog
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Plotting unavailable",
+                f"matplotlib is required to plot marker histories.\n\n{exc}")
+            return
+        labels = [f"M{i + 1}" for i in range(len(pts))]
+        # Open on the field being viewed when that field is plottable, so the
+        # plot answers the question the user already had on screen.
+        from src.ui.pages.marker_plot_dialog import PLOTTABLE
+        field = (self._field if any(self._field == n for n, _, _ in PLOTTABLE)
+                 else "Eeff_rate")
+        try:
+            dlg = MarkerPlotDialog(analysis, pts, labels=labels,
+                                   parent=self, field=field)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not build the plot", str(exc))
+            return
+        dlg.exec()
 
     def _export_video(self) -> None:
         analysis = self._wizard.analysis
