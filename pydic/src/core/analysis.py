@@ -258,6 +258,80 @@ class _CroppedTemporalField:
     values: np.ndarray
 
 
+def _is_lazy_dataset(arr) -> bool:
+    """True for an on-disk HDF5 dataset kept unread by a lazy session."""
+    return (arr is not None and not isinstance(arr, (np.ndarray, CompactField))
+            and hasattr(arr, "shape") and hasattr(arr, "dtype")
+            and hasattr(arr, "__getitem__") and not hasattr(arr, "indices"))
+
+
+class _LazyView:
+    """
+    A field derived from on-disk data, evaluated only over what is read.
+
+    Velocity is not stored in a session file because it is a deterministic view
+    of displacement and the frame interval. Recomputing it eagerly on load would
+    materialise the whole sequence and defeat lazy loading, so these views apply
+    the arithmetic to each slice as it is requested. They expose enough of the
+    ndarray surface (shape, dtype, slicing, np.asarray) for the display, stats
+    and export paths that consume result fields.
+    """
+
+    __slots__ = ()
+    shape: tuple
+    dtype = np.dtype(np.float32)
+
+    def _evaluate(self, key):
+        raise NotImplementedError
+
+    def __getitem__(self, key):
+        return self._evaluate(key)
+
+    def __array__(self, dtype=None, copy=None):
+        out = self._evaluate(Ellipsis)
+        return out if dtype is None else out.astype(dtype, copy=False)
+
+    @property
+    def size(self) -> int:
+        return int(np.prod(self.shape))
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+
+class _ScaledView(_LazyView):
+    """One on-disk field multiplied by a constant."""
+
+    __slots__ = ("_base", "_factor", "shape")
+
+    def __init__(self, base, factor: float):
+        self._base = base
+        self._factor = np.float32(factor)
+        self.shape = tuple(base.shape)
+
+    def _evaluate(self, key):
+        block = np.asarray(self._base[key], dtype=np.float32)
+        return block * self._factor
+
+
+class _HypotView(_LazyView):
+    """Magnitude of two on-disk components, scaled by a constant."""
+
+    __slots__ = ("_x", "_y", "_factor", "shape")
+
+    def __init__(self, x, y, factor: float):
+        self._x, self._y = x, y
+        self._factor = np.float32(factor)
+        self.shape = tuple(x.shape)
+
+    def _evaluate(self, key):
+        bx = np.asarray(self._x[key], dtype=np.float32)
+        by = np.asarray(self._y[key], dtype=np.float32)
+        with np.errstate(invalid="ignore"):
+            return np.hypot(bx, by).astype(np.float32, copy=False) * self._factor
+
+
 class DICAnalysis:
     def __init__(self) -> None:
         self.ref_path:  Optional[str]      = None
@@ -1054,14 +1128,31 @@ class DICAnalysis:
             with np.errstate(invalid="ignore"):
                 res.mag_inc = _result_f32(np.sqrt(res.u ** 2 + res.v ** 2))
 
-    def _compute_velocities_and_rates(self, progress_cb: Optional[Callable[[float, str], None]] = None) -> None:
-        N = len(self.results)
-        if N < 1: return
-        dt = 1.0 / max(self.fps, 1e-9)
+    def _compute_velocities(self) -> None:
+        """
+        Derive Vx/Vy/Veff from displacement and the frame interval.
 
+        Split out from _compute_velocities_and_rates so a loaded session can
+        rebuild velocity without touching the strain rates it restored from
+        file. Velocity is not saved to HDF5 -- it is a deterministic view of
+        u/v and dt -- so it has to be recomputed whenever results arrive from
+        anywhere other than a fresh run.
+        """
+        if not self.results:
+            return
+        dt = 1.0 / max(self.fps, 1e-9)
         # Each result is one measured interval, so its instantaneous mean
         # velocity is displacement divided by that interval's duration.
         for res in self.results:
+            # A lazily loaded session keeps displacement on disk precisely to
+            # avoid holding the whole sequence in memory. Materialising it here
+            # to divide by dt would undo that, so velocity stays a view that
+            # scales whatever slice is actually read.
+            if isinstance(res.u, _LazyView) or _is_lazy_dataset(res.u):
+                res.Vx = _ScaledView(res.u, 1.0 / dt)
+                res.Vy = _ScaledView(res.v, 1.0 / dt)
+                res.Veff = _HypotView(res.u, res.v, 1.0 / dt)
+                continue
             if isinstance(res.u, CompactField) and isinstance(res.v, CompactField):
                 common = np.intersect1d(
                     res.u.indices, res.v.indices, assume_unique=True)
@@ -1082,6 +1173,13 @@ class DICAnalysis:
             res.Vy = _result_f32(np.where(valid, res.v / dt, np.nan))
             with np.errstate(invalid="ignore"):
                 res.Veff = _result_f32(np.sqrt(res.Vx ** 2 + res.Vy ** 2))
+
+    def _compute_velocities_and_rates(self, progress_cb: Optional[Callable[[float, str], None]] = None) -> None:
+        N = len(self.results)
+        if N < 1:
+            return
+        dt = 1.0 / max(self.fps, 1e-9)
+        self._compute_velocities()
 
         from .strain import von_mises_equivalent
 
@@ -2663,6 +2761,27 @@ class DICAnalysis:
             self._compute_velocities_and_rates()
         elif self.results and any(r.u_inc is None for r in self.results):
             self._compute_incremental_displacements()
+
+        # Velocity is deliberately not written to file -- it is a deterministic
+        # view of u/v and dt (see export_hdf5) -- so it must be rebuilt here.
+        # Without this, every field the Velocity family draws is None after
+        # loading a session and the canvas is blank, while displacement, which
+        # is stored, renders normally. Only pre-schema-3 files recomputed it.
+        if self.results and any(getattr(r, "Vx", None) is None for r in self.results):
+            report(0.97, "Deriving velocity fields…")
+            self._compute_velocities()
+
+        # Strain rates are stored, but a file written by a build that did not
+        # save them (or a partial/interrupted save) leaves those screens blank
+        # too. They are recoverable whenever the displacement gradients came
+        # back with the file. Only fill genuine gaps: a rate already read from
+        # disk is the measurement of record and is never recomputed over.
+        if self.results and all(
+                getattr(r, "Eeff_rate", None) is None for r in self.results):
+            if all(getattr(r, name, None) is not None for r in self.results
+                   for name in ("du_dx", "du_dy", "dv_dx", "dv_dy")):
+                report(0.98, "Deriving strain-rate fields…")
+                self._compute_velocities_and_rates()
         report(1.0, f"Loaded {len(self.results)} frames.")
 
     def _get_settings_path(self) -> str:
