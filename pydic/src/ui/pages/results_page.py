@@ -1169,7 +1169,7 @@ class ResultsPage(QWidget):
         self._marker_list.blockSignals(True)
         self._marker_list.clear()
         analysis = self._wizard.analysis
-        pts = self._canvas.markers
+        pts = self._canvas.markers()
         trail = self._trail_combo.currentData() or 0
         trajs = analysis.get_trajectories_from_seeds(pts, self._frame, trail) if pts else []
         for i, (x, y) in enumerate(pts):
@@ -1195,7 +1195,7 @@ class ResultsPage(QWidget):
             self._canvas.set_streaklines(None)
             self._canvas.set_markers([])
             return
-        pts = self._canvas.markers
+        pts = self._canvas.markers()
         if not pts:
             self._canvas.set_marker_draw_positions([])
             self._canvas.set_streaklines(None)
@@ -2425,7 +2425,7 @@ class ResultsPage(QWidget):
         self._export_progress.show()
         self._export_progress.setValue(0)
         self._export_progress.setFormat("Rendering… %p%")
-        markers = self._canvas.markers
+        markers = self._canvas.markers()
         trail = self._trail_combo.currentData() or 0
         spec.trail = trail
 
