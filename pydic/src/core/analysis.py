@@ -5,6 +5,7 @@ Fixed: Survival rate denominator uses valid ROI subset count to prevent false Au
 """
 from __future__ import annotations
 import importlib.util
+import csv
 import os, time
 import threading
 from collections import OrderedDict
@@ -1910,6 +1911,100 @@ class DICAnalysis:
             return (0.0, 1.0)
         limits = robust_limits(np.concatenate(pooled), cov)
         return limits if limits is not None else (0.0, 1.0)
+
+    #: Fields written by :meth:`export_marker_timeseries`, in column order.
+    MARKER_TIMESERIES_FIELDS = (
+        "u", "v", "u_inc", "v_inc", "mag_inc",
+        "Exx_inf", "Eyy_inf", "Exy_inf", "Gxy_inf", "Eeff_inf",
+        "Exx_gl", "Eyy_gl", "Exy_gl", "Gxy_gl", "Eeff_gl",
+        "Vx", "Vy", "Veff",
+        "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
+        "Exx_rate", "Exy_rate", "Gxy_rate", "Eyy_rate", "Eeff_rate", "corr")
+
+    def export_marker_timeseries(self, seeds, path: str,
+                                 labels=None, max_frame: Optional[int] = None) -> int:
+        """
+        Write the per-frame history of each trajectory marker as one tidy CSV.
+
+        This is the temporal counterpart to :meth:`export_csv`: instead of every
+        subset at one instant, it is one point followed through time, which is
+        what you plot to get a strain-rate-versus-time curve for a location.
+
+        Each row is one (frame, marker) pair, with the marker's tracked position
+        on that frame followed by every field sampled at it. Fields are sampled
+        at the marker's REFERENCE-frame seed, because that is the grid the fields
+        are indexed on -- the same convention :meth:`marker_positions` uses to
+        follow a material point. Values pass through the same calibration as the
+        per-frame CSV, and units are stated in the header row.
+
+        A marker that leaves the correlated region has blank field columns from
+        the frame it was lost onward, so a gap in a plot is visibly a dropout
+        rather than a zero.
+
+        Returns the number of data rows written.
+        """
+        if not self.results or not seeds:
+            raise ValueError("Nothing to export: place at least one marker first.")
+        seeds = [(float(sx), float(sy)) for (sx, sy) in seeds]
+        last = len(self.results) - 1 if max_frame is None else min(int(max_frame), len(self.results) - 1)
+        last = max(0, last)
+        fps = float(getattr(self, "fps", 0.0) or 0.0)
+
+        # Only export fields this run actually has, so the sheet has no dead
+        # columns; probe every frame because e.g. rates are absent on frame 0.
+        names = [n for n in self.MARKER_TIMESERIES_FIELDS
+                 if any(getattr(self.results[i], n, None) is not None
+                        for i in range(last + 1))]
+        units = {}
+        for n in names:
+            arr = next((getattr(self.results[i], n) for i in range(last + 1)
+                        if getattr(self.results[i], n, None) is not None), None)
+            _, units[n] = self.calibration.convert(n, np.zeros(1), _FIELD_BASE_UNIT.get(n, ""))
+
+        pos_unit = self.calibration.describe() if self.calibration.calibrated else "px"
+        header = ["frame", "time_s", "marker", "marker_label",
+                  f"x [{pos_unit}]", f"y [{pos_unit}]", "x_px", "y_px", "tracked"]
+        header += [f"{n} [{units[n]}]" if units[n] else n for n in names]
+
+        rows = 0
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(header)
+            for m, (sx, sy) in enumerate(seeds):
+                label = (labels[m] if labels and m < len(labels) else f"M{m + 1}")
+                u_total = v_total = 0.0
+                tracked = True
+                for i in range(last + 1):
+                    res = self.results[i]
+                    if tracked:
+                        du = self._sample_sparse(res.u, sx, sy)
+                        dv = self._sample_sparse(res.v, sx, sy)
+                        if np.isfinite(du) and np.isfinite(dv):
+                            u_total += du
+                            v_total += dv
+                        else:
+                            tracked = False
+                    x_px, y_px = sx + u_total, sy + v_total
+                    xc, _ = self.calibration.convert("u", np.array([x_px]), "px")
+                    yc, _ = self.calibration.convert("u", np.array([y_px]), "px")
+                    row = [i, (i / fps if fps > 0 else ""), m, label,
+                           f"{float(xc[0]):.6g}", f"{float(yc[0]):.6g}",
+                           f"{x_px:.4f}", f"{y_px:.4f}", int(tracked)]
+                    for n in names:
+                        arr = getattr(res, n, None)
+                        if arr is None or not tracked:
+                            row.append("")
+                            continue
+                        val = self._sample_sparse(arr, sx, sy)
+                        if not np.isfinite(val):
+                            row.append("")
+                            continue
+                        conv, _ = self.calibration.convert(
+                            n, np.array([val]), _FIELD_BASE_UNIT.get(n, ""))
+                        row.append(f"{float(conv[0]):.6g}")
+                    w.writerow(row)
+                    rows += 1
+        return rows
 
     def export_csv(self, result_index, directory: str) -> None:
         """Write the selected frame's fields as CSV.

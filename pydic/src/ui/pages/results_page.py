@@ -887,6 +887,18 @@ class ResultsPage(QWidget):
             lambda: self._canvas.remove_marker(self._canvas.selected_marker))
         mp_lay.addWidget(self._del_marker_btn)
 
+        self._marker_csv_btn = QPushButton("Export temporal data (CSV)…")
+        self._marker_csv_btn.setFixedHeight(26)
+        self._marker_csv_btn.setToolTip(
+            "Write every frame of every marker to one spreadsheet: position plus\n"
+            "displacement, velocity, strain and strain rate sampled at that point.\n"
+            "Opens in Excel; one row per (frame, marker), ready to plot.")
+        self._marker_csv_btn.setStyleSheet(
+            f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
+            f" border-radius:3px; font-size:10px;")
+        self._marker_csv_btn.clicked.connect(self._export_marker_timeseries)
+        mp_lay.addWidget(self._marker_csv_btn)
+
         self._marker_panel.setVisible(False)
         sb_lay.addWidget(self._marker_panel)
 
@@ -1169,7 +1181,7 @@ class ResultsPage(QWidget):
         self._marker_list.blockSignals(True)
         self._marker_list.clear()
         analysis = self._wizard.analysis
-        pts = self._canvas.markers()
+        pts = self._canvas.markers
         trail = self._trail_combo.currentData() or 0
         trajs = analysis.get_trajectories_from_seeds(pts, self._frame, trail) if pts else []
         for i, (x, y) in enumerate(pts):
@@ -1195,7 +1207,7 @@ class ResultsPage(QWidget):
             self._canvas.set_streaklines(None)
             self._canvas.set_markers([])
             return
-        pts = self._canvas.markers()
+        pts = self._canvas.markers
         if not pts:
             self._canvas.set_marker_draw_positions([])
             self._canvas.set_streaklines(None)
@@ -2358,6 +2370,38 @@ class ResultsPage(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
+    def _export_marker_timeseries(self) -> None:
+        """Write the per-frame history of every marker to one spreadsheet."""
+        analysis = self._wizard.analysis
+        pts = self._canvas.markers
+        if not pts:
+            QMessageBox.warning(
+                self, "No markers",
+                "Place at least one marker on the image first:\n\n"
+                "Enable “Place markers”, then click the point you want to follow.")
+            return
+        if not analysis.results:
+            QMessageBox.warning(self, "Nothing to export", "Run an analysis first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Marker Time Series", "marker_timeseries.csv",
+            "CSV files (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            labels = [f"M{i + 1}" for i in range(len(pts))]
+            rows = analysis.export_marker_timeseries(pts, path, labels=labels)
+            QMessageBox.information(
+                self, "Exported",
+                f"{rows} rows for {len(pts)} marker(s) written to:\n{path}\n\n"
+                "One row per frame per marker. Filter on the “marker” column, "
+                "then plot any field against “time_s” (or “frame” if the capture "
+                "rate is not set).")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
     def _export_video(self) -> None:
         analysis = self._wizard.analysis
         if not analysis.results:
@@ -2425,7 +2469,7 @@ class ResultsPage(QWidget):
         self._export_progress.show()
         self._export_progress.setValue(0)
         self._export_progress.setFormat("Rendering… %p%")
-        markers = self._canvas.markers()
+        markers = self._canvas.markers
         trail = self._trail_combo.currentData() or 0
         spec.trail = trail
 
