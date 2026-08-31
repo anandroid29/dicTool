@@ -713,7 +713,7 @@ class ImageCanvas(QWidget):
                 self._markers[self._marker_sel] = QPointF(
                     min(max(ip.x(), 0.0), W - 1.0), min(max(ip.y(), 0.0), H - 1.0))
                 self._marker_draw_pts = []
-                self.markers_changed.emit(self.markers)
+                self.markers_changed.emit(self.markers())
                 self.update()
             return
         if self._marker_mode:
@@ -792,7 +792,7 @@ class ImageCanvas(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if self._marker_drag:
             self._marker_drag = False
-            self.markers_changed.emit(self.markers)
+            self.markers_changed.emit(self.markers())
             return
         if event.button() == Qt.MouseButton.MiddleButton:
             self._dragging = False
@@ -1302,7 +1302,7 @@ class ImageCanvas(QWidget):
         self._markers.append(QPointF(float(x), float(y)))
         self._marker_sel = len(self._markers) - 1
         self._marker_draw_pts = []
-        self.markers_changed.emit(self.markers)
+        self.markers_changed.emit(self.markers())
         self.marker_selected.emit(self._marker_sel)
         self.update()
         return self._marker_sel
@@ -1313,7 +1313,7 @@ class ImageCanvas(QWidget):
             if i < len(self._marker_draw_pts):
                 self._marker_draw_pts.pop(i)
             self._marker_sel = min(self._marker_sel, len(self._markers) - 1)
-            self.markers_changed.emit(self.markers)
+            self.markers_changed.emit(self.markers())
             self.marker_selected.emit(self._marker_sel)
             self.update()
 
