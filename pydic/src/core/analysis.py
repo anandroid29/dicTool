@@ -258,6 +258,17 @@ class _CroppedTemporalField:
 
 
 class DICAnalysis:
+    # Class-level defaults for the trajectory cache.
+    #
+    # An instance is not always built through __init__ -- state-clearing methods
+    # are exercised against object.__new__(DICAnalysis), and those methods bump
+    # the epoch. Defaulting on the class means the bump resolves and creates the
+    # instance attribute, instead of raising inside a method whose whole job is
+    # to reset state. The dict default is None rather than {} because a mutable
+    # class attribute would be shared by every analysis in the process.
+    _results_epoch: int = 0
+    _path_cache: Optional[dict] = None
+
     def __init__(self) -> None:
         self.ref_path:  Optional[str]      = None
         self.def_paths: List[str]          = []
@@ -285,6 +296,16 @@ class DICAnalysis:
         self.prefer_gpu: bool = True
         self.last_backend: str = "unknown"
         self._cancel: list = [False]
+
+        # Incremental trajectory tracing. A path traced to frame N is a prefix
+        # of the path to frame N+1, so scrubbing forward should extend the
+        # accumulation rather than replay it from frame 0. Without this every
+        # frame change re-walked the whole history for every marker, which is
+        # what made streaklines unusable on a long sequence.
+        # The epoch is bumped whenever the result sequence is rebuilt, so a
+        # cached path can never outlive the data it was traced through.
+        self._results_epoch = 0
+        self._path_cache = {}
         # Schema-3 sessions keep datasets on disk and materialise only fields
         # that are actually viewed or exported. These proxies require the file
         # handle to remain open for the lifetime of the loaded session.
@@ -446,6 +467,7 @@ class DICAnalysis:
         # later pages display a plausible mixture of two sessions.
         self._release_loaded_hdf5()
         self.results.clear()
+        self._results_epoch += 1
         self.ref_path = path
         self._ref_image = _load_image(path)
         self._preview_frame_index = None
@@ -463,6 +485,7 @@ class DICAnalysis:
         # a frame is added.
         self._release_loaded_hdf5()
         self.results.clear()
+        self._results_epoch += 1
         self.def_paths.append(path)
 
     def clear_deformed(self) -> None:
@@ -471,6 +494,7 @@ class DICAnalysis:
         self._preview_frame_index = None
         self._preview_frame_image = None
         self.results.clear()
+        self._results_epoch += 1
         self.dynamic_frame_overrides = {}
         self.dynamic_future_overrides = {}
 
@@ -484,6 +508,7 @@ class DICAnalysis:
         self.dynamic_frame_overrides = {}
         self.dynamic_future_overrides = {}
         self.results.clear()
+        self._results_epoch += 1
 
     def set_strain_origin_mask(self, mask: np.ndarray) -> None:
         if self._ref_image is not None and mask.shape != self._ref_image.shape:
@@ -496,6 +521,7 @@ class DICAnalysis:
             origin &= self._roi_mask
         self._strain_origin_mask = origin
         self.results.clear()
+        self._results_epoch += 1
 
     def set_strain_origin_from_file(self, path: str) -> None:
         if self._ref_image is None:
@@ -507,6 +533,7 @@ class DICAnalysis:
         self._release_loaded_hdf5()
         self._strain_origin_mask = None
         self.results.clear()
+        self._results_epoch += 1
 
     def set_roi_from_file(self, path: str) -> None:
         if self._ref_image is None:
@@ -529,6 +556,7 @@ class DICAnalysis:
         self.dynamic_frame_overrides = {}
         self.dynamic_future_overrides = {}
         self.results.clear()
+        self._results_epoch += 1
 
     @property
     def reference_image(self) -> Optional[np.ndarray]:
@@ -563,6 +591,7 @@ class DICAnalysis:
         self._cancel[0] = False
         self._release_loaded_hdf5()
         self.results.clear()
+        self._results_epoch += 1
         if self._ref_image is None:
             raise RuntimeError("No reference image.")
         if not self.def_paths:
@@ -678,6 +707,7 @@ class DICAnalysis:
         self._cancel[0] = False
         self._release_loaded_hdf5()
         self.results.clear()
+        self._results_epoch += 1
 
         if self._ref_image is None or not self.def_paths:
             raise RuntimeError("Missing reference or deformed images.")
@@ -1181,33 +1211,123 @@ class DICAnalysis:
         if x1 <= x0 or y1 <= y0:
             return float("nan")
         if isinstance(arr, CompactField):
-            ys = (arr.indices // W).astype(np.int64, copy=False)
-            xs = (arr.indices % W).astype(np.int64, copy=False)
-            inside = ((xs >= x0) & (xs < x1) &
-                      (ys >= y0) & (ys < y1) & np.isfinite(arr.values))
-            if not inside.any():
+            # Indices are flat row-major and sorted, so each image row occupies
+            # one contiguous run. Binary-searching the run for each row of the
+            # window touches only the handful of subsets actually inside it.
+            #
+            # The previous version divided and modded EVERY index in the frame
+            # -- around 100k subsets on a 1 MP field -- to keep the dozen that
+            # fall in a 19x19 window, and it did that once per marker per frame.
+            # Tracing five markers over a few hundred frames turned that into
+            # hundreds of millions of operations and the window stopped
+            # responding, which is what "streaklines crash the app" was.
+            rows = np.arange(y0, y1, dtype=np.int64) * W
+            lo = np.searchsorted(arr.indices, rows + x0, side="left")
+            hi = np.searchsorted(arr.indices, rows + x1, side="left")
+            counts = hi - lo
+            total = int(counts.sum())
+            if total == 0:
                 return float("nan")
-            xs, ys, vals = xs[inside], ys[inside], arr.values[inside]
-            d2 = (xs - x) ** 2 + (ys - y) ** 2
-            k = min(4, len(d2))
-            idx = np.argpartition(d2, k - 1)[:k]
-            d2k, vk = d2[idx], vals[idx]
-            if d2k.min() < 1e-9:
-                return float(vk[int(np.argmin(d2k))])
-            weights = 1.0 / d2k
-            return float((vk * weights).sum() / weights.sum())
+            # Ragged concatenation of the per-row runs without a Python loop:
+            # two vectorised searchsorted calls and one arange, rather than one
+            # scalar searchsorted per row. This is called twice per marker per
+            # frame, so per-call overhead is what actually matters here.
+            starts = np.repeat(lo, counts)
+            within = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+            sel = starts + within
+            vals = arr.values[sel]
+            finite = np.isfinite(vals)
+            if not finite.any():
+                return float("nan")
+            sel, vals = sel[finite], vals[finite]
+            flat = arr.indices[sel].astype(np.int64, copy=False)
+            ys, xs = flat // W, flat % W
+            return self._interpolate_at(xs, ys, vals, x, y)
         win = arr[y0:y1, x0:x1]
         fin = np.isfinite(win)
         if not fin.any():
             return float("nan")
         ys, xs = np.nonzero(fin)
-        vals = win[fin]
-        d2 = (xs + x0 - x) ** 2 + (ys + y0 - y) ** 2
-        k = min(4, len(d2))
+        return self._interpolate_at(xs + x0, ys + y0, win[fin], x, y)
+
+    @staticmethod
+    def _interpolate_at(xs, ys, vals, x: float, y: float) -> float:
+        """Value of a scattered field at (x, y), by a local weighted plane fit.
+
+        Displacement varies smoothly and close to linearly over a few subset
+        spacings, so a plane through the neighbourhood is the right local model
+        and it reproduces a linear field exactly.
+
+        Inverse-distance weighting, used here previously, does not: on a regular
+        grid it returns a distance-weighted blend that sits off the true value
+        whenever the sample falls between centres. On a pure shear field that
+        was a 1.6% error at the midpoint between rows. It matters more than the
+        size suggests, because trajectory tracing sums the sampled displacement
+        frame after frame -- the error is a bias, not noise, so it accumulates
+        linearly rather than averaging out, and the traced path walks away from
+        the material point it is supposed to follow.
+
+        The design matrix is centred on the query point, so the constant term of
+        the fit is the value there. Weighting by inverse distance keeps nearby
+        centres dominant without breaking linear exactness -- for a truly linear
+        field every weighting recovers the same plane.
+
+        Falls back to inverse-distance weighting when there are too few points
+        to determine a plane, or when they are degenerate (all in one row, say,
+        at the edge of the analysed region).
+        """
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        vals = np.asarray(vals, dtype=np.float64)
+
+        d2 = (xs - x) ** 2 + (ys - y) ** 2
+        if d2.size == 0:
+            return float("nan")
+        nearest = int(np.argmin(d2))
+        if d2[nearest] < 1e-9:
+            return float(vals[nearest])
+
+        # A dozen points spans a couple of subset spacings in each direction:
+        # enough to determine the plane, tight enough that the linear model
+        # still holds across it.
+        k = min(12, d2.size)
         idx = np.argpartition(d2, k - 1)[:k]
-        d2k, vk = d2[idx], vals[idx]
-        if d2k.min() < 1e-9:
-            return float(vk[int(np.argmin(d2k))])
+        xk, yk, vk, d2k = xs[idx], ys[idx], vals[idx], d2[idx]
+
+        if k >= 3:
+            # Solve the weighted normal equations directly. lstsq runs an SVD
+            # per sample, which is four times the cost here and this is called
+            # once per marker per field per frame -- enough to stall a scrub on
+            # its own. The system is 3x3 and symmetric, so forming it from
+            # reductions and solving once is both exact and cheap.
+            dx, dy = xk - x, yk - y
+            w = 1.0 / np.sqrt(d2k)
+            wv = w * vk
+            s00 = w.sum()
+            s01 = (w * dx).sum()
+            s02 = (w * dy).sum()
+            s11 = (w * dx * dx).sum()
+            s12 = (w * dx * dy).sum()
+            s22 = (w * dy * dy).sum()
+            m = np.array([[s00, s01, s02],
+                          [s01, s11, s12],
+                          [s02, s12, s22]])
+            rhs = np.array([wv.sum(), (wv * dx).sum(), (wv * dy).sum()])
+            det = float(np.linalg.det(m))
+            # Reject a system the points cannot determine -- all on one row, or
+            # collinear at the edge of the analysed region -- rather than
+            # amplifying noise through a near-singular solve.
+            scale = float(s00 * s11 * s22)
+            if np.isfinite(det) and scale > 0.0 and abs(det) > 1e-9 * scale:
+                try:
+                    coef = np.linalg.solve(m, rhs)
+                    if np.isfinite(coef[0]):
+                        # The design is centred on the query point, so the
+                        # constant term is the value there.
+                        return float(coef[0])
+                except np.linalg.LinAlgError:
+                    pass
+
         w = 1.0 / d2k
         return float((vk * w).sum() / w.sum())
 
@@ -1226,24 +1346,101 @@ class DICAnalysis:
         if not self.results:
             return None
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
-        u_total = np.zeros_like(self.results[0].u, dtype=float)
-        v_total = np.zeros_like(self.results[0].v, dtype=float)
-        v = np.ones_like(self.results[0].u, dtype=bool)
-        for res in self.results[:idx + 1]:
-            here = np.isfinite(res.u) & np.isfinite(res.v)
-            if res.valid is not None:
-                here &= res.valid
-            v &= here
-            u_total[here] += res.u[here]
-            v_total[here] += res.v[here]
-        if not v.any():
+
+        # Accumulate over the subset centres, never over the full image.
+        #
+        # This used to build three full-resolution arrays and then, for every
+        # frame in the history, densify u and v twice each -- six megabyte-scale
+        # allocations per frame. At a few hundred frames a single click took
+        # seconds and the application stopped responding. Subset centres are a
+        # fraction of a percent of the pixels, and they are all this needs.
+        flat, u_cum, v_cum = self._cumulative_displacement(idx)
+        if flat is None or flat.size == 0:
             return None
-        ys, xs = np.nonzero(v)
-        cx = xs + u_total[ys, xs]
-        cy = ys + v_total[ys, xs]
-        d2 = (cx - x) ** 2 + (cy - y) ** 2
+
+        W = int(self.results[0].u.shape[1])
+        ys = (flat // W).astype(np.float64)
+        xs = (flat % W).astype(np.float64)
+        d2 = (xs + u_cum - x) ** 2 + (ys + v_cum - y) ** 2
         i = int(np.argmin(d2))
         return (float(xs[i]), float(ys[i])), float(np.sqrt(d2[i]))
+
+    def _cumulative_displacement(self, idx: int):
+        """Total displacement at each subset centre tracked through frame `idx`.
+
+        Returns (flat_indices, u_cumulative, v_cumulative) over the points that
+        stayed valid for the whole history, or (None, None, None) if none did.
+
+        Works entirely on the packed values. Points that drop out are removed
+        from the running set rather than masked in a dense array, so the work
+        shrinks as the sequence goes on instead of staying at full frame size.
+        """
+        if not self.results:
+            return None, None, None
+        idx = max(0, min(int(idx), len(self.results) - 1))
+
+        def _packed(field, shape):
+            """(sorted flat indices, values) for a field, compact or dense."""
+            if isinstance(field, CompactField):
+                return field.indices.astype(np.int64, copy=False), field.values
+            arr = np.asarray(field)
+            finite = np.isfinite(arr)
+            return np.flatnonzero(finite.reshape(-1)), arr.reshape(-1)[finite.reshape(-1)]
+
+        first = self.results[0]
+        shape = first.u.shape
+        flat, u_vals = _packed(first.u, shape)
+        _, v_vals = _packed(first.v, shape)
+        if flat.size == 0:
+            return None, None, None
+
+        u_cum = np.zeros(flat.size, dtype=np.float64)
+        v_cum = np.zeros(flat.size, dtype=np.float64)
+
+        for k in range(0, idx + 1):
+            res = self.results[k]
+            f_u, u_k = _packed(res.u, shape)
+            f_v, v_k = _packed(res.v, shape)
+
+            # Keep only points this frame also measured.
+            #
+            # Almost always every frame carries the identical subset grid, and
+            # then the intersection is the identity -- worth detecting, because
+            # searchsorted over ~100k points on every frame of a long sequence
+            # is most of the cost of placing a single marker. array_equal is one
+            # cheap vectorised comparison against that.
+            def _align(f_k):
+                if f_k.size == flat.size and np.array_equal(f_k, flat):
+                    return None                      # identity: index directly
+                pos = np.searchsorted(f_k, flat)
+                np.clip(pos, 0, max(0, f_k.size - 1), out=pos)
+                return pos
+
+            pos = _align(f_u)
+            pos_v = pos if f_v is f_u else _align(f_v)
+
+            if pos is None:
+                keep = np.ones(flat.size, dtype=bool)
+                du = u_k
+            else:
+                keep = (f_u.size > 0) & (f_u[pos] == flat)
+                du = np.where(keep, u_k[pos], np.nan)
+
+            if pos_v is None:
+                dv = v_k
+            else:
+                keep = keep & ((f_v.size > 0) & (f_v[pos_v] == flat))
+                dv = np.where(keep, v_k[pos_v], np.nan)
+
+            keep = keep & np.isfinite(du) & np.isfinite(dv)
+            if not keep.any():
+                return None, None, None
+
+            flat = flat[keep]
+            u_cum = u_cum[keep] + du[keep]
+            v_cum = v_cum[keep] + dv[keep]
+
+        return flat, u_cum, v_cum
 
     def marker_positions(self, seeds, frame_idx: int) -> list[Optional[tuple[float, float]]]:
         """Where each reference-frame marker sits on the displayed frame."""
@@ -1252,17 +1449,16 @@ class DICAnalysis:
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
         out = []
         for (sx, sy) in seeds:
-            u_total = v_total = 0.0
-            valid = True
-            for res in self.results[:idx + 1]:
-                u = self._sample_sparse(res.u, sx, sy)
-                v = self._sample_sparse(res.v, sx, sy)
-                if not (np.isfinite(u) and np.isfinite(v)):
-                    valid = False
-                    break
-                u_total += u
-                v_total += v
-            out.append((float(sx + u_total), float(sy + v_total)) if valid else None)
+            # Same traced path the streaklines use, so a marker and the end of
+            # its own trail can never disagree, and neither pays to re-walk the
+            # history the other already walked.
+            path = self._traced_path(float(sx), float(sy), idx)
+            lost = path["lost_at"]
+            if lost is not None and lost <= idx:
+                out.append(None)
+                continue
+            pts = path["points"]
+            out.append(tuple(pts[idx + 1]) if idx + 1 < len(pts) else None)
         return out
 
     def get_trajectories_from_seeds(self, seeds, max_frame: int, trail: int = 0
@@ -1284,23 +1480,73 @@ class DICAnalysis:
         last = min(int(max_frame), len(self.results) - 1)
         out: list[dict] = []
         for (sx, sy) in seeds:
-            pts: list[tuple[float, float]] = [(float(sx), float(sy))]
-            lost_at = None
-            u_total = v_total = 0.0
-            for i in range(0, last + 1):
-                u = self._sample_sparse(self.results[i].u, sx, sy)
-                v = self._sample_sparse(self.results[i].v, sx, sy)
-                if not (np.isfinite(u) and np.isfinite(v)):
-                    lost_at = i
-                    break
-                u_total += u
-                v_total += v
-                pts.append((float(sx + u_total), float(sy + v_total)))
+            path = self._traced_path(float(sx), float(sy), last)
+            pts = path["points"][:last + 2]          # seed + one point per frame
+            lost_at = path["lost_at"]
+            if lost_at is not None and lost_at > last:
+                lost_at = None                        # not lost yet at this frame
             if trail and trail > 0 and len(pts) > trail + 1:
                 pts = pts[-(trail + 1):]
-            out.append({"points": pts, "lost_at": lost_at,
+            out.append({"points": list(pts), "lost_at": lost_at,
                         "seed": (float(sx), float(sy))})
         return out
+
+    def _results_token(self) -> tuple:
+        """Identity of the current result sequence, for cache validation.
+
+        The epoch counter alone only catches the code paths inside this class
+        that clear `results`. Callers also replace the list contents directly --
+        loading a session, swapping in a re-run -- and a cached path that
+        survives that is a path traced through data the viewer is no longer
+        showing. Pairing the epoch with the length and the identity of the first
+        result catches that too.
+        """
+        first = id(self.results[0]) if self.results else 0
+        return (self._results_epoch, len(self.results), first)
+
+    def _traced_path(self, sx: float, sy: float, last: int) -> dict:
+        """Path of one material point, traced to at least frame `last`.
+
+        Cached and extended in place. Scrubbing forward costs only the frames
+        newly entered; scrubbing back costs nothing, because the shorter path is
+        a prefix of the one already held.
+        """
+        cache = self._path_cache
+        if cache is None:
+            cache = self._path_cache = {}
+        key = (round(sx, 3), round(sy, 3))
+        entry = cache.get(key)
+        if entry is None or entry["epoch"] != self._results_token():
+            entry = {"epoch": self._results_token(),
+                     "points": [(float(sx), float(sy))],
+                     "traced_to": -1, "lost_at": None,
+                     "u": 0.0, "v": 0.0}
+            self._path_cache[key] = entry
+
+        # Once a point is lost it stays lost; there is nothing further to trace.
+        if entry["lost_at"] is not None:
+            return entry
+
+        for i in range(entry["traced_to"] + 1, last + 1):
+            u = self._sample_sparse(self.results[i].u, sx, sy)
+            v = self._sample_sparse(self.results[i].v, sx, sy)
+            if not (np.isfinite(u) and np.isfinite(v)):
+                entry["lost_at"] = i
+                break
+            entry["u"] += u
+            entry["v"] += v
+            entry["points"].append((sx + entry["u"], sy + entry["v"]))
+            entry["traced_to"] = i
+
+        # A cache that grows without bound across a long session is its own
+        # problem; markers are few, so a small cap is ample. Re-insert this key
+        # last so the entry just traced is never the one evicted.
+        if len(self._path_cache) > 64:
+            self._path_cache.pop(key, None)
+            for stale in list(self._path_cache)[:-32]:
+                self._path_cache.pop(stale, None)
+            self._path_cache[key] = entry
+        return entry
 
     # ------------------------------------------------------------------
     # Frame-pair analysis
@@ -2153,6 +2399,7 @@ class DICAnalysis:
         report(0.0, "Opening HDF5 session…")
         self._release_loaded_hdf5()
         self.results.clear()
+        self._results_epoch += 1
         self.def_paths.clear()
         self.temporal_results = None
         self.temporal_pairs = []
