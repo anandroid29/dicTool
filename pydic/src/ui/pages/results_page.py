@@ -541,7 +541,7 @@ class ResultsPage(QWidget):
         disp_lay.setSpacing(8)
         top_outer.addLayout(disp_lay)
 
-        new_btn = QPushButton("← New Session")
+        new_btn = QPushButton("← New session")
         new_btn.setFixedWidth(120)
         new_btn.clicked.connect(self._wizard.new_session)
         top_lay.addWidget(new_btn)
@@ -588,7 +588,7 @@ class ResultsPage(QWidget):
 
         self._streak_chk = QCheckBox("Streaklines")
         self._streak_chk.setToolTip(
-            "Trace trajectories from markers you place on the image")
+            "Trace trajectories from markers placed on the image.")
         self._streak_chk.setStyleSheet(f"color:{_C_ACCENT}; font-size: 12px; font-weight: 800;")
         self._streak_chk.toggled.connect(self._on_streak_toggled)
         top_lay.addWidget(self._streak_chk)
@@ -612,7 +612,7 @@ class ResultsPage(QWidget):
 
         self._clear_markers_btn = QPushButton("Clear")
         self._clear_markers_btn.setFixedHeight(28)
-        self._clear_markers_btn.setToolTip("Remove all markers")
+        self._clear_markers_btn.setToolTip("Remove all markers.")
         self._clear_markers_btn.setStyleSheet(
             f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
             f" padding:3px 10px; border-radius:3px; font-size:11px;")
@@ -627,7 +627,7 @@ class ResultsPage(QWidget):
         self._trail_combo.addItem("Full", 0)
         for n in (10, 25, 50, 100):
             self._trail_combo.addItem(f"{n} frames", n)
-        self._trail_combo.setToolTip("How much trajectory history to draw")
+        self._trail_combo.setToolTip("How much trajectory history to draw.")
         self._trail_combo.setFixedWidth(96)
         self._trail_combo.currentIndexChanged.connect(self._refresh_overlay)
         top_lay.addWidget(self._trail_combo)
@@ -659,7 +659,7 @@ class ResultsPage(QWidget):
         disp_lay.addWidget(self._cmap_combo)
 
         self._sym_chk = QCheckBox("Sym")
-        self._sym_chk.setToolTip("Centre colormap around zero")
+        self._sym_chk.setToolTip("Centre the colour scale on zero.")
         self._sym_chk.stateChanged.connect(self._refresh_overlay)
         disp_lay.addWidget(self._sym_chk)
 
@@ -685,7 +685,7 @@ class ResultsPage(QWidget):
         self._range_fit_btn = QPushButton("Fit")
         self._range_fit_btn.setFixedWidth(40)
         self._range_fit_btn.setToolTip(
-            "Fill the limits from this frame's data, then keep them pinned.")
+            "Set the limits from this frame, then keep them fixed.")
         self._range_fit_btn.setEnabled(False)
         self._range_fit_btn.clicked.connect(self._fit_range_to_frame)
         disp_lay.addWidget(self._range_fit_btn)
@@ -706,12 +706,12 @@ class ResultsPage(QWidget):
         self._coverage_combo.setCurrentText(DEFAULT_COVERAGE_TEXT)
         self._coverage_combo.setFixedWidth(74)
         self._coverage_combo.setToolTip(
-            "Share of the data the colour scale must span.\n\n"
-            "100% uses the true min and max, so one bad correlation can flatten\n"
-            "the whole map. Lower values trim that much from each tail — 98%\n"
-            "ignores the most extreme 1% at each end.\n\n"
-            "This only changes the colour mapping. Statistics and every export\n"
-            "still report the true values."
+            "Share of the data the colour scale spans.\n\n"
+            "100% uses the true minimum and maximum, so a single bad\n"
+            "correlation can flatten the map. 98% ignores the most extreme\n"
+            "1% at each end.\n\n"
+            "Affects the colours only. Statistics and exports report the\n"
+            "true values."
         )
         self._coverage_combo.currentIndexChanged.connect(self._refresh_overlay)
         disp_lay.addWidget(self._coverage_combo)
@@ -719,9 +719,9 @@ class ResultsPage(QWidget):
         self._clip_chk = QCheckBox("Flag clipped")
         self._clip_chk.setChecked(True)
         self._clip_chk.setToolTip(
-            "Draw values outside the colour range in magenta (above) and\n"
-            "cyan (below), instead of letting them sit at the end colour\n"
-            "where they look like legitimate extremes.")
+            "Draw values above the range in magenta and below it in cyan,\n"
+            "so clipping is visible instead of blending into the end\n"
+            "colours.")
         self._clip_chk.stateChanged.connect(self._refresh_overlay)
         disp_lay.addWidget(self._clip_chk)
         disp_lay.addStretch()
@@ -777,14 +777,14 @@ class ResultsPage(QWidget):
         # disagreement is the signal that the field contains outliers.
         self._stat_labels: dict[str, QLabel] = {}
         for stat, tip in (
-            ("Mean",    "Arithmetic mean. Shifts without bound if even one "
-                        "subset decorrelates."),
-            ("Median",  "Middle value. Unaffected by a minority of bad points —\n"
-                        "if this differs markedly from the mean, trust this one."),
+            ("Mean",    "Arithmetic mean. One decorrelated subset can shift "
+                        "it without bound."),
+            ("Median",  "Middle value, unaffected by a minority of bad points.\n"
+                        "Where it differs markedly from the mean, trust this one."),
             ("Std Dev", "Standard deviation. Like the mean, sensitive to outliers."),
             ("IQR",     "Interquartile range: the spread of the middle 50%.\n"
                         "A robust alternative to standard deviation."),
-            ("P1–P99",  "1st to 99th percentile — the practical extremes,\n"
+            ("P1–P99",  "1st to 99th percentile: the practical extremes,\n"
                         "with the most extreme 1% at each end set aside."),
             ("Min/Max", "True extremes, including any failed correlations.\n"
                         "Compare with P1–P99 to see how far the tails reach."),
@@ -890,9 +890,9 @@ class ResultsPage(QWidget):
         self._marker_csv_btn = QPushButton("Export temporal data (CSV)…")
         self._marker_csv_btn.setFixedHeight(26)
         self._marker_csv_btn.setToolTip(
-            "Write every frame of every marker to one spreadsheet: position plus\n"
-            "displacement, velocity, strain and strain rate sampled at that point.\n"
-            "Opens in Excel; one row per (frame, marker), ready to plot.")
+            "Write each marker's full history to one spreadsheet.\n"
+            "One row per frame per marker, with position and every\n"
+            "field sampled at that point.")
         self._marker_csv_btn.setStyleSheet(
             f"background:{_C_CARD}; color:{_C_TEXT2}; border:1px solid {_C_BORDER};"
             f" border-radius:3px; font-size:10px;")
@@ -911,9 +911,9 @@ class ResultsPage(QWidget):
         self._pair_btn = QPushButton("Smoothed pair sequence…")
         self._pair_btn.setFixedHeight(30)
         self._pair_btn.setToolTip(
-            "Build a playable sequence of longer frame intervals. Each interval\n"
-            "composes material motion and recomputes velocity, strain rate, and\n"
-            "Green–Lagrange strain.")
+            "Build a playable sequence of longer frame intervals. Each one\n"
+            "composes material motion and recomputes velocity, strain rate\n"
+            "and Green-Lagrange strain.")
         self._pair_btn.clicked.connect(self._pair_button_clicked)
         sb_lay.addWidget(self._pair_btn)
 
@@ -940,8 +940,8 @@ class ResultsPage(QWidget):
             f"background:{_C_CARD}; color:{_C_WARN}; border:1px solid {_C_WARN};"
             f" border-radius:3px; font-size:10px;")
         self._pair_clear_btn.setToolTip(
-            "Permanently discard the computed temporal cache and pair list.\n"
-            "Back to single frames does not discard them.")
+            "Discard the temporal cache and pair list. This cannot be undone.\n"
+            "Back to single frames keeps them.")
         self._pair_clear_btn.clicked.connect(self._discard_pair_data)
         self._pair_clear_btn.setVisible(False)
         sb_lay.addWidget(self._pair_clear_btn)
@@ -981,7 +981,7 @@ class ResultsPage(QWidget):
         bot_lay.setSpacing(10)
 
         # ── NEW: Reset Zoom Button ────────────────────────────────────
-        self._reset_view_btn = QPushButton("Reset Zoom")
+        self._reset_view_btn = QPushButton("Reset zoom")
         self._reset_view_btn.setFixedHeight(30)
         self._reset_view_btn.clicked.connect(self._canvas.fit_image)
         bot_lay.addWidget(self._reset_view_btn)
@@ -1026,9 +1026,8 @@ class ResultsPage(QWidget):
         # The rate is read fresh on every tick by _advance, so changing it
         # mid-playback takes effect at the next frame without restarting.
         self._fps_spin.setToolTip(
-            "Playback rate for the frame scrubber.\n"
-            "This is a review speed, unrelated to the capture rate used for "
-            "velocity and strain rate.")
+            "Playback speed for review only. The capture rate used for\n"
+            "velocity and strain rate is set separately.")
         bot_lay.addWidget(self._fps_spin)
 
         # ── Scale: pixel size and the unit to report in ───────────────
@@ -1045,9 +1044,9 @@ class ResultsPage(QWidget):
         scale_lbl = QLabel("1 px =")
         scale_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
         scale_lbl.setToolTip(
-            "Physical size of one pixel. Set this and displacements and\n"
-            "velocities are reported in real units instead of pixels.\n"
-            "Strain and strain rate are ratios and never change.")
+            "Physical size of one pixel. Displacement and velocity are then\n"
+            "reported in real units. Strain and strain rate are ratios and\n"
+            "are unaffected.")
         bot_lay.addWidget(scale_lbl)
 
         self._px_size_spin = QDoubleSpinBox()
@@ -1065,8 +1064,8 @@ class ResultsPage(QWidget):
         self._unit_combo.setCurrentText("mm")
         self._unit_combo.setFixedWidth(66)
         self._unit_combo.setToolTip(
-            "Unit used to enter the pixel size. Result values automatically "
-            "promote to a larger engineering unit when they reach 100.")
+            "Unit for the pixel size. Results move up to the next unit "
+            "once values reach 100.")
         self._unit_combo.currentTextChanged.connect(self._on_calibration_changed)
         bot_lay.addWidget(self._unit_combo)
 
@@ -1130,13 +1129,13 @@ class ResultsPage(QWidget):
         mapped = analysis.reference_from_current(x, y, self._frame)
         if mapped is None:
             QMessageBox.information(self, "No data",
-                                    "This frame has no valid correlation data yet.")
+                                    "This frame has no valid correlation data.")
             return
         (rx, ry), resid = mapped
         if resid > 25.0:
             QMessageBox.information(
                 self, "Outside analysed region",
-                "That point isn't inside the analysed region for this frame.\n"
+                "That point is outside the analysed region for this frame.\n"
                 f"Nearest tracked material point is {resid:.0f} px away.")
             return
         self._canvas.add_marker(rx, ry)
@@ -1635,11 +1634,11 @@ class ResultsPage(QWidget):
             f"color:{_C_WARN if skewed else _C_TEXT}; font-size:11px; "
             f"font-family:'Fira Code','Cascadia Code',monospace;")
         self._stat_labels["Mean"].setToolTip(
-            "Mean and median disagree by more than half the interquartile "
-            "range —\noutliers are pulling the mean. Prefer the median."
+            "Mean and median differ by more than half the interquartile "
+            "range.\nOutliers are pulling the mean; prefer the median."
             if skewed else
-            "Arithmetic mean. Shifts without bound if even one subset "
-            "decorrelates.")
+            "Arithmetic mean. One decorrelated subset can shift it "
+            "without bound.")
 
     # ------------------------------------------------------------------
     # Value probe
@@ -1866,8 +1865,8 @@ class ResultsPage(QWidget):
         self._pair_clear_btn.setVisible(bool(self._pair_list))
         self._scale_global_rb.setText("Pair-fixed" if active else "Global")
         self._scale_global_rb.setToolTip(
-            "Keep the limits established by the first displayed pair so the "
-            "playable pair sequence remains directly comparable."
+            "Keep the limits from the first pair so the sequence stays "
+            "comparable."
             if active else
             "Fix the scale to the min/max across the whole sequence.")
         self._pair_btn.setText(
@@ -2144,7 +2143,7 @@ class ResultsPage(QWidget):
         self._pair_history_active = False
         self._pair_history_task = None
         if not ok:
-            self._export_progress.setFormat("Temporal strain-rate failed ✗")
+            self._export_progress.setFormat("Temporal strain rate failed")
             if self._pair_mode:
                 self._frame_lbl.setText(
                     f"Temporal strain-rate failed: {error}")
@@ -2188,7 +2187,7 @@ class ResultsPage(QWidget):
                     self._play_btn.setChecked(False)
                     self._toggle_play(False)
             if self._pair_store is not None:
-                self._export_progress.setFormat("Temporal preprocessing failed ✗")
+                self._export_progress.setFormat("Temporal preprocessing failed")
             self._pump_pair_workers()
             return
 
@@ -2368,7 +2367,7 @@ class ResultsPage(QWidget):
             self._wizard.analysis.export_csv(target, directory)
             QMessageBox.information(self, "Exported", f"CSV files saved to:\n{directory}")
         except Exception as e:
-            QMessageBox.warning(self, "Export Error", str(e))
+            QMessageBox.warning(self, "Export failed", str(e))
 
     def _export_marker_timeseries(self) -> None:
         """Write the per-frame history of every marker to one spreadsheet."""
@@ -2377,8 +2376,7 @@ class ResultsPage(QWidget):
         if not pts:
             QMessageBox.warning(
                 self, "No markers",
-                "Place at least one marker on the image first:\n\n"
-                "Enable “Place markers”, then click the point you want to follow.")
+                "Enable Place markers, then click the point you want to follow.")
             return
         if not analysis.results:
             QMessageBox.warning(self, "Nothing to export", "Run an analysis first.")
@@ -2396,9 +2394,8 @@ class ResultsPage(QWidget):
             QMessageBox.information(
                 self, "Exported",
                 f"{rows} rows for {len(pts)} marker(s) written to:\n{path}\n\n"
-                "One row per frame per marker. Filter on the “marker” column, "
-                "then plot any field against “time_s” (or “frame” if the capture "
-                "rate is not set).")
+                "One row per frame per marker. Filter on the marker column, "
+                "then plot any field against time_s.")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
@@ -2423,9 +2420,9 @@ class ResultsPage(QWidget):
                         self._request_pair(index, priority=False)
             QMessageBox.information(
                 self, "Temporal preprocessing",
-                "The sliding/non-overlapping temporal sequence is still being "
-                "calculated. The progress bar will say ‘Temporal sequence "
-                "ready’ when averaged video export is available.")
+                "The temporal sequence is still being calculated. The progress "
+                "bar reads Temporal sequence ready when averaged video "
+                "export becomes available.")
             return
         export_count = (len(self._pair_list) if temporal_export
                         else len(analysis.results))
@@ -2493,7 +2490,7 @@ class ResultsPage(QWidget):
             self._video_store_generation = None
             self._cleanup_pair_store_dirs()
         self._export_progress.setValue(100 if ok else 0)
-        self._export_progress.setFormat("Video export complete" if ok else "Video export failed ✗")
+        self._export_progress.setFormat("Video export complete" if ok else "Video export failed")
         QTimer.singleShot(2500, self._export_progress.hide)
         if ok:
             QMessageBox.information(self, "Exported", f"Written to:\n{msg}")
@@ -2534,7 +2531,7 @@ class ResultsPage(QWidget):
     def _start_hdf5_worker(self, path: str) -> None:
         self._export_progress.show()
         self._export_progress.setValue(0)
-        self._export_progress.setFormat("Exporting HDF5... %p%")
+        self._export_progress.setFormat("Exporting HDF5…  %p%")
         self._export_progress.setStyleSheet(
             f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius:3px; color: {_C_TEXT}; }}"
             f"QProgressBar::chunk {{ background: {_C_ACCENT}; border-radius: 3px; }}"
@@ -2569,13 +2566,13 @@ class ResultsPage(QWidget):
             self._cleanup_pair_store_dirs()
         if success:
             self._export_progress.setValue(100)
-            self._export_progress.setFormat("Export Complete")
+            self._export_progress.setFormat("Export complete")
             self._export_progress.setStyleSheet(
                 f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius:3px; color: {_C_TEXT}; }}"
                 f"QProgressBar::chunk {{ background: {_C_SUCCESS}; border-radius: 3px; }}"
             )
         else:
-            self._export_progress.setFormat("Export Failed ✗")
+            self._export_progress.setFormat("Export failed")
             self._export_progress.setStyleSheet(
                 f"QProgressBar {{ background: {_C_CARD}; border: 1px solid {_C_BORDER}; border-radius:3px; color: red; }}"
                 f"QProgressBar::chunk {{ background: {_C_CARD}; }}"

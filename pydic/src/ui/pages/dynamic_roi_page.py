@@ -128,7 +128,7 @@ class DynamicROIPage(QWidget):
         title.setStyleSheet(f"color:{_C_TEXT}; font-size:13px; font-weight:600;")
         top_lay.addWidget(title)
         top_lay.addStretch()
-        self._reset_view_btn = QPushButton("Reset Zoom")
+        self._reset_view_btn = QPushButton("Reset zoom")
         self._reset_view_btn.setFixedHeight(30)
         self._reset_view_btn.setToolTip("Fit the reference image back into the viewport.")
         self._reset_view_btn.clicked.connect(self._canvas_fit_image)
@@ -156,8 +156,8 @@ class DynamicROIPage(QWidget):
         fbar.addWidget(self._frame_override_lbl)
         self._frame_replace_chk = QCheckBox("Replace base")
         self._frame_replace_chk.setToolTip(
-            "Use this frame's Include drawing as the complete Dynamic ROI.\n"
-            "Without this option, frame Include/Exclude modify the global base.")
+            "Use this frame's Include drawing as the whole dynamic ROI.\n"
+            "Otherwise Include and Exclude modify the global base.")
         self._frame_replace_chk.toggled.connect(self._on_frame_replace_toggled)
         fbar.addWidget(self._frame_replace_chk)
 
@@ -216,15 +216,15 @@ class DynamicROIPage(QWidget):
         self._set_future_btn = QPushButton("Set → future")
         self._set_future_btn.setFixedHeight(30)
         self._set_future_btn.setToolTip(
-            "Use this frame's effective override as the default beginning with "
-            "the next frame. Exact-frame edits still win.")
+            "Apply this frame's override as the default from the next frame\n"
+            "onward. Exact-frame edits still take priority.")
         self._set_future_btn.clicked.connect(self._set_current_as_future_default)
         fbar.addWidget(self._set_future_btn)
         self._clear_future_btn = QPushButton("Clear future")
         self._clear_future_btn.setFixedHeight(30)
         self._clear_future_btn.setToolTip(
-            "Keep defaults through this frame, then stop inheriting them from "
-            "the next frame onward. Exact-frame edits remain.")
+            "Keep defaults through this frame, then stop inheriting from the\n"
+            "next frame onward. Exact-frame edits remain.")
         self._clear_future_btn.clicked.connect(self._clear_future_defaults)
         fbar.addWidget(self._clear_future_btn)
         self._clear_frame_btn = QPushButton("Clear frame")
@@ -270,12 +270,12 @@ class DynamicROIPage(QWidget):
         self._cb_method = QComboBox()
         self._cb_method.addItems(_METHODS)
         self._cb_method.setToolTip(
-            "Contrast  — local intensity standard deviation.\n"
-            "Edge Detection — Sobel gradient magnitude.\n"
-            "Hybrid — both, each normalised before being summed.\n\n"
-            "The threshold is calibrated once on the selected zero-strain frame and then\n"
-            "held fixed, so 'enough texture' means the same thing in frame 500\n"
-            "as in frame 1.")
+            "Contrast: local intensity standard deviation.\n"
+            "Edge detection: Sobel gradient magnitude.\n"
+            "Hybrid: both, each normalised before being summed.\n\n"
+            "The threshold is calibrated once on the zero-strain frame and\n"
+            "then held fixed, so 'enough texture' means the same in frame\n"
+            "500 as in frame 1.")
         self._cb_method.currentTextChanged.connect(self._on_method_changed)
         lay.addWidget(self._cb_method)
 
@@ -291,7 +291,7 @@ class DynamicROIPage(QWidget):
         self._auto_chk = QCheckBox("Automatic (Otsu)")
         self._auto_chk.setChecked(True)
         self._auto_chk.setToolTip(
-            "Pick the threshold automatically from the selected zero-strain frame.\n"
+            "Pick the threshold from the zero-strain frame.\n"
             "Uncheck to set it by hand.")
         self._auto_chk.toggled.connect(self._on_auto_toggled)
         lay.addWidget(self._auto_chk)
@@ -314,8 +314,8 @@ class DynamicROIPage(QWidget):
         a_lbl.setStyleSheet(f"color:{_C_TEXT}; font-size:12px;")
         a_lbl.setToolTip(
             "Discard connected regions smaller than this fraction of the\n"
-            "largest one. Keeps speckle noise out without throwing away the\n"
-            "chip or the workpiece, which are separate bodies.")
+            "largest. Removes speckle without discarding the chip or the\n"
+            "workpiece, which are separate bodies.")
         arow.addWidget(a_lbl)
         self._area_spin = QDoubleSpinBox()
         self._area_spin.setRange(0.0, 1.0)
@@ -331,11 +331,11 @@ class DynamicROIPage(QWidget):
         self._fill_chk = QCheckBox("Fill enclosed holes")
         self._fill_chk.setChecked(True)
         self._fill_chk.setToolTip(
-            "Keep a region the texture metric rejected when it is completely\n"
-            "surrounded by kept material — a glare spot or washed-out patch\n"
-            "inside the specimen is a local dropout, not a gap in the material.\n\n"
-            "No size limit: a hole is filled because it is enclosed, not because\n"
-            "it is small. Use Exclude to override it where a gap is genuine.")
+            "Keep a rejected region when it is entirely surrounded by kept\n"
+            "material. A glare spot or washed-out patch inside the specimen\n"
+            "is a local dropout, not a gap in the material.\n\n"
+            "Size is not considered: a hole is filled because it is enclosed.\n"
+            "Use Exclude where the gap is genuine.")
         self._fill_chk.toggled.connect(self._on_threshold_changed)
         lay.addWidget(self._fill_chk)
 
@@ -1124,7 +1124,7 @@ class DynamicROIPage(QWidget):
             preview = calibration
 
         if method == "None":
-            self._hint.setText("No dynamic masking — every pixel of the static ROI "
+            self._hint.setText("No dynamic masking. Every pixel of the static ROI "
                                "is analysed in every frame.")
             self._canvas.clear_result_overlay()
             self._stats.setText("")

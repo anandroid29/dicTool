@@ -79,8 +79,8 @@ class _PanelEditor(QWidget):
 
         self.streaks = QCheckBox("Overlay streaklines")
         self.streaks.setToolTip(
-            "Draw the marker trajectories on top of this panel too.\n"
-            "Always on for a 'Streaklines only' panel.")
+            "Draw the marker trajectories over this panel.\n"
+            "Always on for a Streaklines only panel.")
         lay.addWidget(self.streaks, 1, 2, 1, 2)
 
         # Background and its colour picker sit together: the picker only applies
@@ -93,7 +93,7 @@ class _PanelEditor(QWidget):
         lay.addWidget(self.background, 2, 1)
 
         self.colour_btn = QPushButton("Pick colour…")
-        self.colour_btn.setToolTip("Only applies when Background is 'Solid colour'.")
+        self.colour_btn.setToolTip("Applies only when Background is Solid colour.")
         self.colour_btn.clicked.connect(self._pick_colour)
         lay.addWidget(self.colour_btn, 2, 2, 1, 2)
 
@@ -232,7 +232,7 @@ class VideoExportDialog(QDialog):
                  current_field: str, current_cmap: str, fps: float = 25.0,
                  parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Export Video")
+        self.setWindowTitle("Export video")
         self.setMinimumWidth(760)
         self._fields = fields
         self._cmaps = cmaps
@@ -265,11 +265,11 @@ class VideoExportDialog(QDialog):
         gl.addWidget(QLabel("Format"), 1, 0)
         self.codec = QComboBox(); self.codec.addItems(list(CODECS.keys()))
         self.codec.setToolTip(
-            "mp4v plays essentially everywhere.\n"
+            "mp4v plays almost everywhere.\n"
             "MJPG needs no external codec if mp4 fails.\n"
             "FFV1 is lossless but large.\n"
-            "PNG image sequence is the only option that preserves a\n"
-            "transparent background — no video codec here carries alpha.")
+            "PNG sequence is the only option that keeps a transparent\n"
+            "background; none of the video codecs carry alpha.")
         gl.addWidget(self.codec, 1, 1)
 
         gl.addWidget(QLabel("FPS"), 1, 2)
@@ -318,7 +318,7 @@ class VideoExportDialog(QDialog):
         msgs = []
         if transparent and not seq:
             msgs.append("⚠  A transparent background cannot be stored in a video "
-                        "file — it will come out black. Choose 'PNG image "
+                        "file; it will come out black. Choose the PNG image "
                         "sequence' to keep real transparency.")
         if seq:
             msgs.append("Frames are written as numbered PNGs into a folder next "

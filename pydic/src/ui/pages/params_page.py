@@ -104,7 +104,7 @@ class ParamsPage(QWidget):
         back.clicked.connect(self._wizard.go_before_params)
         top_lay.addWidget(back)
 
-        title = QLabel("Step 4  ·  Analysis Parameters")
+        title = QLabel("Step 4  ·  Analysis parameters")
         title.setStyleSheet(f"color:{_C_TEXT}; font-size:13px; font-weight:600;")
         top_lay.addWidget(title)
         top_lay.addStretch()
@@ -222,7 +222,7 @@ class ParamsPage(QWidget):
         right_lay.addWidget(_section_label("Optimizer"))
 
         # --- PASTE THIS NEW BLOCK RIGHT HERE ---
-        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn = QPushButton("Reset to defaults")
         reset_btn.setStyleSheet(
             "background: #282b2e; color: #94a3b8; border: 1px solid #3c4247; "
             "padding: 6px; border-radius:3px;"
@@ -259,8 +259,8 @@ class ParamsPage(QWidget):
         right_lay.addWidget(_section_label("Shape function"))
 
         self._cb_order = QComboBox()
-        self._cb_order.addItem("1st order — affine (6 param)", 1)
-        self._cb_order.addItem("2nd order — quadratic (12 param)", 2)
+        self._cb_order.addItem("1st order affine (6 parameters)", 1)
+        self._cb_order.addItem("2nd order quadratic (12 parameters)", 2)
         self._cb_order.setCurrentIndex(
             1 if int(getattr(params, "shape_order", 1)) >= 2 else 0)
         self._cb_order.setFixedWidth(196)
@@ -281,11 +281,11 @@ class ParamsPage(QWidget):
         self._order_note.setVisible(False)
         right_lay.addWidget(self._order_note)
 
-        self._order_probe_btn = QPushButton("Measure cost on my images")
+        self._order_probe_btn = QPushButton("Measure on these images")
         self._order_probe_btn.setFixedHeight(26)
         self._order_probe_btn.setToolTip(
-            "Estimate the extra random error 2nd order would cost on the actual\n"
-            "reference image, and the strain curvature needed to be worth it.")
+            "Estimate the extra random error 2nd order would add on this\n"
+            "reference image, and the strain curvature needed to justify it.")
         self._order_probe_btn.clicked.connect(self._probe_shape_order)
         self._order_probe_btn.setVisible(False)
         right_lay.addWidget(self._order_probe_btn)
@@ -330,7 +330,7 @@ class ParamsPage(QWidget):
         foot_lay.addStretch()
 
         # ── GPU Acceleration Toggle ───────────────────────────────────
-        self._gpu_chk = QPushButton("Use GPU Acceleration (CuPy)")
+        self._gpu_chk = QPushButton("Use GPU acceleration (CuPy)")
         self._gpu_chk.setCheckable(True)
         self._gpu_chk.toggled.connect(lambda *_: self._update_order_note())
         self._gpu_chk.setFixedHeight(32)
@@ -343,7 +343,7 @@ class ParamsPage(QWidget):
                 f"QPushButton:!checked {{ background: transparent; color: {_C_TEXT2}; border: 1px solid {_C_BORDER}; border-radius:3px; padding: 0 12px; }}"
             )
             self._gpu_chk.setToolTip(
-                "CuPy is installed. The NVIDIA device is checked when analysis starts.")
+                "CuPy is installed. The device is checked when analysis starts.")
         else:
             self._gpu_chk.setChecked(False)
             self._gpu_chk.setEnabled(False)
@@ -454,7 +454,7 @@ class ParamsPage(QWidget):
 
         method = getattr(p, "dynamic_roi", "None")
         if method in ("None", None):
-            self._dyn_lbl.setText("Off — every pixel of the ROI is analysed in every frame.")
+            self._dyn_lbl.setText("Off. Every pixel of the ROI is analysed in every frame.")
         else:
             thr = getattr(p, "dynamic_roi_threshold", None)
             thr_txt = "automatic threshold" if thr is None else f"threshold {thr*100:.0f}%"
@@ -464,7 +464,7 @@ class ParamsPage(QWidget):
             extra = ""
             if n_inc or n_exc:
                 extra = f", {n_inc:,} px forced in / {n_exc:,} px forced out"
-            self._dyn_lbl.setText(f"{method} — {thr_txt}{extra}.")
+            self._dyn_lbl.setText(f"{method}, {thr_txt}{extra}.")
 
         if hasattr(self._canvas, "set_subset_radius"):
             self._canvas.set_subset_radius(p.subset_radius)
@@ -507,7 +507,7 @@ class ParamsPage(QWidget):
             point_word = "point" if n_pts == 1 else "points"
             self._strain_warn.setText(
                 f"⚠  {sw} px spans only {n_pts} grid {point_word} at "
-                f"{p.subset_spacing} px spacing — too few to fit a strain plane. "
+                f"{p.subset_spacing} px spacing: too few to fit a strain plane. "
                 f"{eff} px will be used instead.")
             self._strain_warn.setVisible(True)
             self._strain_warn.updateGeometry()
@@ -535,11 +535,11 @@ class ParamsPage(QWidget):
         # keep running first order, so say so rather than let it look applied.
         if self._gpu_chk.isChecked():
             msgs.append("<b style='color:#c2954f;'>GPU solver does not support "
-                        "2nd order</b> — it will run 1st order. Turn off GPU "
+                        "2nd order</b>, so it will run 1st order. Turn off GPU "
                         "acceleration to use it.")
         msgs.append("2nd order lowers systematic error where strain curves "
                     "inside a subset, but roughly doubles random error on a "
-                    "weak pattern. Measure before committing.")
+                    "weak pattern. Measure before choosing it.")
         self._order_note.setText("<br><br>".join(msgs))
 
     def _probe_shape_order(self) -> None:
@@ -562,7 +562,7 @@ class ParamsPage(QWidget):
         pen = r["penalty_px"]
         need = max(0.0, 2.0 * pen / (rad ** 2))
         QMessageBox.information(
-            self, "2nd order — measured cost",
+            self, "Measured cost of 2nd order",
             f"Image noise:            {r['noise_sigma']:.2f} grey levels (8-bit)\n"
             f"Mean gradient in ROI:   {r['mean_gradient']:.2f} grey/px (8-bit)\n"
             f"Usable samples:         {r['valid_samples_order1']} / "
@@ -606,7 +606,7 @@ class ParamsPage(QWidget):
         self._on_param_changed()  # Update the subset counter and dynamic-ROI summary
 
         QMessageBox.information(
-            self, "Defaults Reset",
+            self, "Defaults restored",
             f"Parameters reset to defaults.\n\n"
             f"Radius: {p.subset_radius}\n"
             f"Spacing: {p.subset_spacing}\n"
@@ -620,8 +620,8 @@ class ParamsPage(QWidget):
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self, "Strain origin required",
-                "Draw the strain-origin line/curve inside the ROI. New "
-                "material crossing that region starts at zero accumulated strain.")
+                "Draw the strain-origin line inside the ROI. Material "
+                "crossing it starts at zero accumulated strain.")
             self._wizard.go_roi()
             return
         # Commit every visible control even if it was edited by keyboard and has
