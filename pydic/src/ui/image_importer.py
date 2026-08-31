@@ -97,7 +97,7 @@ class ImageSequenceImporterDialog(QDialog):
         self._play_timer.setSingleShot(True)
         self._play_timer.timeout.connect(self._advance_preview)
 
-        self.setWindowTitle("Load Image Sequence")
+        self.setWindowTitle("Load image sequence")
         self.setMinimumSize(760, 720)
         self.resize(900, 790)
         self.setModal(True)
@@ -187,13 +187,13 @@ class ImageSequenceImporterDialog(QDialog):
         range_grid.addWidget(QLabel("Start position:"), 0, 0)
         self.start_spin = QSpinBox()
         self.start_spin.setToolTip(
-            "Skip images before this zero-based position. The selected start "
-            "is normally the reference frame.")
+            "Skip images before this position; counting starts at 0.\n"
+            "The start image is normally the reference.")
         range_grid.addWidget(self.start_spin, 0, 1)
 
         range_grid.addWidget(QLabel("End position:"), 0, 2)
         self.end_spin = QSpinBox()
-        self.end_spin.setToolTip("Last source image to consider, inclusive.")
+        self.end_spin.setToolTip("Last source image to use, inclusive.")
         range_grid.addWidget(self.end_spin, 0, 3)
 
         range_grid.addWidget(QLabel("Load every:"), 1, 0)
@@ -206,8 +206,8 @@ class ImageSequenceImporterDialog(QDialog):
         range_grid.addWidget(QLabel("Reference position:"), 1, 2)
         self.reference_spin = QSpinBox()
         self.reference_spin.setToolTip(
-            "Position within the sampled sequence. Frames before it are shown "
-            "for choosing the reference, but are not loaded into DIC.")
+            "Position within the sampled sequence. Earlier frames are shown\n"
+            "for choosing the reference but are not analysed.")
         range_grid.addWidget(self.reference_spin, 1, 3)
 
         self.limit_check = QCheckBox("Limit deformed frames to")
@@ -235,7 +235,7 @@ class ImageSequenceImporterDialog(QDialog):
             self._fps_from_meta if self._fps_from_meta is not None else 1.0)
         self.fps_spin.setSuffix(" Hz")
         self.fps_spin.setToolTip(
-            "Rate of the images before the 'Load every' sampling is applied.")
+            "Rate of the source images, before Load every sampling.")
         timing_grid.addWidget(self.fps_spin, 0, 1, 1, 2)
 
         timing_grid.addWidget(QLabel("Pixel size:"), 1, 0)
@@ -263,7 +263,7 @@ class ImageSequenceImporterDialog(QDialog):
         roi_row = QHBoxLayout(roi_group)
         self.roi_edit = QLineEdit()
         self.roi_edit.setReadOnly(True)
-        self.roi_edit.setPlaceholderText("No mask selected — draw the ROI later")
+        self.roi_edit.setPlaceholderText("No mask selected. Draw the ROI later.")
         roi_row.addWidget(self.roi_edit, 1)
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self._browse_roi)

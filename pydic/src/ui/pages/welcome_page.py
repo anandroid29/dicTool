@@ -181,8 +181,8 @@ class WelcomePage(QWidget):
         hero_lay.addWidget(logo)
 
         tagline = QLabel(
-            "A focused digital image correlation workflow for displacement, "
-            "velocity, strain rate, and accumulated strain.")
+            "Digital image correlation for displacement, velocity, strain "
+            "rate and accumulated strain.")
         tagline.setStyleSheet(f"color:{_C_TEXT2}; font-size:13px;")
         tagline.setWordWrap(True)
         hero_lay.addWidget(tagline)
@@ -216,8 +216,7 @@ class WelcomePage(QWidget):
             f"color:{_C_TEXT}; font-size:18px; font-weight:700;")
         body_lay.addWidget(section_title)
         section_copy = QLabel(
-            "Start from a recording, an extracted image sequence, or a saved "
-            "analysis session.")
+            "Start from a recording, an image sequence, or a saved session.")
         section_copy.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
         body_lay.addWidget(section_copy)
 
@@ -329,8 +328,8 @@ class WelcomePage(QWidget):
         if not def_paths:
             QMessageBox.warning(
                 self, "Reference has no following frames",
-                "Choose a reference frame earlier in the extracted sequence. "
-                "Updated-Lagrangian analysis proceeds forward from it.")
+                "Choose a reference frame earlier in the sequence. "
+                "Analysis proceeds forward from it.")
             return
         analysis = self._wizard.analysis
         analysis.calibration = dlg.get_calibration()
@@ -382,13 +381,13 @@ class WelcomePage(QWidget):
                 elif ext in valid_exts:
                     img_files.append(full_path)
         except Exception as e:
-            QMessageBox.critical(self, "Folder Error", f"Could not read folder:\n{e}")
+            QMessageBox.critical(self, "Could not read folder", f"Could not read folder:\n{e}")
             return
 
         img_files.sort()
 
         if len(img_files) < 2:
-            QMessageBox.warning(self, "Not Enough Images", "The folder must contain at least 2 images.")
+            QMessageBox.warning(self, "Not enough images", "The folder must contain at least 2 images.")
             return
 
         # Attempt to read metadata
@@ -427,12 +426,12 @@ class WelcomePage(QWidget):
             # ended before anything else happened to write the settings.
             self._wizard.analysis.save_settings()
         except Exception as e:
-            QMessageBox.critical(self, "Dialog Error", f"Failed to open settings dialog:\n{e}")
+            QMessageBox.critical(self, "Could not open settings", f"Failed to open settings dialog:\n{e}")
             return
 
         if len(selected_paths) < 2:
             QMessageBox.warning(
-                self, "Invalid Selection",
+                self, "Invalid selection",
                 "The selection must contain one reference image and at least "
                 "one deformed image.")
             return
@@ -456,7 +455,7 @@ class WelcomePage(QWidget):
             try:
                 analysis.set_roi_from_file(roi_path)
             except Exception as e:
-                QMessageBox.warning(self, "ROI Load Error", f"Could not load selected ROI mask:\n{e}")
+                QMessageBox.warning(self, "Could not load ROI", f"Could not load selected ROI mask:\n{e}")
 
         self._update_status(ref, defs, analysis.fps)
 
@@ -529,7 +528,7 @@ class WelcomePage(QWidget):
     def _on_hdf5_failed(self, message: str) -> None:
         self._close_hdf5_progress()
         QMessageBox.critical(
-            self, "Load Error", f"Failed to load session:\n{message}")
+            self, "Could not load session", f"Failed to load session:\n{message}")
 
     def _clear_hdf5_loader(self) -> None:
         self._hdf5_worker = None
@@ -544,7 +543,7 @@ class WelcomePage(QWidget):
             time_text = (f"Effective sample rate: {fps:.2f} fps  ·  "
                          f"Δt = {1000/fps:.1f} ms per frame")
         else:
-            time_text = "No fps metadata — strain rate will use Δt = 1 s"
+            time_text = "No frame-rate metadata. Strain rate will use \u0394t = 1 s"
         scale_text = self._wizard.analysis.calibration.describe()
         self._status_fps.setText(f"   {time_text}  ·  {scale_text}")
         self._status_box.setVisible(True)

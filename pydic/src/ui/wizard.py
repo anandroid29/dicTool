@@ -30,7 +30,7 @@ class Wizard(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("PyDIC — Digital Image Correlation")
+        self.setWindowTitle("PyDIC  ·  Digital Image Correlation")
         self.setMinimumSize(1200, 720)
         self.resize(1440, 900)
 
@@ -52,8 +52,8 @@ class Wizard(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Information)
         box.setWindowTitle("Saved settings adjusted")
-        box.setText("Some saved settings could not be used as stored and have "
-                    "been corrected:")
+        box.setText("Some saved settings were invalid and have been "
+                    "corrected:")
         box.setInformativeText("\n\n".join(f"•  {n}" for n in notices))
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
         box.exec()

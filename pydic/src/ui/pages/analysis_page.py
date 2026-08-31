@@ -72,7 +72,7 @@ class AnalysisPage(QWidget):
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(20, 0, 20, 0)
 
-        self._title = QLabel("Step 5  ·  Running Analysis")
+        self._title = QLabel("Step 5  ·  Running analysis")
         self._title.setStyleSheet(f"color:{_C_TEXT}; font-size:13px; font-weight:600;")
         top_lay.addWidget(self._title)
         top_lay.addStretch()
@@ -385,7 +385,7 @@ class AnalysisPage(QWidget):
         self._status_lbl.setText(f"Error: {msg}")
         self._status_lbl.setStyleSheet(f"color:{_C_DANGER}; font-size:12px;")
         from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.critical(self, "Analysis Error", msg)
+        QMessageBox.critical(self, "Analysis failed", msg)
 
     def _cancel(self) -> None:
         self._wizard.analysis.cancel()

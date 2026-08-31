@@ -185,7 +185,7 @@ class VideoImporterDialog(QDialog):
         initial_calibration: Optional[Calibration] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Import Video Frames")
+        self.setWindowTitle("Import video frames")
         self.setMinimumWidth(520)
         self.setModal(True)
         self.setStyleSheet(
@@ -243,11 +243,11 @@ class VideoImporterDialog(QDialog):
         root.setSpacing(12)
 
         # ── Title ──────────────────────────────────────────────────────
-        title = QLabel("Import Video Frames")
+        title = QLabel("Import video frames")
         title.setStyleSheet("color:#e6e8ea; font-size:15px; font-weight:700;")
         root.addWidget(title)
 
-        sub = QLabel("Extract individual frames from a video file for use as DIC images.")
+        sub = QLabel("Extract frames from a video file for use as DIC images.")
         sub.setStyleSheet(_LABEL_DIM)
         sub.setWordWrap(True)
         root.addWidget(sub)
@@ -255,7 +255,7 @@ class VideoImporterDialog(QDialog):
         root.addWidget(self._separator())
 
         # ── Video file ─────────────────────────────────────────────────
-        vgrp = QGroupBox("Video File")
+        vgrp = QGroupBox("Video file")
         vlay = QVBoxLayout(vgrp)
         vlay.setSpacing(6)
 
@@ -331,7 +331,7 @@ class VideoImporterDialog(QDialog):
         self._px_size_spin.setSpecialValueText("— unknown —")
         self._px_size_spin.setStyleSheet(_SPIN)
         self._px_size_spin.setToolTip(
-            "Physical length represented by one source-video pixel.\n"
+            "Physical length of one source-video pixel.\n"
             "Leave at 0 to report displacement in pixels.")
         scale_row.addWidget(self._px_size_spin)
         self._px_unit_combo = QComboBox()
@@ -370,7 +370,7 @@ class VideoImporterDialog(QDialog):
         root.addLayout(scrub_row)
 
         # ── Frame range ────────────────────────────────────────────────
-        rgrp = QGroupBox("Frame Range")
+        rgrp = QGroupBox("Frame range")
         rgrid = QGridLayout(rgrp)
         rgrid.setSpacing(8)
 
@@ -413,7 +413,7 @@ class VideoImporterDialog(QDialog):
         root.addWidget(rgrp)
 
         # ── Reference frame ────────────────────────────────────────────
-        ref_grp = QGroupBox("Reference Frame")
+        ref_grp = QGroupBox("Reference frame")
         ref_lay = QHBoxLayout(ref_grp)
         ref_lay.setSpacing(8)
         ref_lbl = QLabel("Use extracted frame #")
@@ -438,7 +438,7 @@ class VideoImporterDialog(QDialog):
         out_lbl.setStyleSheet(_LABEL_DIM)
         out_row.addWidget(out_lbl)
         self._out_edit = QLineEdit()
-        self._out_edit.setPlaceholderText("(auto — temp folder next to video)")
+        self._out_edit.setPlaceholderText("Auto: temporary folder beside the video")
         out_row.addWidget(self._out_edit, 1)
         btn_out = QPushButton("…")
         btn_out.setFixedWidth(28)
@@ -476,7 +476,7 @@ class VideoImporterDialog(QDialog):
         self._cancel_btn.clicked.connect(self._on_cancel)
         btn_row.addWidget(self._cancel_btn)
 
-        self._extract_btn = QPushButton("Extract Frames")
+        self._extract_btn = QPushButton("Extract frames")
         self._extract_btn.setStyleSheet(_BTN_ACCENT)
         self._extract_btn.setEnabled(False)
         self._extract_btn.clicked.connect(self._start_extraction)
@@ -586,7 +586,7 @@ class VideoImporterDialog(QDialog):
         step = self._step_spin.value()
 
         if e < s:
-            self._count_lbl.setText("Invalid range (End < Start)")
+            self._count_lbl.setText("Invalid range: end is before start")
             self._count_lbl.setStyleSheet("color:#bf6259; font-size:11px;")  # Red warning
             self._ref_spin.setMaximum(0)
             if hasattr(self, '_extract_btn'):
@@ -628,7 +628,7 @@ class VideoImporterDialog(QDialog):
         if self._video_path and container > 0:
             ratio = self._capture_fps_spin.value() / container
             if ratio > 1.01:
-                txt += f"   (file plays back at {container:.2f} fps — {ratio:.4g}× slow motion)"
+                txt += f"   (file plays back at {container:.2f} fps, {ratio:.4g}\u00d7 slow motion)"
             elif ratio < 0.99:
                 txt += f"   (file reports {container:.2f} fps)"
         note.setText(txt)
@@ -671,7 +671,7 @@ class VideoImporterDialog(QDialog):
 
         if os.path.isdir(out) and os.listdir(out):
             ans = QMessageBox.question(
-                self, "Output folder not empty",
+                self, "Output folder is not empty",
                 f"The folder already contains files:\n{out}\n\n"
                 "Existing PNG files will be overwritten. Continue?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -719,7 +719,7 @@ class VideoImporterDialog(QDialog):
             self._ref_spin.value(), len(paths) - 1
         )
         self._extract_status.setText(
-            f"Done — {len(paths)} frames saved."
+            f"Done. {len(paths)} frames saved."
         )
 
         try:
@@ -747,7 +747,7 @@ class VideoImporterDialog(QDialog):
         self._progress.setVisible(False)
         self._extract_status.setVisible(False)
         self._extract_btn.setEnabled(True)
-        QMessageBox.critical(self, "Extraction Error", msg)
+        QMessageBox.critical(self, "Extraction failed", msg)
 
     def _on_cancel(self) -> None:
         if self._worker:

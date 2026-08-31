@@ -62,7 +62,7 @@ class FramePairDialog(QDialog):
                  existing_mode: str = "custom",
                  parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Smoothed Frame-Pair Sequence")
+        self.setWindowTitle("Smoothed frame-pair sequence")
         self.setMinimumWidth(520)
         self.setModal(True)
         self.setStyleSheet(
@@ -103,8 +103,8 @@ class FramePairDialog(QDialog):
 
         sub = QLabel(
             "Each pair becomes one item on the Results timeline. A wider pair "
-            "averages motion over a longer interval, reducing frame-to-frame "
-            "noise. Green–Lagrange strain is recomputed from that pair's composed "
+            "averages motion over a longer interval, which reduces frame-to-frame "
+            "noise. Green-Lagrange strain is recomputed from the pair's composed "
             "displacement rather than copied from either endpoint."
         )
         sub.setWordWrap(True)
@@ -174,7 +174,7 @@ class FramePairDialog(QDialog):
         self._bulk_span.setValue(1)
         self._bulk_span.setToolTip(
             "Frames between the two ends of each pair.\n"
-            "1 pairs every frame with the next one.")
+            "1 pairs every frame with the next.")
         self._bulk_span.setStyleSheet(_SPIN)
         bg.addWidget(self._bulk_span, 0, 5)
 
@@ -207,8 +207,8 @@ class FramePairDialog(QDialog):
         self._strain_window.setSuffix(" px")
         self._strain_window.setStyleSheet(_SPIN)
         self._strain_window.setToolTip(
-            "Spatial least-squares radius used only when recomputing strain for\n"
-            "this temporal pair sequence. It does not alter single-frame strain.")
+            "Least-squares radius used when recomputing strain for this pair\n"
+            "sequence. Single-frame strain is unaffected.")
         self._strain_window.valueChanged.connect(self._sync_strain_note)
         sg.addWidget(self._strain_window, 0, 1)
         self._strain_note = QLabel("")
@@ -334,7 +334,8 @@ class FramePairDialog(QDialog):
         if added == 0:
             QMessageBox.information(
                 self, "PyDIC",
-                "No new pairs — that range and span produced nothing not already listed.")
+                "No new pairs. That range and span produced nothing that is not "
+            "already listed.")
             return
         self._sequence_mode = (
             "sliding" if overlap else "non_overlapping") if was_empty else "custom"

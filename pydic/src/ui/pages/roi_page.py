@@ -79,7 +79,7 @@ class ROIPage(QWidget):
         back.clicked.connect(self._wizard.go_welcome)
         top_lay.addWidget(back)
 
-        title = QLabel("Step 2  ·  Define Region of Interest")
+        title = QLabel("Step 2  ·  Region of interest")
         title.setStyleSheet(f"color:{_C_TEXT}; font-size:13px; font-weight:600;")
         top_lay.addWidget(title)
 
@@ -88,9 +88,9 @@ class ROIPage(QWidget):
         start_lbl = QLabel("Strain zero frame")
         start_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
         start_lbl.setToolTip(
-            "Accumulated strain is zero on this full-sequence frame.\n"
-            "The canvas displays this frame while you draw the ROI and the\n"
-            "origin line/curve that continuously seeds new material paths.")
+            "Accumulated strain is zero on this frame. It stays on the\n"
+            "canvas while you draw the ROI and the origin line that\n"
+            "seeds new material paths.")
         top_lay.addWidget(start_lbl)
 
         self._strain_start_spin = QSpinBox()
@@ -216,7 +216,7 @@ class ROIPage(QWidget):
 
         # Clear button
         clr_btn = QPushButton("⟳")
-        clr_btn.setToolTip("Clear the mask currently being edited")
+        clr_btn.setToolTip("Clear the mask being edited.")
         clr_btn.setFixedSize(44, 36)
         clr_btn.clicked.connect(self._clear_active_mask)
         clr_btn.setStyleSheet(
@@ -253,22 +253,22 @@ class ROIPage(QWidget):
         foot_lay = QHBoxLayout(footer)
         foot_lay.setContentsMargins(20, 0, 20, 0)
 
-        full_btn = QPushButton("Use Full Image")
+        full_btn = QPushButton("Use full image")
         full_btn.setFixedWidth(130)
         full_btn.clicked.connect(self._use_full)
         foot_lay.addWidget(full_btn)
 
         # ────────Reset Zoom Button ────────────────────────────────────
-        self._reset_view_btn = QPushButton("Reset Zoom")
+        self._reset_view_btn = QPushButton("Reset zoom")
         self._reset_view_btn.setFixedWidth(110)
         self._reset_view_btn.clicked.connect(self._canvas.fit_image)
         foot_lay.addWidget(self._reset_view_btn)
         # ──────────────────────────────────────────────────────────────
 
-        load_btn = QPushButton("Load ROI from File")
+        load_btn = QPushButton("Load ROI from file")
         load_btn.setFixedWidth(180)
         load_btn.setToolTip(
-            "Load a pre-defined ROI mask from:\n"
+            "Load an ROI mask from:\n"
             "  • PNG / TIF / JPG image  (white = ROI)\n"
             "  • NumPy .npy array\n"
             "  • Ncorr .mat / .h5 file"
@@ -289,16 +289,16 @@ class ROIPage(QWidget):
         self._cb_dynamic.addItems(["None", "Contrast", "Edge Detection", "Hybrid"])
         self._cb_dynamic.setFixedWidth(134)
         self._cb_dynamic.setToolTip(
-            "Per-frame texture masking, applied INSIDE the ROI you drew.\n"
-            "Useful for cutting experiments where material leaves the field.\n\n"
-            "Anything other than None adds a tuning step where you can set the\n"
-            "threshold and force regions in or out by hand.")
+            "Per-frame texture masking, applied inside the ROI you drew.\n"
+            "Useful when material leaves the field, as in cutting tests.\n\n"
+            "Any setting other than None adds a tuning step for the\n"
+            "threshold and for forcing regions in or out by hand.")
         self._cb_dynamic.currentTextChanged.connect(self._on_dynamic_changed)
         foot_lay.addWidget(self._cb_dynamic)
 
         foot_lay.addSpacing(18)
 
-        self._seed_status = QLabel("No seed — will default to ROI centroid")
+        self._seed_status = QLabel("No seed. Defaults to the ROI centroid.")
         self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
         foot_lay.addWidget(self._seed_status)
 
@@ -316,7 +316,7 @@ class ROIPage(QWidget):
         # drawing tool. Keep it full-sized and at the extreme bottom-right.
         self._finish_line_btn = FooterButton("Done")
         self._finish_line_btn.setToolTip(
-            "Finish and save the current strain-origin line/curve")
+            "Finish and save the strain-origin line")
         self._finish_line_btn.setFixedHeight(38)
         self._finish_line_btn.setMinimumWidth(120)
         self._finish_line_btn.setVisible(False)
@@ -400,7 +400,7 @@ class ROIPage(QWidget):
     def _finish_strain_line(self) -> None:
         if not self._canvas.finish_active_shape():
             QMessageBox.information(
-                self, "Finish strain-origin line",
+                self, "Unfinished strain-origin line",
                 "Draw at least two points, then press Done.")
             return
         # Stay ready to add another disconnected inlet segment if needed.
@@ -493,7 +493,7 @@ class ROIPage(QWidget):
             self._seed_status.setText(f"Seed: ({sx}, {sy})")
             self._seed_status.setStyleSheet("color:#6a9c74; font-size:11px;")
         else:
-            self._seed_status.setText("No seed — will default to ROI centroid")
+            self._seed_status.setText("No seed. Defaults to the ROI centroid.")
             self._seed_status.setStyleSheet("color:#94a3b8; font-size:11px;")
 
         # Hide the subset radius square/circle on the ROI page
@@ -508,7 +508,7 @@ class ROIPage(QWidget):
         else:
             self._wizard.analysis.clear_roi()
             self._wizard.seed_xy = None
-            self._seed_status.setText("No seed — will default to ROI centroid")
+            self._seed_status.setText("No seed. Defaults to the ROI centroid.")
             self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
         self._refresh_mask_status()
 
@@ -542,7 +542,7 @@ class ROIPage(QWidget):
             if not (0 <= sy < h and 0 <= sx < w) or not mask[sy, sx]:
                 self._wizard.seed_xy = None
                 self._canvas.set_seed_xy(None)
-                self._seed_status.setText("No seed — will default to ROI centroid")
+                self._seed_status.setText("No seed. Defaults to the ROI centroid.")
                 self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
 
     def _on_seed_placed(self, x: int, y: int) -> None:
@@ -550,7 +550,7 @@ class ROIPage(QWidget):
         # undo emits that when the region containing the seed is restored away.
         if x < 0 or y < 0:
             self._wizard.seed_xy = None
-            self._seed_status.setText("No seed — will default to ROI centroid")
+            self._seed_status.setText("No seed. Defaults to the ROI centroid.")
             self._seed_status.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
             return
         self._wizard.seed_xy = (x, y)
@@ -600,6 +600,6 @@ class ROIPage(QWidget):
                 self._refresh_mask_status()
         except Exception as exc:
             QMessageBox.critical(
-                self, "ROI Load Error",
+                self, "Could not load ROI",
                 f"Could not load ROI from:\n{path}\n\n{exc}"
             )
