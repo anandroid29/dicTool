@@ -37,7 +37,6 @@ _C_DISABLED = "#3f4a5c"
 
 CONTENTS = [("Result field", "field"),
             ("Raw frame", "image"),
-            ("Streaklines only", "streaklines"),
             ("Empty", "empty")]
 
 
@@ -79,8 +78,7 @@ class _PanelEditor(QWidget):
 
         self.streaks = QCheckBox("Overlay streaklines")
         self.streaks.setToolTip(
-            "Draw the marker trajectories over this panel.\n"
-            "Always on for a Streaklines only panel.")
+            "Draw the marker trajectories over this result or raw-frame panel.")
         lay.addWidget(self.streaks, 1, 2, 1, 2)
 
         # Background and its colour picker sit together: the picker only applies
@@ -172,8 +170,8 @@ class _PanelEditor(QWidget):
     def _sync_enabled(self, *_):
         """Show only the controls that do something for the chosen content.
 
-        Irrelevant controls are HIDDEN, not greyed. A raw-frame or streaklines
-        panel has no field, so field / colormap / colour range / symmetric /
+        Irrelevant controls are HIDDEN, not greyed. A raw-frame panel has no
+        field, so field / colormap / colour range / symmetric /
         colourbar mean nothing there; leaving them on screen greyed still makes
         the panel look like it has settings you failed to reach. The grid rows
         collapse when every widget in them is hidden, so each panel shrinks to
@@ -201,12 +199,10 @@ class _PanelEditor(QWidget):
         # rather than leaving a permanently dead button on screen.
         self.colour_btn.setVisible(draws and self.background.currentText() == "Solid colour")
 
-        # A streaklines-only panel is nothing but trajectories, so the toggle is
-        # redundant there; an empty panel draws nothing at all.
+        # Result and raw-frame panels can both carry trajectories; an empty
+        # panel draws nothing at all.
         self.streaks.setVisible(kind in ("field", "image"))
-        if kind == "streaklines":
-            self.streaks.setChecked(True)
-        elif not draws:
+        if not draws:
             self.streaks.setChecked(False)
 
     def spec(self) -> PanelSpec:
@@ -230,7 +226,7 @@ class _PanelEditor(QWidget):
 class VideoExportDialog(QDialog):
     def __init__(self, fields: dict, cmaps: List[str], n_frames: int,
                  current_field: str, current_cmap: str, fps: float = 25.0,
-                 parent=None):
+                 parent=None, source_size: tuple[int, int] | None = None):
         super().__init__(parent)
         self.setWindowTitle("Export video")
         self.setMinimumWidth(760)
@@ -257,8 +253,11 @@ class VideoExportDialog(QDialog):
         gl.addWidget(self.cols, 0, 3)
 
         gl.addWidget(QLabel("Cell size"), 0, 4)
-        self.cell_w = QSpinBox(); self.cell_w.setRange(120, 4096); self.cell_w.setValue(640)
-        self.cell_h = QSpinBox(); self.cell_h.setRange(120, 4096); self.cell_h.setValue(480)
+        source_w, source_h = source_size or (640, 480)
+        self.cell_w = QSpinBox(); self.cell_w.setRange(1, 16384); self.cell_w.setValue(int(source_w))
+        self.cell_h = QSpinBox(); self.cell_h.setRange(1, 16384); self.cell_h.setValue(int(source_h))
+        self.cell_w.setToolTip("Output width of each cell; defaults to the source frame width.")
+        self.cell_h.setToolTip("Output height of each cell; defaults to the source frame height.")
         gl.addWidget(self.cell_w, 0, 5)
         gl.addWidget(self.cell_h, 0, 6)
 
@@ -337,10 +336,8 @@ class VideoExportDialog(QDialog):
             # raw frame so a new grid is immediately meaningful.
             e = _PanelEditor(i, self._fields, self._cmaps,
                              self._current_field, self._current_cmap)
-            if i == 1:
+            if i > 0:
                 e.content.setCurrentIndex(1)       # Raw frame
-            elif i == 2:
-                e.content.setCurrentIndex(2)       # Streaklines only
             e.background.currentTextChanged.connect(self._update_hint)
             self._editors.append(e)
             self._panel_lay.addWidget(e)

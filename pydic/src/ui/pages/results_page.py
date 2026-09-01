@@ -299,6 +299,40 @@ class _PairTask(QRunnable):
                 self._generation, self._index, None, str(exc))
 
 
+class _TrajectoryTaskSignals(QObject):
+    done = pyqtSignal(int, object, object, str)
+
+
+class _TrajectoryTask(QRunnable):
+    """Trace markers without blocking Qt's event loop."""
+
+    def __init__(self, analysis, request_id: int, key, seeds, endpoint: int,
+                 trail: int) -> None:
+        super().__init__()
+        self.signals = _TrajectoryTaskSignals()
+        self.analysis = analysis
+        self.request_id = int(request_id)
+        self.key = key
+        self.seeds = list(seeds)
+        self.endpoint = int(endpoint)
+        self.trail = int(trail)
+
+    def run(self) -> None:
+        try:
+            trajectories = self.analysis.get_trajectories_from_seeds(
+                self.seeds, self.endpoint, self.trail)
+            draw_points = [
+                (tr["points"][-1]
+                 if tr["lost_at"] is None and tr["points"] else None)
+                for tr in trajectories]
+            self.signals.done.emit(
+                self.request_id, self.key,
+                (trajectories, draw_points), "")
+        except Exception as exc:
+            self.signals.done.emit(
+                self.request_id, self.key, None, str(exc))
+
+
 class _TemporalHistorySignals(QObject):
     progress = pyqtSignal(int, int, str)
     item_ready = pyqtSignal(int, int)
@@ -477,6 +511,11 @@ class ResultsPage(QWidget):
         # makes playback with streaklines on unusable.
         self._traj_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._TRAJ_CACHE_MAX = 64
+        self._traj_request_id = 0
+        self._traj_tasks: dict[int, _TrajectoryTask] = {}
+        self._traj_active_request: Optional[int] = None
+        self._traj_pending = None
+        self._traj_latest_key = None
         self._play_timer = QTimer(self)
         self._play_timer.setSingleShot(True)
         self._play_timer.setInterval(200)
@@ -629,7 +668,8 @@ class ResultsPage(QWidget):
             self._trail_combo.addItem(f"{n} frames", n)
         self._trail_combo.setToolTip("How much trajectory history to draw.")
         self._trail_combo.setFixedWidth(96)
-        self._trail_combo.currentIndexChanged.connect(self._refresh_overlay)
+        self._trail_combo.currentIndexChanged.connect(
+            lambda _index: self._render_trajectories(self._frame))
         top_lay.addWidget(self._trail_combo)
 
         for w in (self._place_btn, self._marker_count_lbl, self._clear_markers_btn,
@@ -753,7 +793,7 @@ class ResultsPage(QWidget):
         )
         sb_lay = QVBoxLayout(sidebar)
         sb_lay.setContentsMargins(16, 20, 16, 20)
-        sb_lay.setSpacing(14)
+        sb_lay.setSpacing(10)
 
         # Stats
         stats_head_row = QHBoxLayout()
@@ -776,7 +816,11 @@ class ResultsPage(QWidget):
         # Showing both means a disagreement between them is visible, and that
         # disagreement is the signal that the field contains outliers.
         self._stat_labels: dict[str, QLabel] = {}
-        for stat, tip in (
+        stats_grid = QGridLayout()
+        stats_grid.setContentsMargins(0, 0, 0, 0)
+        stats_grid.setHorizontalSpacing(8)
+        stats_grid.setVerticalSpacing(3)
+        stat_items = (
             ("Mean",    "Arithmetic mean. One decorrelated subset can shift "
                         "it without bound."),
             ("Median",  "Middle value, unaffected by a minority of bad points.\n"
@@ -790,23 +834,30 @@ class ResultsPage(QWidget):
                         "Compare with P1–P99 to see how far the tails reach."),
             ("Points",  "Number of correlated subsets contributing to these\n"
                         "statistics."),
-        ):
-            row = QHBoxLayout()
+        )
+        for index, (stat, tip) in enumerate(stat_items):
+            cell = QWidget()
+            row = QHBoxLayout(cell)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(3)
             k_lbl = QLabel(stat + ":")
-            k_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:11px;")
-            k_lbl.setFixedWidth(58)
+            k_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:9px;")
             k_lbl.setToolTip(tip)
             row.addWidget(k_lbl)
             v_lbl = QLabel("—")
             v_lbl.setStyleSheet(
-                f"color:{_C_TEXT}; font-size:11px; "
+                f"color:{_C_TEXT}; font-size:10px; "
                 f"font-family:'Fira Code','Cascadia Code',monospace;"
             )
             v_lbl.setToolTip(tip)
             v_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             row.addWidget(v_lbl, 1)
-            sb_lay.addLayout(row)
+            if index < 4:
+                stats_grid.addWidget(cell, index // 2, index % 2)
+            else:
+                stats_grid.addWidget(cell, index - 2, 0, 1, 2)
             self._stat_labels[stat] = v_lbl
+        sb_lay.addLayout(stats_grid)
 
         # ── Value probe ───────────────────────────────────────────────
         # Reading a number off a colourbar is an estimate. This reports the
@@ -843,11 +894,24 @@ class ResultsPage(QWidget):
         sb_lay.addWidget(self._sep())
 
         # Export
-        exp_hdr = QLabel("EXPORT")
+        exp_hdr = QLabel("EXPORT OPTIONS")
         exp_hdr.setStyleSheet(
             f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;"
         )
         sb_lay.addWidget(exp_hdr)
+
+        export_actions = QWidget()
+        export_lay = QVBoxLayout(export_actions)
+        export_lay.setContentsMargins(0, 0, 0, 0)
+        export_lay.setSpacing(0)
+        for label, slot in [("CSV (this frame)", self._export_csv),
+                            ("HDF5 (all frames)", self._export_hdf5),
+                            ("Video / image sequence…", self._export_video)]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(34)
+            btn.clicked.connect(slot)
+            export_lay.addWidget(btn)
+        sb_lay.addWidget(export_actions)
 
         # ── Marker panel (visible only while Streaklines is on) ──
         self._marker_panel = QWidget()
@@ -900,15 +964,14 @@ class ResultsPage(QWidget):
         mp_lay.addWidget(self._marker_csv_btn)
 
         self._marker_panel.setVisible(False)
-        sb_lay.addWidget(self._marker_panel)
 
         # ── Smoothed frame-pair sequence ────────────────────────────
-        pair_hdr = QLabel("FRAME PAIRS")
+        pair_hdr = QLabel("TEMPORAL SEQUENCE")
         pair_hdr.setStyleSheet(
             f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;")
         sb_lay.addWidget(pair_hdr)
 
-        self._pair_btn = QPushButton("Smoothed pair sequence…")
+        self._pair_btn = QPushButton("Create temporal sequence…")
         self._pair_btn.setFixedHeight(30)
         self._pair_btn.setToolTip(
             "Build a playable sequence of longer frame intervals. Each one\n"
@@ -923,7 +986,6 @@ class ResultsPage(QWidget):
             f"color:{_C_SUCCESS}; font-size:10px; background:{_C_CARD};"
             f" border:1px solid {_C_SUCCESS}; border-radius:3px; padding:6px;")
         self._pair_banner.setVisible(False)
-        sb_lay.addWidget(self._pair_banner)
 
         self._pair_exit_btn = QPushButton("← Back to single frames")
         self._pair_exit_btn.setFixedHeight(26)
@@ -946,15 +1008,10 @@ class ResultsPage(QWidget):
         self._pair_clear_btn.setVisible(False)
         sb_lay.addWidget(self._pair_clear_btn)
 
-        sb_lay.addWidget(self._sep())
-
-        for label, slot in [("CSV (this frame)", self._export_csv),
-                             ("HDF5 (all frames)", self._export_hdf5),
-                             ("Video / image sequence…", self._export_video)]:
-            btn = QPushButton(label)
-            btn.setFixedHeight(30)
-            btn.clicked.connect(slot)
-            sb_lay.addWidget(btn)
+        # Marker controls belong after the temporal controls: trajectories can
+        # be used in either timeline, while the temporal sequence determines
+        # which underlying endpoint a marker is drawn at.
+        sb_lay.addWidget(self._marker_panel)
 
         self._export_progress = QProgressBar()
         self._export_progress.setFixedHeight(24)
@@ -1108,7 +1165,11 @@ class ResultsPage(QWidget):
         if not on:
             self._place_btn.setChecked(False)
             self._canvas.set_marker_mode(False)
-        self._refresh_overlay()
+        # Toggling trajectories does not change the field or background. A full
+        # overlay refresh can scan a lazy long-sequence HDF5 global range and
+        # can also enqueue a temporal pair, all on what should be a cheap UI
+        # action. Update only the trajectory layer.
+        self._render_trajectories(self._frame)
 
     def _on_place_toggled(self, on: bool) -> None:
         self._canvas.set_marker_mode(on)
@@ -1126,7 +1187,8 @@ class ResultsPage(QWidget):
         analysis = self._wizard.analysis
         if not analysis.results:
             return
-        mapped = analysis.reference_from_current(x, y, self._frame)
+        mapped = analysis.reference_from_current(
+            x, y, self._trajectory_source_index(self._frame))
         if mapped is None:
             QMessageBox.information(self, "No data",
                                     "This frame has no valid correlation data.")
@@ -1144,7 +1206,9 @@ class ResultsPage(QWidget):
         n = len(pts)
         self._marker_count_lbl.setText("1 marker" if n == 1 else f"{n} markers")
         self._rebuild_marker_list()
-        self._refresh_overlay()
+        # Marker edits only affect the trajectory layer. In particular, avoid
+        # rerunning the (potentially lazy HDF5-backed) field overlay pipeline.
+        self._render_trajectories(self._frame)
 
     def _clear_markers(self) -> None:
         self._canvas.clear_markers()
@@ -1176,13 +1240,11 @@ class ResultsPage(QWidget):
         self._marker_hint.setVisible(True)
         self._marker_count_lbl.setText("0 markers")
 
-    def _rebuild_marker_list(self) -> None:
+    def _rebuild_marker_list(self, trajs=None) -> None:
         self._marker_list.blockSignals(True)
         self._marker_list.clear()
-        analysis = self._wizard.analysis
         pts = self._canvas.markers
-        trail = self._trail_combo.currentData() or 0
-        trajs = analysis.get_trajectories_from_seeds(pts, self._frame, trail) if pts else []
+        trajs = trajs or []
         for i, (x, y) in enumerate(pts):
             if i < len(trajs) and trajs[i]["lost_at"] is not None:
                 status = f"lost @ frame {trajs[i]['lost_at']}"
@@ -1203,22 +1265,83 @@ class ResultsPage(QWidget):
     def _render_trajectories(self, idx: int) -> None:
         analysis = self._wizard.analysis
         if not self._streak_chk.isChecked():
+            self._traj_latest_key = None
+            self._traj_pending = None
             self._canvas.set_streaklines(None)
-            self._canvas.set_markers([])
+            self._canvas.set_marker_draw_positions([])
             return
         pts = self._canvas.markers
         if not pts:
+            self._traj_latest_key = None
+            self._traj_pending = None
             self._canvas.set_marker_draw_positions([])
             self._canvas.set_streaklines(None)
             return
         trail = self._trail_combo.currentData() or 0
-        trajs, draw_pts = self._cached_trajectories(pts, idx, trail)
+        source = self._trajectory_source_index(idx)
+        marker_key = tuple((round(x, 3), round(y, 3)) for x, y in pts)
+        results = analysis.results
+        result_token = (id(analysis), len(results),
+                        id(results[0]) if results else 0,
+                        id(results[-1]) if results else 0)
+        key = (result_token, source, int(trail), marker_key)
+        self._traj_latest_key = key
+        hit = self._traj_cache.get(key)
+        if hit is not None:
+            self._traj_cache.move_to_end(key)
+            self._apply_trajectory_result(*hit)
+            return
+
+        self._traj_request_id += 1
+        request = (self._traj_request_id, key, list(pts), source, int(trail))
+        if self._traj_active_request is not None:
+            # Playback may request many frames faster than one trace completes.
+            # Keep only the newest request instead of building a work queue.
+            self._traj_pending = request
+            return
+        self._start_trajectory_task(request)
+
+    def _start_trajectory_task(self, request) -> None:
+        request_id, key, pts, source, trail = request
+        task = _TrajectoryTask(
+            self._wizard.analysis, request_id, key, pts, source, trail)
+        task.signals.done.connect(self._on_trajectory_ready)
+        self._traj_tasks[request_id] = task
+        self._traj_active_request = request_id
+        self._pair_pool.start(task)
+
+    def _apply_trajectory_result(self, trajs, draw_pts) -> None:
         self._canvas.set_marker_draw_positions(draw_pts)
         self._canvas.set_streaklines(
             [t["points"] for t in trajs],
             colors=[marker_color(i) for i in range(len(trajs))],
             lost_flags=[t["lost_at"] is not None for t in trajs],
         )
+        self._rebuild_marker_list(trajs)
+
+    @pyqtSlot(int, object, object, str)
+    def _on_trajectory_ready(self, request_id: int, key, value, error: str) -> None:
+        self._traj_tasks.pop(request_id, None)
+        if self._traj_active_request == request_id:
+            self._traj_active_request = None
+        if value is not None:
+            self._traj_cache[key] = value
+            self._traj_cache.move_to_end(key)
+            while len(self._traj_cache) > self._TRAJ_CACHE_MAX:
+                self._traj_cache.popitem(last=False)
+            if key == self._traj_latest_key and self._streak_chk.isChecked():
+                self._apply_trajectory_result(*value)
+        elif error:
+            print(f"Trajectory calculation failed: {error}")
+
+        pending = self._traj_pending
+        self._traj_pending = None
+        if pending is not None and pending[1] == self._traj_latest_key:
+            hit = self._traj_cache.get(pending[1])
+            if hit is not None:
+                self._apply_trajectory_result(*hit)
+            else:
+                self._start_trajectory_task(pending)
 
     def on_before_show(self) -> None:
         """Cheap synchronous blanking so no stale frame is ever painted."""
@@ -1324,23 +1447,37 @@ class ResultsPage(QWidget):
         return img
 
     def _cached_trajectories(self, pts, idx: int, trail: int):
-        """Marker trajectories, from cache when the inputs are unchanged.
-
-        Keyed on the marker positions themselves, so moving, adding or removing
-        a marker misses the cache rather than redrawing the previous paths.
-        """
-        key = (idx, trail, tuple((round(x, 3), round(y, 3)) for x, y in pts))
+        """Synchronous cache used by exports/tests; interactive drawing is async."""
+        source = self._trajectory_source_index(idx)
+        marker_key = tuple((round(x, 3), round(y, 3)) for x, y in pts)
+        analysis = self._wizard.analysis
+        results = analysis.results
+        result_token = (id(analysis), len(results),
+                        id(results[0]) if results else 0,
+                        id(results[-1]) if results else 0)
+        key = (result_token, source, int(trail), marker_key)
         hit = self._traj_cache.get(key)
         if hit is not None:
             self._traj_cache.move_to_end(key)
             return hit
-        analysis = self._wizard.analysis
-        trajs = analysis.get_trajectories_from_seeds(pts, idx, trail)
-        value = (trajs, analysis.marker_positions(pts, idx))
+        trajectories = analysis.get_trajectories_from_seeds(
+            pts, source, int(trail))
+        draw_points = [
+            (tr["points"][-1]
+             if tr["lost_at"] is None and tr["points"] else None)
+            for tr in trajectories]
+        value = (trajectories, draw_points)
         self._traj_cache[key] = value
         while len(self._traj_cache) > self._TRAJ_CACHE_MAX:
             self._traj_cache.popitem(last=False)
         return value
+
+    def _trajectory_source_index(self, idx: int) -> int:
+        """Underlying single-frame endpoint represented by this timeline item."""
+        if self._pair_mode and self._pair_list:
+            idx = max(0, min(int(idx), len(self._pair_list) - 1))
+            return int(self._pair_list[idx][1])
+        return max(0, min(int(idx), len(self._wizard.analysis.results) - 1))
 
     def _invalidate_caches(self) -> None:
         """Drop cached frames and trajectories.
@@ -1351,6 +1488,9 @@ class ResultsPage(QWidget):
         """
         self._img_cache.clear()
         self._traj_cache.clear()
+        self._traj_request_id += 1
+        self._traj_latest_key = None
+        self._traj_pending = None
         self._pair_cache.clear()
 
     def _show_frame(self, idx: int) -> None:
@@ -1631,7 +1771,7 @@ class ResultsPage(QWidget):
         skewed = (np.isfinite(iqr) and iqr > 0 and
                   abs(summary["mean"] - summary["median"]) > 0.5 * iqr)
         self._stat_labels["Mean"].setStyleSheet(
-            f"color:{_C_WARN if skewed else _C_TEXT}; font-size:11px; "
+            f"color:{_C_WARN if skewed else _C_TEXT}; font-size:10px; "
             f"font-family:'Fira Code','Cascadia Code',monospace;")
         self._stat_labels["Mean"].setToolTip(
             "Mean and median differ by more than half the interquartile "
@@ -1835,10 +1975,16 @@ class ResultsPage(QWidget):
             self._play_btn.setChecked(False)
             self._toggle_play(False)
         self._pair_frame_before_single = self._frame
+        endpoint = (self._pair_list[self._frame][1]
+                    if self._pair_list and 0 <= self._frame < len(self._pair_list)
+                    else self._single_frame_before_pairs)
         self._pair_mode = False
         self._pair_avg = None
         n = len(self._wizard.analysis.results)
-        restored = max(0, min(self._single_frame_before_pairs, max(0, n - 1)))
+        # "Back to single frames" now shows the single frame whose image was
+        # already under the current temporal result instead of jumping to the
+        # unrelated frame that happened to be open before temporal mode.
+        restored = max(0, min(endpoint, max(0, n - 1)))
         self._slider.blockSignals(True)
         self._slider.setMaximum(max(0, n - 1))
         self._slider.setValue(restored)
@@ -1860,7 +2006,9 @@ class ResultsPage(QWidget):
     def _sync_pair_ui(self) -> None:
         """Show pair-sequence state while keeping its timeline interactive."""
         active = self._pair_mode
-        self._pair_banner.setVisible(active)
+        # Detailed green status card duplicated the timeline label and consumed
+        # most of the sidebar on long sequences.
+        self._pair_banner.setVisible(False)
         self._pair_exit_btn.setVisible(active)
         self._pair_clear_btn.setVisible(bool(self._pair_list))
         self._scale_global_rb.setText("Pair-fixed" if active else "Global")
@@ -1870,9 +2018,9 @@ class ResultsPage(QWidget):
             if active else
             "Fix the scale to the min/max across the whole sequence.")
         self._pair_btn.setText(
-            "Edit pair sequence…" if active else
+            "Edit temporal sequence…" if active else
             ("Return to temporal sequence" if self._pair_list else
-             "Smoothed pair sequence…"))
+             "Create temporal sequence…"))
 
         if active:
             n = len(self._pair_list)
@@ -2263,6 +2411,7 @@ class ResultsPage(QWidget):
             self._frame_lbl.setText(
                 f"Calculating pair {self._frame + 1} / {len(self._pair_list)}"
                 f"   ·   {a + 1}→{b + 1}…")
+            self._render_trajectories(self._frame)
             return
         self._render_pair_result(self._frame, res)
         self._prefetch_pair_neighbors(self._frame)
@@ -2286,8 +2435,7 @@ class ResultsPage(QWidget):
         else:
             self._canvas.set_result_overlay_rgba(None)
 
-        self._canvas.set_streaklines(None)
-        self._canvas.set_markers([])
+        self._render_trajectories(index)
 
         self._update_stats(res)
         n = len(self._pair_list)
@@ -2427,9 +2575,14 @@ class ResultsPage(QWidget):
         export_count = (len(self._pair_list) if temporal_export
                         else len(analysis.results))
 
-        dlg = VideoExportDialog(FIELDS, CMAPS, export_count,
-                                self._field, self._cmap_combo.currentText(),
-                                fps=float(self._fps_spin.value()), parent=self)
+        shape = analysis._ref_shape
+        source_size = ((int(shape[1]), int(shape[0]))
+                       if shape is not None else None)
+        dlg = VideoExportDialog(
+            FIELDS, CMAPS, export_count,
+            self._field, self._cmap_combo.currentText(),
+            fps=float(self._fps_spin.value()), parent=self,
+            source_size=source_size)
         # Carry the on-screen colour range into panel 1 so "export what I'm
         # looking at" is the default rather than something to reconstruct.
         rng = self.current_range_spec()

@@ -34,6 +34,44 @@ from .stats import field_summary, robust_limits
 from .units import Calibration
 
 
+def _targeted_gpu_recovery_seeds(gpu_solver, prev_image, cur_image,
+                                 inc_u, inc_v, guess_u, guess_v,
+                                 max_seeds: int = 32):
+    """One NCC seed per failed connected grid region, largest regions first."""
+    from scipy.ndimage import label, distance_transform_edt
+    from .ncc import ncc_initial_guess
+
+    solved = (np.isfinite(inc_u[gpu_solver.gy_flat, gpu_solver.gx_flat]) &
+              np.isfinite(inc_v[gpu_solver.gy_flat, gpu_solver.gx_flat]))
+    failed = (np.asarray(gpu_solver.valid_mask, dtype=bool) & ~solved).reshape(
+        gpu_solver.grid_shape)
+    labels, count = label(failed)
+    components = []
+    for component in range(1, count + 1):
+        mask = labels == component
+        size = int(mask.sum())
+        if size:
+            # An interior seed gives propagation room in every direction and
+            # avoids choosing a ragged dropout boundary.
+            iy, ix = np.unravel_index(
+                int(np.argmax(distance_transform_edt(mask))), mask.shape)
+            components.append((size, int(iy), int(ix)))
+
+    seeds = []
+    nx = gpu_solver.grid_shape[1]
+    for _size, iy, ix in sorted(components, reverse=True)[:max_seeds]:
+        idx = iy * nx + ix
+        x = int(gpu_solver.gx_flat[idx])
+        y = int(gpu_solver.gy_flat[idx])
+        u, v, _score = ncc_initial_guess(
+            prev_image, cur_image, x, y,
+            gpu_solver.params.subset_radius,
+            gpu_solver.params.search_radius, guess_u, guess_v)
+        seeds.append((idx, np.array(
+            [u, v, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)))
+    return seeds
+
+
 # Native (uncalibrated) unit of each exportable field, used to label exports.
 # Kept beside the data rather than in the UI so a headless export says the same
 # thing the results view does.
@@ -333,6 +371,11 @@ class _HypotView(_LazyView):
 
 
 class DICAnalysis:
+    # Tests and lightweight integrations sometimes instantiate with
+    # object.__new__; class defaults keep trajectory helpers usable there.
+    _path_cache: Optional[dict] = None
+    _path_lock = None
+
     def __init__(self) -> None:
         self.ref_path:  Optional[str]      = None
         self.def_paths: List[str]          = []
@@ -360,6 +403,8 @@ class DICAnalysis:
         self.prefer_gpu: bool = True
         self.last_backend: str = "unknown"
         self._cancel: list = [False]
+        self._path_cache = {}
+        self._path_lock = threading.RLock()
         # Schema-3 sessions keep datasets on disk and materialise only fields
         # that are actually viewed or exported. These proxies require the file
         # handle to remain open for the lifetime of the loaded session.
@@ -777,7 +822,9 @@ class DICAnalysis:
                 raise ValueError("ROI mask is empty.")
             seed_xy = (int(xs_roi.mean()), int(ys_roi.mean()))
 
-        dist_sq = (gpu_solver.gx_flat - seed_xy[0])**2 + (gpu_solver.gy_flat - seed_xy[1])**2
+        dist_sq = ((gpu_solver.gx_flat - seed_xy[0])**2 +
+                   (gpu_solver.gy_flat - seed_xy[1])**2)
+        dist_sq = np.where(gpu_solver.valid_mask, dist_sq, np.inf)
         seed_idx = int(np.argmin(dist_sq))
         actual_seed_x = int(gpu_solver.gx_flat[seed_idx])
         actual_seed_y = int(gpu_solver.gy_flat[seed_idx])
@@ -846,21 +893,20 @@ class DICAnalysis:
                 survival_rate = valid_count / max(1, expected_subsets)
 
                 if survival_rate < 0.60:
-                    print(f"\n[AUTO-FALLBACK] Frame {i+1} collapsed (Survival: {survival_rate*100:.1f}%). Re-running with targeted NCC...")
+                    print(f"\n[TARGETED RECOVERY] Frame {i+1} dropped to "
+                          f"{survival_rate*100:.1f}% coverage. Repairing only "
+                          "failed connected regions.")
 
                     if progress_cb:
                         progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.7, f"[{i + 1}/{n_frames}] Jolt detected. Repairing via NCC...")
 
-                    guess_u, guess_v, _ = ncc_initial_guess(
-                        prev_image, cur_image, current_seed_x, current_seed_y,
-                        self.params.subset_radius, self.params.search_radius,
-                        guess_u, guess_v
-                    )
-                    seed_p = np.array([guess_u, guess_v, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
-
-                    inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f = gpu_solver.solve_frame(
-                        cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False
-                    )
+                    recovery_seeds = _targeted_gpu_recovery_seeds(
+                        gpu_solver, prev_image, cur_image, inc_u, inc_v,
+                        guess_u, guess_v)
+                    if recovery_seeds:
+                        (inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx,
+                         inc_dv_dy, corr_f) = gpu_solver.solve_frame(
+                            cur_image, recovery_seeds=recovery_seeds)
 
             # Dynamic ROI rejection must happen BEFORE strain accumulation. In
             # the old order, a subset that left the frame could contribute one
@@ -1280,13 +1326,28 @@ class DICAnalysis:
         if x1 <= x0 or y1 <= y0:
             return float("nan")
         if isinstance(arr, CompactField):
-            ys = (arr.indices // W).astype(np.int64, copy=False)
-            xs = (arr.indices % W).astype(np.int64, copy=False)
-            inside = ((xs >= x0) & (xs < x1) &
-                      (ys >= y0) & (ys < y1) & np.isfinite(arr.values))
-            if not inside.any():
+            # Each image row is one sorted run in CompactField.indices. Locate
+            # all local runs with two vectorised searches; a Python loop here
+            # is amplified by frames × markers × u/v × retry radii.
+            rows = np.arange(y0, y1, dtype=np.int64) * W
+            lo = np.searchsorted(arr.indices, rows + x0, side="left")
+            hi = np.searchsorted(arr.indices, rows + x1, side="left")
+            counts = hi - lo
+            total = int(counts.sum())
+            if total == 0:
                 return float("nan")
-            xs, ys, vals = xs[inside], ys[inside], arr.values[inside]
+            starts = np.repeat(lo, counts)
+            offsets = (np.arange(total) -
+                       np.repeat(np.cumsum(counts) - counts, counts))
+            pos = starts + offsets
+            vals = arr.values[pos]
+            finite = np.isfinite(vals)
+            if not finite.any():
+                return float("nan")
+            flat = arr.indices[pos[finite]].astype(np.int64, copy=False)
+            vals = vals[finite]
+            ys = flat // W
+            xs = flat % W
             d2 = (xs - x) ** 2 + (ys - y) ** 2
             k = min(4, len(d2))
             idx = np.argpartition(d2, k - 1)[:k]
@@ -1397,14 +1458,22 @@ class DICAnalysis:
             return None
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
 
-        # Inverting the forward map by shooting: guess a reference seed, advect
-        # it with the same code the trajectories use, and correct the guess by
-        # the miss vector. The forward map is close to a translation locally, so
-        # this converges in a handful of iterations -- and, unlike summing the
-        # per-frame fields at a fixed grid index, it never adds displacements
-        # that were measured on different configurations.
-        best = self._shoot_to(x, y, idx, float(x), float(y))
+        # Walk the updated-Lagrangian fields backwards first. The previous
+        # implementation launched up to hundreds of complete forward traces to
+        # invert one click; on a 1,400-frame session that blocked Qt for over a
+        # minute. Each inverse step solves q + d_i(q) = current by fixed-point
+        # iteration, so the work stays linear in sequence length.
+        reverse = self._reverse_advect_path(float(x), float(y), idx)
+        best = (self._shoot_to(x, y, idx, reverse[0], reverse[1], max_iter=4)
+                if reverse is not None else None)
         if best is not None and best[1] < 1.0:
+            return best
+
+        # Never start the old exhaustive reference-grid fallback on a long
+        # sequence. A reverse estimate with a visible residual is preferable to
+        # freezing the application; the caller already rejects clicks whose
+        # round-trip residual exceeds its tolerance.
+        if idx > 120:
             return best
 
         # Miss-vector correction assumes the forward map is locally a
@@ -1444,6 +1513,29 @@ class DICAnalysis:
                 best = self._pattern_search(x, y, idx, best)
         return best
 
+    def _reverse_advect_path(self, x: float, y: float, last: int
+                             ) -> Optional[tuple[float, float]]:
+        """Invert intervals ``last..0`` without replaying candidate paths."""
+        tx, ty = float(x), float(y)
+        for i in range(last, -1, -1):
+            qx, qy = tx, ty
+            for _ in range(8):
+                u = self._sample_sparse(self.results[i].u, qx, qy)
+                v = self._sample_sparse(self.results[i].v, qx, qy)
+                if not (np.isfinite(u) and np.isfinite(v)):
+                    return None
+                nx, ny = tx - u, ty - v
+                if np.hypot(nx - qx, ny - qy) < 1e-3:
+                    qx, qy = nx, ny
+                    break
+                qx, qy = nx, ny
+            tx, ty = float(qx), float(qy)
+            if self._ref_shape is not None:
+                H, W = self._ref_shape
+                if not (0.0 <= tx <= W - 1.0 and 0.0 <= ty <= H - 1.0):
+                    return None
+        return tx, ty
+
     def _pattern_search(self, x: float, y: float, idx: int,
                         best: tuple[tuple[float, float], float]
                         ) -> tuple[tuple[float, float], float]:
@@ -1470,11 +1562,12 @@ class DICAnalysis:
                 step *= 0.5
         return (bx, by), berr
 
-    def _shoot_to(self, x: float, y: float, idx: int, gx: float, gy: float
+    def _shoot_to(self, x: float, y: float, idx: int, gx: float, gy: float,
+                  max_iter: int = 12
                   ) -> Optional[tuple[tuple[float, float], float]]:
         """Refine a reference-seed guess so that it advects onto (x, y)."""
         best: Optional[tuple[tuple[float, float], float]] = None
-        for _ in range(12):
+        for _ in range(max(1, int(max_iter))):
             pts, lost_at = self._advect_path(gx, gy, idx)
             if lost_at is not None:
                 break
@@ -1500,8 +1593,11 @@ class DICAnalysis:
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
         out = []
         for (sx, sy) in seeds:
-            pts, lost_at = self._advect_path(sx, sy, idx)
-            out.append(pts[-1] if lost_at is None else None)
+            path = self._traced_path(float(sx), float(sy), idx)
+            pts, lost_at = path["points"], path["lost_at"]
+            out.append(tuple(pts[idx + 1])
+                       if (lost_at is None or lost_at > idx) and idx + 1 < len(pts)
+                       else None)
         return out
 
     def get_trajectories_from_seeds(self, seeds, max_frame: int, trail: int = 0
@@ -1523,12 +1619,52 @@ class DICAnalysis:
         last = min(int(max_frame), len(self.results) - 1)
         out: list[dict] = []
         for (sx, sy) in seeds:
-            pts, lost_at = self._advect_path(sx, sy, last)
+            path = self._traced_path(float(sx), float(sy), last)
+            pts, lost_at = list(path["points"][:last + 2]), path["lost_at"]
+            if lost_at is not None and lost_at > last:
+                lost_at = None
             if trail and trail > 0 and len(pts) > trail + 1:
                 pts = pts[-(trail + 1):]
             out.append({"points": pts, "lost_at": lost_at,
                         "seed": (float(sx), float(sy))})
         return out
+
+    def _results_token(self) -> tuple:
+        first = id(self.results[0]) if self.results else 0
+        last = id(self.results[-1]) if self.results else 0
+        return len(self.results), first, last
+
+    def _traced_path(self, sx: float, sy: float, last: int) -> dict:
+        """Thread-safe material path cache, extended only for unseen frames."""
+        lock = self._path_lock
+        if lock is None:
+            lock = self._path_lock = threading.RLock()
+        with lock:
+            cache = self._path_cache
+            if cache is None:
+                cache = self._path_cache = {}
+            key = (round(sx, 3), round(sy, 3))
+            token = self._results_token()
+            entry = cache.get(key)
+            if entry is None or entry["token"] != token:
+                entry = {"token": token, "points": [(sx, sy)],
+                         "traced_to": -1, "lost_at": None}
+                cache[key] = entry
+            if entry["lost_at"] is None:
+                x, y = entry["points"][-1]
+                for i in range(entry["traced_to"] + 1, last + 1):
+                    nxt = self._advect_step(self.results[i], x, y)
+                    if nxt is None:
+                        entry["lost_at"] = i
+                        break
+                    x, y = nxt
+                    entry["points"].append((x, y))
+                    entry["traced_to"] = i
+            if len(cache) > 64:
+                for stale in list(cache)[:-32]:
+                    if stale != key:
+                        cache.pop(stale, None)
+            return entry
 
     # ------------------------------------------------------------------
     # Frame-pair analysis

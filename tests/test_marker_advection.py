@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pydic"))
 
 from src.core.analysis import DICAnalysis  # noqa: E402
+from src.core.compact_field import CompactField  # noqa: E402
 
 H = W = 200
 GRID = 4  # subset spacing of the synthetic measurement grid
@@ -138,6 +139,20 @@ def test_uniform_flow_is_exact():
     for k, (px, py) in enumerate(pts):
         assert px == pytest.approx(50.0 + 1.5 * k, abs=1e-6)
         assert py == pytest.approx(120.0 - 0.5 * k, abs=1e-6)
+
+
+def test_compact_field_marker_sampling_matches_dense_field():
+    """The fast sorted-index path must retain trajectory interpolation semantics."""
+    dense = _build(uniform, 12)
+    compact = _build(uniform, 12)
+    for res in compact.results:
+        res.u = CompactField.from_dense(res.u)
+        res.v = CompactField.from_dense(res.v)
+    seed = (51.25, 119.5)
+    expected = dense.get_trajectories_from_seeds([seed], 11)[0]
+    actual = compact.get_trajectories_from_seeds([seed], 11)[0]
+    assert actual["lost_at"] == expected["lost_at"]
+    assert actual["points"] == pytest.approx(expected["points"], abs=1e-9)
 
 
 def test_marker_positions_match_trajectory_endpoint():

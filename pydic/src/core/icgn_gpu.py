@@ -52,6 +52,12 @@ class GPUWavefrontDIC:
         self.state = None
         self.p_global = None
         self.cls_global = None
+        self.ref_value = None
+        self.ref_grad_x = None
+        self.ref_grad_y = None
+        self._cur_image = None
+        self._cur_gpu = None
+        self._cur_coeff = None
 
     def _spline_coeff(self, img: np.ndarray) -> "cp.ndarray":
         """Cubic B-spline coefficients of `img`, computed on the GPU when possible."""
@@ -86,6 +92,7 @@ class GPUWavefrontDIC:
         self.N_total = len(self.gx_flat)
 
         self.ref_coeff = self._spline_coeff(ref_image)
+        self._invalidate_reference_maps()
 
         dy_sub, dx_sub = np.mgrid[-self.r:self.r+1, -self.r:self.r+1]
         mask_sub = (dx_sub**2 + dy_sub**2) <= self.r**2
@@ -98,11 +105,69 @@ class GPUWavefrontDIC:
 
         self._initialized = True
 
+    def _invalidate_reference_maps(self) -> None:
+        self.ref_value = self.ref_grad_x = self.ref_grad_y = None
+
+    def _prepare_current(self, image: np.ndarray):
+        """Upload and prefilter a frame once, including targeted recovery."""
+        if self._cur_image is image and self._cur_coeff is not None:
+            return self._cur_gpu, self._cur_coeff
+        self._cur_image = image
+        self._cur_gpu = cp.asarray(np.asarray(image, dtype=np.float64))
+        if _HAS_CP_SPLINE:
+            try:
+                self._cur_coeff = _cp_spline_filter(
+                    self._cur_gpu, order=3, output=cp.float64, mode='mirror')
+            except Exception:
+                self._cur_coeff = self._spline_coeff(image)
+        else:
+            self._cur_coeff = self._spline_coeff(image)
+        return self._cur_gpu, self._cur_coeff
+
+    def _prepare_reference_maps(self) -> None:
+        """Evaluate the fixed reference lattice once for all wavefront batches."""
+        if self.ref_value is not None:
+            return
+        self.ref_value = cp.empty((self.H, self.W), dtype=cp.float64)
+        self.ref_grad_x = cp.empty_like(self.ref_value)
+        self.ref_grad_y = cp.empty_like(self.ref_value)
+        # Row chunks avoid constructing a multi-hundred-MB coordinate stack.
+        h = 1e-3
+        rows_per_chunk = 256
+        x = cp.arange(self.W, dtype=cp.float64)[None, :]
+        for y0 in range(0, self.H, rows_per_chunk):
+            y1 = min(self.H, y0 + rows_per_chunk)
+            yy = cp.arange(y0, y1, dtype=cp.float64)[:, None]
+            xx = cp.broadcast_to(x, (y1 - y0, self.W))
+            yy = cp.broadcast_to(yy, xx.shape)
+            base = cp.stack((yy.ravel(), xx.ravel()))
+            xp = cp.stack((yy.ravel(), (xx + h).ravel()))
+            xm = cp.stack((yy.ravel(), (xx - h).ravel()))
+            yp = cp.stack(((yy + h).ravel(), xx.ravel()))
+            ym = cp.stack(((yy - h).ravel(), xx.ravel()))
+            shape = (y1 - y0, self.W)
+            self.ref_value[y0:y1] = map_coordinates(
+                self.ref_coeff, base, order=3, mode='mirror',
+                prefilter=False).reshape(shape)
+            self.ref_grad_x[y0:y1] = (map_coordinates(
+                self.ref_coeff, xp, order=3, mode='mirror', prefilter=False) -
+                map_coordinates(self.ref_coeff, xm, order=3, mode='mirror',
+                                prefilter=False)).reshape(shape) / (2 * h)
+            self.ref_grad_y[y0:y1] = (map_coordinates(
+                self.ref_coeff, yp, order=3, mode='mirror', prefilter=False) -
+                map_coordinates(self.ref_coeff, ym, order=3, mode='mirror',
+                                prefilter=False)).reshape(shape) / (2 * h)
+
     def update_reference_image(self, new_ref_image: np.ndarray):
         """Update reference B-spline coefficients for Updated Lagrangian tracking.
         Grid geometry and subset offsets are unchanged — only the reference
         intensity data is replaced with the new (previous) frame."""
-        self.ref_coeff = self._spline_coeff(new_ref_image)
+        if self._cur_image is new_ref_image and self._cur_coeff is not None:
+            self.ref_coeff = self._cur_coeff
+        else:
+            self.ref_coeff = self._spline_coeff(new_ref_image)
+        self._invalidate_reference_maps()
+        self._cur_image = self._cur_gpu = self._cur_coeff = None
 
     @staticmethod
     def release_temporary_memory() -> None:
@@ -129,14 +194,25 @@ class GPUWavefrontDIC:
 
     def solve_frame(self, cur_image: np.ndarray, seed_idx: int = -1,
                     seed_p: np.ndarray = None,
-                    warm_start: bool = False):
+                    warm_start: bool = False, *, recovery_seeds=None):
         if not self._initialized:
             raise RuntimeError("Must precompute reference before solving frames.")
 
-        cur_coeff = self._spline_coeff(cur_image)
-        cur_gpu = cp.asarray(np.asarray(cur_image, dtype=np.float64), dtype=cp.float64)
+        cur_gpu, cur_coeff = self._prepare_current(cur_image)
+        self._prepare_reference_maps()
 
-        if not warm_start:
+        if recovery_seeds is not None:
+            # Preserve reliable warm-start solutions and open only failed ROI
+            # regions for propagation from targeted NCC seeds.
+            pending = (self.state != 2) & cp.asarray(self.valid_mask)
+            self.state[pending] = 0
+            self.state[~cp.asarray(self.valid_mask)] = -1
+            self.retry[pending] = 0
+            for idx, params in recovery_seeds:
+                if bool(pending[int(idx)]):
+                    self.state[int(idx)] = 1
+                    self.p_global[int(idx)] = cp.asarray(params, dtype=cp.float64)
+        elif not warm_start:
             self.state = cp.zeros(self.N_total, dtype=cp.int8)
             self.state[~cp.asarray(self.valid_mask)] = -1
             self.p_global = cp.zeros((self.N_total, 6), dtype=cp.float64)
@@ -219,26 +295,16 @@ class GPUWavefrontDIC:
             # rejected this (run_icgn's bounds test); the GPU never did.
             ref_oob = self._out_of_bounds(ref_xs_act, ref_ys_act)
 
-            coords_ref = cp.stack([ref_ys_act.ravel(), ref_xs_act.ravel()], axis=0)
-
-            f = map_coordinates(self.ref_coeff, coords_ref, order=3, mode='mirror', prefilter=False).reshape(N_act, self.N_px)
+            ref_xi = ref_xs_act.astype(cp.int32)
+            ref_yi = ref_ys_act.astype(cp.int32)
+            f = self.ref_value[ref_yi, ref_xi]
             f_mean = f.mean(axis=1, keepdims=True)
             f_c = f - f_mean
             sigma_f_act = cp.maximum(cp.sqrt((f_c**2).sum(axis=1, keepdims=True)), 1e-12)
             f_norm_act = f_c / sigma_f_act
 
-            h = 1e-3
-            cx_p = cp.stack([ref_ys_act.ravel(), ref_xs_act.ravel() + h], axis=0)
-            cx_m = cp.stack([ref_ys_act.ravel(), ref_xs_act.ravel() - h], axis=0)
-            fx = (map_coordinates(self.ref_coeff, cx_p, order=3, mode='mirror', prefilter=False) -
-                  map_coordinates(self.ref_coeff, cx_m, order=3, mode='mirror', prefilter=False)) / (2*h)
-            fx = fx.reshape(N_act, self.N_px)
-
-            cy_p = cp.stack([ref_ys_act.ravel() + h, ref_xs_act.ravel()], axis=0)
-            cy_m = cp.stack([ref_ys_act.ravel() - h, ref_xs_act.ravel()], axis=0)
-            fy = (map_coordinates(self.ref_coeff, cy_p, order=3, mode='mirror', prefilter=False) -
-                  map_coordinates(self.ref_coeff, cy_m, order=3, mode='mirror', prefilter=False)) / (2*h)
-            fy = fy.reshape(N_act, self.N_px)
+            fx = self.ref_grad_x[ref_yi, ref_xi]
+            fy = self.ref_grad_y[ref_yi, ref_xi]
 
             # --- Bug 1 Fix: Correct ZNSSD steepest descent with mean-correction ---
             # Raw Jacobian dF/dp (before normalization)

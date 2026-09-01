@@ -9,7 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QPushButton
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -22,6 +22,7 @@ from src.core.rg_dic import DICParams
 from src.core.temporal import TemporalResultSequence, save_temporal_result
 from src.ui.pages.frame_pair_dialog import FramePairDialog
 from src.ui.pages.results_page import ResultsPage
+from src.ui.pages.video_export_dialog import VideoExportDialog
 from src.ui.render import PanelSpec
 from src.ui.video_export import ExportSpec, ViewRenderer, export_video
 from src.ui.wizard import Wizard
@@ -383,7 +384,8 @@ def test_results_pair_sequence_keeps_timeline_and_restores_single_frame():
     assert page._pair_generation == generation
     assert page._pair_list == retained_pairs
     assert page._slider.maximum() == 3
-    assert page._slider.value() == 2
+    # Leaving temporal mode stays on the endpoint image of the selected pair.
+    assert page._slider.value() == 3
 
     page._resume_pair_sequence()
     assert page._pair_mode
@@ -394,6 +396,112 @@ def test_results_pair_sequence_keeps_timeline_and_restores_single_frame():
     page._discard_pair_data()
     assert not page._pair_list
     assert page._pair_generation == generation + 1
+    page._pair_pool.waitForDone(3000)
+    page.close()
+
+
+def test_temporal_mode_streakline_uses_the_pair_endpoint():
+    shape, radius, spacing = (41, 41), 5, 5
+    analysis = DICAnalysis()
+    analysis.params = DICParams(
+        subset_radius=radius, subset_spacing=spacing, strain_window=5)
+    analysis._roi_mask = np.ones(shape, dtype=bool)
+    analysis._ref_image = np.zeros(shape, dtype=float)
+    analysis.fps = 1000.0
+    frame = _increment(
+        shape, radius, spacing,
+        lambda x, _y: np.full_like(x, 0.1, dtype=float),
+        lambda _x, y: np.zeros_like(y, dtype=float),
+    )
+    analysis.results = [frame, frame, frame, frame]
+    analysis.def_paths = []
+    page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))
+    page._pair_list = [(0, 2), (1, 3)]
+    page._pair_mode = True
+    page._frame = 1
+    page._canvas.set_markers([(radius, radius)])
+    page._streak_chk.blockSignals(True)
+    page._streak_chk.setChecked(True)
+    page._streak_chk.blockSignals(False)
+    page._render_trajectories(1)
+
+    assert page._trajectory_source_index(1) == 3
+    assert _wait_until(lambda: len(page._canvas._streak_paths) == 1)
+    trajectories, _draw_points = next(iter(page._traj_cache.values()))
+    assert len(trajectories[0]["points"]) == 5
+    assert trajectories[0]["points"][-1][0] == pytest.approx(radius + 0.4)
+    page._pair_pool.waitForDone(3000)
+    page.close()
+
+
+def test_sidebar_export_buttons_and_marker_order_are_compact_but_unclipped():
+    analysis = DICAnalysis()
+    page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))
+    video_button = next(
+        button for button in page.findChildren(QPushButton)
+        if button.text() == "Video / image sequence…")
+
+    assert video_button.height() == 34
+    assert video_button.parentWidget().layout().spacing() == 0
+    sidebar_layout = page._marker_panel.parentWidget().layout()
+    assert sidebar_layout.indexOf(page._marker_panel) > sidebar_layout.indexOf(
+        page._pair_clear_btn)
+    page.close()
+
+
+def test_video_export_uses_source_dimensions_without_streakline_only_panel():
+    dialog = VideoExportDialog(
+        {"u": ("Horizontal displacement", "px")}, ["turbo"], 20,
+        "u", "turbo", source_size=(1920, 1080))
+
+    assert (dialog.cell_w.value(), dialog.cell_h.value()) == (1920, 1080)
+    choices = [dialog._editors[0].content.itemData(i)
+               for i in range(dialog._editors[0].content.count())]
+    assert "streaklines" not in choices
+    assert "image" in choices
+    assert dialog._editors[0].streaks.text() == "Overlay streaklines"
+    dialog.close()
+
+
+def test_streakline_toggle_never_traces_on_the_ui_thread(monkeypatch):
+    shape, radius, spacing = (41, 41), 5, 5
+    analysis = DICAnalysis()
+    analysis.params = DICParams(
+        subset_radius=radius, subset_spacing=spacing, strain_window=5)
+    analysis._roi_mask = np.ones(shape, dtype=bool)
+    analysis._ref_image = np.zeros(shape, dtype=float)
+    frame = _increment(
+        shape, radius, spacing,
+        lambda x, _y: np.full_like(x, 0.1, dtype=float),
+        lambda _x, y: np.zeros_like(y, dtype=float),
+    )
+    analysis.results = [frame, frame, frame]
+    analysis.def_paths = []
+    original = analysis.get_trajectories_from_seeds
+
+    def delayed_trace(*args, **kwargs):
+        time.sleep(0.15)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(analysis, "get_trajectories_from_seeds", delayed_trace)
+    page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))
+    page._frame = 2
+    page._canvas.set_markers([(radius, radius)])
+
+    started = time.monotonic()
+    page._streak_chk.setChecked(True)
+    returned_in = time.monotonic() - started
+
+    assert returned_in < 0.1
+    assert len(page._canvas._streak_paths) == 0
+    assert _wait_until(lambda: len(page._canvas._streak_paths) == 1)
+
+    # Clearing while a different path is still running must not let that stale
+    # worker completion put a deleted marker back on the canvas.
+    page._canvas.set_markers([(radius + spacing, radius)])
+    page._canvas.clear_markers()
+    assert _wait_until(lambda: page._traj_active_request is None)
+    assert len(page._canvas._streak_paths) == 0
     page._pair_pool.waitForDone(3000)
     page.close()
 

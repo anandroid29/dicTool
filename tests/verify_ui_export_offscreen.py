@@ -149,8 +149,10 @@ def main() -> None:
     save_widget(page, "results_1024_gl.png")
     narrow = visible_overflow(page)
 
-    dialog = VideoExportDialog(FIELDS, CMAPS, len(analysis.results),
-                               "Eeff_gl", "turbo", analysis.fps)
+    source_h, source_w = analysis.reference_image.shape[:2]
+    dialog = VideoExportDialog(
+        FIELDS, CMAPS, len(analysis.results), "Eeff_gl", "turbo",
+        analysis.fps, source_size=(source_w, source_h))
     dialog.rows.setValue(2)
     dialog.cols.setValue(2)
     dialog.resize(900, 760)
@@ -158,11 +160,11 @@ def main() -> None:
     QApplication.processEvents()
 
     raw = dialog._editors[1]
-    streak = dialog._editors[2]
     controls = ("colour_hdr", "lbl_field", "field", "lbl_cmap", "cmap",
                 "lbl_range", "range_mode", "rng_row", "symmetric", "colorbar")
     raw_hidden = {name: getattr(raw, name).isHidden() for name in controls}
-    streak_hidden = {name: getattr(streak, name).isHidden() for name in controls}
+    content_choices = [raw.content.itemData(i)
+                       for i in range(raw.content.count())]
     all_fields_present = all(e.field.count() == len(FIELDS) for e in dialog._editors)
     save_widget(dialog, "video_export_2x2.png")
 
@@ -216,9 +218,10 @@ def main() -> None:
         "results_toolbar_1366": wide,
         "results_toolbar_1024": narrow,
         "raw_irrelevant_controls_all_hidden": all(raw_hidden.values()),
-        "streakline_irrelevant_controls_all_hidden": all(streak_hidden.values()),
         "raw_control_visibility": raw_hidden,
-        "streakline_control_visibility": streak_hidden,
+        "streaklines_only_choice_removed": "streaklines" not in content_choices,
+        "video_cell_size_matches_source":
+            (dialog.cell_w.value(), dialog.cell_h.value()) == (source_w, source_h),
         "all_result_fields_available_in_each_panel": all_fields_present,
         "field_count": len(FIELDS),
         "video_import_pixel_size_mm":
