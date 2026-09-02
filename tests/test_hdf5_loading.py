@@ -3,8 +3,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-import pydic.core.analysis as analysis_module
-from pydic.core.analysis import DICAnalysis
+import strainx.core.analysis as analysis_module
+from strainx.core.analysis import DICAnalysis
 
 
 def _write_minimal_session(path: Path, n_frames: int = 3) -> None:
@@ -28,7 +28,7 @@ def _write_minimal_session(path: Path, n_frames: int = 3) -> None:
 
 
 def test_hdf5_loader_reports_frame_progress(tmp_path, monkeypatch):
-    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("STRAINX_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(analysis_module, "HDF5_LAZY_THRESHOLD_BYTES", 0)
     path = tmp_path / "session.h5"
     _write_minimal_session(path)
@@ -53,7 +53,7 @@ def test_hdf5_loader_reports_frame_progress(tmp_path, monkeypatch):
 
 
 def test_frame_dynamic_roi_overrides_round_trip(tmp_path, monkeypatch):
-    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("STRAINX_SETTINGS_PATH", str(tmp_path / "settings.json"))
     path = tmp_path / "frame_overrides.h5"
     include = np.zeros((4, 4), dtype=bool)
     exclude = np.zeros((4, 4), dtype=bool)

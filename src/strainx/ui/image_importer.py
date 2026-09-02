@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
 )
 
-from pydic.core.units import Calibration, LENGTH_UNIT_ORDER
+from strainx.core.units import Calibration, LENGTH_UNIT_ORDER
 
 
 _BG = "#1a1c1e"

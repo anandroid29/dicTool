@@ -17,8 +17,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import pydic.core.analysis as analysis_module
-from pydic.core.analysis import DICAnalysis
+import strainx.core.analysis as analysis_module
+from strainx.core.analysis import DICAnalysis
 
 FPS = 10.0
 N = 3
@@ -51,7 +51,7 @@ def _write_session(path: Path, n_frames: int = N) -> None:
 
 @pytest.mark.parametrize("lazy", [False, True])
 def test_velocity_is_available_after_loading_a_session(tmp_path, monkeypatch, lazy):
-    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("STRAINX_SETTINGS_PATH", str(tmp_path / "settings.json"))
     # Threshold 0 forces lazy; a huge threshold forces eager in-memory loading.
     monkeypatch.setattr(analysis_module, "HDF5_LAZY_THRESHOLD_BYTES",
                         0 if lazy else 1 << 40)
@@ -82,7 +82,7 @@ def test_velocity_is_available_after_loading_a_session(tmp_path, monkeypatch, la
 
 def test_lazy_velocity_does_not_read_the_whole_field(tmp_path, monkeypatch):
     """A lazy session must stay lazy: slicing velocity reads only that slice."""
-    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("STRAINX_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(analysis_module, "HDF5_LAZY_THRESHOLD_BYTES", 0)
     path = tmp_path / "session.h5"
     _write_session(path)
@@ -106,7 +106,7 @@ def test_lazy_velocity_does_not_read_the_whole_field(tmp_path, monkeypatch):
 
 def test_stored_rates_are_not_overwritten_on_load(tmp_path, monkeypatch):
     """Rebuilding velocity must not disturb the strain rates read from file."""
-    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("STRAINX_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(analysis_module, "HDF5_LAZY_THRESHOLD_BYTES", 1 << 40)
     path = tmp_path / "session.h5"
     _write_session(path)
@@ -130,7 +130,7 @@ def test_strain_rates_are_rebuilt_when_absent_from_file(tmp_path, monkeypatch):
     A file with no stored rates but intact gradients must still fill the
     strain-rate screens rather than leaving them blank.
     """
-    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("STRAINX_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(analysis_module, "HDF5_LAZY_THRESHOLD_BYTES", 1 << 40)
     path = tmp_path / "session.h5"
     _write_session(path)  # writes gradients, no *_rate datasets

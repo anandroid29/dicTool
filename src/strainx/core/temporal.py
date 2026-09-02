@@ -181,7 +181,7 @@ class TemporalResultSequence(Sequence):
 
 
 def load_hdf5_temporal_result(path: str, index: int):
-    """Read one temporal result from an exported PyDIC HDF5 subgroup."""
+    """Read one temporal result from an exported strainX HDF5 subgroup."""
     import h5py
     from .analysis import PairResult
 

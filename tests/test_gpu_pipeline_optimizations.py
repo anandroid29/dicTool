@@ -6,11 +6,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from pydic.core.cuda_native import (
+from strainx.core.cuda_native import (
     NativeCudaSolver, native_cuda_available, native_cuda_diagnostic,
     native_plane_fit,
 )
-from pydic.core.rg_dic import DICParams
+from strainx.core.rg_dic import DICParams
 
 
 pytestmark = pytest.mark.skipif(

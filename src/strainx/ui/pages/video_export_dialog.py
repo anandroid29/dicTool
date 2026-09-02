@@ -16,12 +16,12 @@ from PyQt6.QtWidgets import (
     QScrollArea, QWidget, QFrame, QColorDialog, QGroupBox,
 )
 
-from pydic.ui.render import PanelSpec, RangeSpec, BACKGROUND_CHOICES
-from pydic.ui.video_export import ExportSpec, CODECS
+from strainx.ui.render import PanelSpec, RangeSpec, BACKGROUND_CHOICES
+from strainx.ui.video_export import ExportSpec, CODECS
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from pydic.ui.theme import C_BORDER, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+from strainx.ui.theme import C_BORDER, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_BORDER = C_BORDER
 _C_SURFACE = C_SURFACE

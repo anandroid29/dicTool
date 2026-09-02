@@ -17,9 +17,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-os.environ["PYDIC_SETTINGS_PATH"] = str(ROOT / "output" / "verification" / "settings.json")
+os.environ["STRAINX_SETTINGS_PATH"] = str(ROOT / "output" / "verification" / "settings.json")
 
-from pydic.core.analysis import DICAnalysis
+from strainx.core.analysis import DICAnalysis
 
 
 def build_roi(ref_path: Path) -> tuple[np.ndarray, tuple[int, int]]:

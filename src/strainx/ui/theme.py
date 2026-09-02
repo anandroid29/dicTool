@@ -1,5 +1,5 @@
 """
-theme.py — PyDIC interface theme.
+theme.py — strainX interface theme.
 
 A measurement instrument, not a consumer application. Three rules follow from
 that, and every token below is chosen to serve them.

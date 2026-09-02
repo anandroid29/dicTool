@@ -1,6 +1,6 @@
 import numpy as np
 
-from pydic.core.shape_order import shape_order_report
+from strainx.core.shape_order import shape_order_report
 
 
 def _textured_image(height=96, width=112):

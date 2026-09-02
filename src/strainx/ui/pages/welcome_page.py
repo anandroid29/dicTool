@@ -13,16 +13,16 @@ from PyQt6.QtWidgets import (
     QMessageBox, QProgressDialog,
 )
 
-from pydic.core.units import Calibration
+from strainx.core.units import Calibration
 
 if TYPE_CHECKING:
-    from pydic.ui.wizard import Wizard
-from pydic.ui.components import FooterButton
-from pydic.ui.image_importer import ImageSequenceImporterDialog
+    from strainx.ui.wizard import Wizard
+from strainx.ui.components import FooterButton
+from strainx.ui.image_importer import ImageSequenceImporterDialog
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from pydic.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+from strainx.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_ACCENT = C_ACCENT
 _C_BG = C_BG
@@ -82,7 +82,7 @@ class _HDF5LoadWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         try:
-            from pydic.core.analysis import DICAnalysis
+            from strainx.core.analysis import DICAnalysis
             analysis = DICAnalysis()
             analysis.load_hdf5(
                 self.path,
@@ -198,7 +198,7 @@ class WelcomePage(QWidget):
         hero_lay.setContentsMargins(64, 30, 64, 28)
         hero_lay.setSpacing(8)
 
-        product = QLabel("PYDIC  /  MEASUREMENT WORKSPACE")
+        product = QLabel("STRAINX  /  MEASUREMENT WORKSPACE")
         product.setStyleSheet(
             f"color:#74a6c9; font-size:10px; font-weight:700; "
             "letter-spacing:1.8px;")
@@ -331,7 +331,7 @@ class WelcomePage(QWidget):
         root.addWidget(footer)
 
     def _import_video(self) -> None:
-        from pydic.ui.video_importer import VideoImporterDialog
+        from strainx.ui.video_importer import VideoImporterDialog
 
         start_dir = self._get_safe_start_dir("last_video_directory")
         dlg = VideoImporterDialog(

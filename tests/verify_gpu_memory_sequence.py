@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 OUT = ROOT / "output" / "verification"
 OUT.mkdir(parents=True, exist_ok=True)
-os.environ["PYDIC_SETTINGS_PATH"] = str(OUT / "memory_test_settings.json")
+os.environ["STRAINX_SETTINGS_PATH"] = str(OUT / "memory_test_settings.json")
 
-from pydic.core.analysis import DICAnalysis
-from pydic.core.cuda_native import native_cuda_memory_info
+from strainx.core.analysis import DICAnalysis
+from strainx.core.cuda_native import native_cuda_memory_info
 
 
 class PROCESS_MEMORY_COUNTERS(ctypes.Structure):

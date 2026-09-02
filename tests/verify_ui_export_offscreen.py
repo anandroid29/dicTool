@@ -19,18 +19,18 @@ from PyQt6.QtWidgets import QApplication, QWidget, QScrollArea, QCheckBox
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pydic.core.analysis import DICAnalysis, PairResult
-from pydic.core.rg_dic import DICParams
-from pydic.core.units import Calibration
-from pydic.ui.pages.results_page import CMAPS, FIELDS, ResultsPage
-from pydic.ui.pages.params_page import ParamsPage
-from pydic.ui.pages.dynamic_roi_page import DynamicROIPage
-from pydic.ui.image_canvas import ROITool
-from pydic.ui.pages.video_export_dialog import VideoExportDialog
-from pydic.ui.render import PanelSpec, RangeSpec
-from pydic.ui.video_export import ExportSpec, export_video
-from pydic.ui.video_importer import VideoImporterDialog
-from pydic.ui.theme import STYLESHEET
+from strainx.core.analysis import DICAnalysis, PairResult
+from strainx.core.rg_dic import DICParams
+from strainx.core.units import Calibration
+from strainx.ui.pages.results_page import CMAPS, FIELDS, ResultsPage
+from strainx.ui.pages.params_page import ParamsPage
+from strainx.ui.pages.dynamic_roi_page import DynamicROIPage
+from strainx.ui.image_canvas import ROITool
+from strainx.ui.pages.video_export_dialog import VideoExportDialog
+from strainx.ui.render import PanelSpec, RangeSpec
+from strainx.ui.video_export import ExportSpec, export_video
+from strainx.ui.video_importer import VideoImporterDialog
+from strainx.ui.theme import STYLESHEET
 
 
 OUT = ROOT / "output" / "verification" / "ui"

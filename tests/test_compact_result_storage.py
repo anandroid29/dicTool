@@ -6,12 +6,12 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pydic"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pydic.core.analysis import DICAnalysis, PairResult
-from pydic.core.compact_field import CompactField, CompactMask
-from pydic.core.rg_dic import DICParams
-from pydic.core.units import Calibration
+from strainx.core.analysis import DICAnalysis, PairResult
+from strainx.core.compact_field import CompactField, CompactMask
+from strainx.core.rg_dic import DICParams
+from strainx.core.units import Calibration
 
 
 class CompactResultStorageTests(unittest.TestCase):

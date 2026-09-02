@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QFrame, QCheckBox, QComboBox,
 )
 
-from pydic.core.units import Calibration, LENGTH_UNIT_ORDER
+from strainx.core.units import Calibration, LENGTH_UNIT_ORDER
 
 # Defer CV2 import to prevent UI freeze on startup
 if TYPE_CHECKING:
@@ -292,7 +292,7 @@ class VideoImporterDialog(QDialog):
             "For an ordinary video, leave the detected value unchanged. Override it\n"
             "only when the file metadata is wrong, or when high-speed footage was\n"
             "saved with a different playback rate.\n\n"
-            "If Step is N, PyDIC analyses every Nth frame and uses:\n"
+            "If Step is N, strainX analyses every Nth frame and uses:\n"
             "effective sample rate = source capture rate / N\n"
             "Δt = N / source capture rate.\n\n"
             "The effective rate and Δt are shown below. They control velocity and\n"
@@ -509,7 +509,7 @@ class VideoImporterDialog(QDialog):
 
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            QMessageBox.warning(self, "PyDIC", f"Cannot open:\n{path}")
+            QMessageBox.warning(self, "strainX", f"Cannot open:\n{path}")
             return
 
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -665,7 +665,7 @@ class VideoImporterDialog(QDialog):
         if not out:
             out = os.path.join(
                 tempfile.gettempdir(),
-                "pydic_frames_" + os.path.splitext(
+                "strainx_frames_" + os.path.splitext(
                     os.path.basename(self._video_path))[0]
             )
 

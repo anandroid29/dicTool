@@ -12,16 +12,16 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QFileDialog, QMessageBox, QComboBox,
     QSpinBox,
 )
-from pydic.ui.components import FooterButton
+from strainx.ui.components import FooterButton
 
 if TYPE_CHECKING:
-    from pydic.ui.wizard import Wizard
+    from strainx.ui.wizard import Wizard
 
-from pydic.ui.image_canvas import ImageCanvas, ROITool
+from strainx.ui.image_canvas import ImageCanvas, ROITool
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from pydic.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+from strainx.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_ACCENT = C_ACCENT
 _C_BG = C_BG

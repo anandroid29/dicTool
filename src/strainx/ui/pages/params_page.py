@@ -12,16 +12,16 @@ from PyQt6.QtWidgets import (
     QFrame, QGridLayout, QSizePolicy, QCheckBox, QComboBox, QScrollArea
 )
 
-from pydic.ui.components import FooterButton
+from strainx.ui.components import FooterButton
 
 if TYPE_CHECKING:
-    from pydic.ui.wizard import Wizard
+    from strainx.ui.wizard import Wizard
 
-from pydic.ui.image_canvas import ImageCanvas
+from strainx.ui.image_canvas import ImageCanvas
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from pydic.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+from strainx.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_ACCENT = C_ACCENT
 _C_BORDER = C_BORDER
@@ -33,7 +33,7 @@ _C_TEXT2 = C_TEXT2
 _C_TEXT3 = C_TEXT3
 
 
-from pydic.core.cuda_native import native_cuda_library_present
+from strainx.core.cuda_native import native_cuda_library_present
 
 # Library presence is a filesystem-only UI check. The analysis worker performs
 # authoritative driver/device validation when CUDA execution is chosen.
@@ -554,7 +554,7 @@ class ParamsPage(QWidget):
                                     "Load a reference image first.")
             return
         try:
-            from pydic.core.shape_order import shape_order_report
+            from strainx.core.shape_order import shape_order_report
             mask = (self._preview_roi_mask if self._preview_roi_mask is not None
                     else self._wizard.analysis.roi_mask)
             r = shape_order_report(img, mask,
@@ -580,7 +580,7 @@ class ParamsPage(QWidget):
             f"If your shear zone curvature is below that, stay on 1st order.")
 
     def _reset_defaults(self) -> None:
-        from pydic.core.rg_dic import DICParams
+        from strainx.core.rg_dic import DICParams
         from PyQt6.QtWidgets import QMessageBox
 
         # 1. Reset core settings and overwrite JSON

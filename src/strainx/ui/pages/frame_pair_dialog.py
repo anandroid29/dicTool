@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from pydic.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_RAISED, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
+from strainx.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_RAISED, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
 
 _C_ACCENT = C_ACCENT
 _C_BORDER = C_BORDER
@@ -300,10 +300,10 @@ class FramePairDialog(QDialog):
     def _add_pair(self) -> None:
         a, b = self._a_spin.value() - 1, self._b_spin.value() - 1
         if a == b:
-            QMessageBox.information(self, "PyDIC", "A pair needs two different frames.")
+            QMessageBox.information(self, "strainX", "A pair needs two different frames.")
             return
         if not self._add(a, b):
-            QMessageBox.information(self, "PyDIC", "That pair is already in the list.")
+            QMessageBox.information(self, "strainX", "That pair is already in the list.")
             return
         self._sequence_mode = "custom"
         self._refresh_list()
@@ -314,7 +314,7 @@ class FramePairDialog(QDialog):
         span = self._bulk_span.value()
         if hi <= lo:
             QMessageBox.information(
-                self, "PyDIC", "The end frame must come after the start frame.")
+                self, "strainX", "The end frame must come after the start frame.")
             return
 
         # Sliding windows move by one displayed frame. Disjoint windows share
@@ -333,7 +333,7 @@ class FramePairDialog(QDialog):
 
         if added == 0:
             QMessageBox.information(
-                self, "PyDIC",
+                self, "strainX",
                 "No new pairs. That range and span produced nothing that is not "
             "already listed.")
             return
@@ -373,7 +373,7 @@ class FramePairDialog(QDialog):
 
     def _accept_if_valid(self) -> None:
         if not self._pairs:
-            QMessageBox.information(self, "PyDIC", "Add at least one frame pair.")
+            QMessageBox.information(self, "strainX", "Add at least one frame pair.")
             return
         self.accept()
 

@@ -11,11 +11,11 @@ from scipy.ndimage import affine_transform, gaussian_filter, map_coordinates, sh
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from pydic.core.cuda_native import (
+from strainx.core.cuda_native import (
     NativeCudaError, NativeCudaSolver, native_cuda_available,
     native_cuda_diagnostic)
-from pydic.core.ncc import ncc_initial_guess
-from pydic.core.rg_dic import DICParams, run_rg_dic
+from strainx.core.ncc import ncc_initial_guess
+from strainx.core.rg_dic import DICParams, run_rg_dic
 
 
 pytestmark = pytest.mark.skipif(
@@ -401,8 +401,8 @@ def test_stage_4_constant_increment_sequence_does_not_alternate():
 
 def test_stage_4_full_gpu_analysis_correlates_adjacent_files(tmp_path, monkeypatch):
     """The app path must report k-1 -> k, never frame 0 -> k or k-2 -> k."""
-    monkeypatch.setenv("PYDIC_SETTINGS_PATH", str(tmp_path / "settings.json"))
-    from pydic.core.analysis import DICAnalysis
+    monkeypatch.setenv("STRAINX_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    from strainx.core.analysis import DICAnalysis
 
     ref = _safe_texture(seed=101, shape=(112, 120))
     increment = np.array([2.0, -1.5])

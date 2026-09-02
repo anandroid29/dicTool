@@ -1,4 +1,4 @@
-#include "pydic_cuda.h"
+#include "strainx_cuda.h"
 
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -1204,11 +1204,11 @@ __global__ void plane_fit_kernel(
 
 extern "C" {
 
-const char* pydic_cuda_version(void) { return "2.0.0-native"; }
-uint32_t pydic_cuda_abi_version(void) { return 2; }
-const char* pydic_cuda_last_error(void) { return g_last_error.c_str(); }
+const char* strainx_cuda_version(void) { return "2.0.0-native"; }
+uint32_t strainx_cuda_abi_version(void) { return 2; }
+const char* strainx_cuda_last_error(void) { return g_last_error.c_str(); }
 
-int pydic_cuda_device_count(void) {
+int strainx_cuda_device_count(void) {
     g_last_error.clear();
     int count = 0;
     const cudaError_t status = cudaGetDeviceCount(&count);
@@ -1220,12 +1220,12 @@ int pydic_cuda_device_count(void) {
     return count;
 }
 
-int pydic_cuda_synchronize(void) {
+int strainx_cuda_synchronize(void) {
     g_last_error.clear();
     return cuda_ok(cudaDeviceSynchronize(), "synchronizing CUDA") ? 0 : -1;
 }
 
-int pydic_cuda_memory_info(uint64_t* free_bytes, uint64_t* total_bytes) {
+int strainx_cuda_memory_info(uint64_t* free_bytes, uint64_t* total_bytes) {
     g_last_error.clear();
     if (!free_bytes || !total_bytes) {
         set_error("CUDA memory-info outputs may not be null."); return -1;
@@ -1238,7 +1238,7 @@ int pydic_cuda_memory_info(uint64_t* free_bytes, uint64_t* total_bytes) {
     return 0;
 }
 
-pydic_cuda_solver_t pydic_cuda_solver_create(
+strainx_cuda_solver_t strainx_cuda_solver_create(
     int subset_radius, int subset_spacing, int search_radius, int rescue_radius,
     int max_iterations, double convergence_tolerance, double correlation_cutoff,
     int mask_subsets_to_roi) {
@@ -1256,11 +1256,11 @@ pydic_cuda_solver_t pydic_cuda_solver_create(
     }
 }
 
-void pydic_cuda_solver_destroy(pydic_cuda_solver_t handle) {
+void strainx_cuda_solver_destroy(strainx_cuda_solver_t handle) {
     delete static_cast<Solver*>(handle);
 }
 
-int pydic_cuda_solver_precompute(pydic_cuda_solver_t handle,
+int strainx_cuda_solver_precompute(strainx_cuda_solver_t handle,
                                  const double* reference_image,
                                  const uint8_t* roi_mask,
                                  int height, int width) {
@@ -1339,8 +1339,8 @@ int pydic_cuda_solver_precompute(pydic_cuda_solver_t handle,
     return 0;
 }
 
-int pydic_cuda_solver_ncc(
-    pydic_cuda_solver_t handle, const double* current_image, int grid_index,
+int strainx_cuda_solver_ncc(
+    strainx_cuda_solver_t handle, const double* current_image, int grid_index,
     double guess_u, double guess_v, double* out_u, double* out_v,
     double* out_zncc) {
     g_last_error.clear();
@@ -1358,8 +1358,8 @@ int pydic_cuda_solver_ncc(
                      *out_u, *out_v, out_zncc) ? 0 : -1;
 }
 
-int pydic_cuda_solver_icgn(
-    pydic_cuda_solver_t handle, const double* current_image, int grid_index,
+int strainx_cuda_solver_icgn(
+    strainx_cuda_solver_t handle, const double* current_image, int grid_index,
     const double* initial_parameters, double* out_parameters,
     double* out_znssd, uint8_t* out_accepted) {
     g_last_error.clear();
@@ -1404,8 +1404,8 @@ int pydic_cuda_solver_icgn(
     return 0;
 }
 
-int pydic_cuda_solver_solve(
-    pydic_cuda_solver_t handle, const double* current_image, int mode,
+int strainx_cuda_solver_solve(
+    strainx_cuda_solver_t handle, const double* current_image, int mode,
     int seed_index, double guess_u, double guess_v,
     double* out_u, double* out_v, double* out_du_dx, double* out_du_dy,
     double* out_dv_dx, double* out_dv_dy, double* out_correlation) {
@@ -1424,18 +1424,18 @@ int pydic_cuda_solver_solve(
         } else if (!solver->has_current) {
             throw std::runtime_error("No resident current image for recovery.");
         }
-        if (mode == PYDIC_CUDA_FRESH) {
+        if (mode == STRAINX_CUDA_FRESH) {
             if (seed_index < 0 || seed_index >= solver->total || !solver->valid[seed_index])
                 throw std::runtime_error("The native CUDA seed is outside the valid grid.");
             initialize_fresh(solver, seed_index, guess_u, guess_v);
-        } else if (mode == PYDIC_CUDA_WARM_START) {
+        } else if (mode == STRAINX_CUDA_WARM_START) {
             initialize_warm_start(solver);
-        } else if (mode == PYDIC_CUDA_RECOVER_FAILED) {
+        } else if (mode == STRAINX_CUDA_RECOVER_FAILED) {
             initialize_recovery(solver, guess_u, guess_v);
         } else {
             throw std::runtime_error("Unknown native CUDA solve mode.");
         }
-        if (!run_wavefront(solver, mode == PYDIC_CUDA_WARM_START)) return -1;
+        if (!run_wavefront(solver, mode == STRAINX_CUDA_WARM_START)) return -1;
         const double nan = std::numeric_limits<double>::quiet_NaN();
         std::fill_n(out_u, count, nan); std::fill_n(out_v, count, nan);
         std::fill_n(out_du_dx, count, nan); std::fill_n(out_du_dy, count, nan);
@@ -1456,7 +1456,7 @@ int pydic_cuda_solver_solve(
     }
 }
 
-int pydic_cuda_solver_update_reference(pydic_cuda_solver_t handle,
+int strainx_cuda_solver_update_reference(strainx_cuda_solver_t handle,
                                        const double* new_reference_image) {
     g_last_error.clear();
     auto* solver = static_cast<Solver*>(handle);
@@ -1488,7 +1488,7 @@ int pydic_cuda_solver_update_reference(pydic_cuda_solver_t handle,
     return launch_gradient(solver) ? 0 : -1;
 }
 
-int pydic_cuda_plane_fit(
+int strainx_cuda_plane_fit(
     const double* vx, const double* vy, const uint8_t* mask,
     int height, int width, int radius,
     double* out_dvx_dx, double* out_dvx_dy,

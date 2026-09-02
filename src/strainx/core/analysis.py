@@ -2874,14 +2874,14 @@ class DICAnalysis:
 
     def _get_settings_path(self) -> str:
         import os
-        # PYDIC_SETTINGS_PATH lets a test (or a second instance) point at its own
+        # STRAINX_SETTINGS_PATH lets a test (or a second instance) point at its own
         # file. Relying on HOME/USERPROFILE for that is unreliable -- expanduser
         # consults several variables in a platform-specific order, so a test can
         # believe it is sandboxed and still write over the real settings.
-        override = os.environ.get("PYDIC_SETTINGS_PATH")
+        override = os.environ.get("STRAINX_SETTINGS_PATH")
         if override:
             return override
-        return os.path.join(os.path.expanduser("~"), ".pydic_settings.json")
+        return os.path.join(os.path.expanduser("~"), ".strainx_settings.json")
 
     def load_settings(self) -> None:
         import json, os
@@ -3011,7 +3011,7 @@ class DICAnalysis:
             parent = os.path.dirname(os.path.abspath(path))
             os.makedirs(parent, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(
-                prefix=".pydic_settings_", suffix=".tmp", dir=parent)
+                prefix=".strainx_settings_", suffix=".tmp", dir=parent)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                     json.dump(data, f, indent=4, ensure_ascii=False)

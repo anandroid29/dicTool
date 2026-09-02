@@ -1,7 +1,7 @@
 """
 components.py
 -------------
-Reusable UI components styled with PyDIC's global theme tokens.
+Reusable UI components styled with strainX's global theme tokens.
 """
 
 from PyQt6.QtCore import Qt
@@ -11,10 +11,10 @@ from PyQt6.QtWidgets import (
     QFrame, QSizePolicy,
 )
 
-from pydic.ui import render
+from strainx.ui import render
 
 # Import your raw color tokens
-from pydic.ui.theme import (
+from strainx.ui.theme import (
     C_ACCENT, C_ACCENT_G, C_ACCENT_D,
     C_SURFACE, C_BORDER, C_TEXT2, C_TEXT3, C_WARNING,
 )

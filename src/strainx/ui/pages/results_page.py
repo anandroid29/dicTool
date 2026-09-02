@@ -28,21 +28,21 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup,
 )
 
-from pydic.core.stats import field_summary
-from pydic.core.compact_field import finite_values, CompactField, CompactMask
-from pydic.core.units import LENGTH_UNIT_ORDER
-from pydic.ui import render
-from pydic.ui.components import ResultColorBar
-from pydic.ui.render import RangeSpec
+from strainx.core.stats import field_summary
+from strainx.core.compact_field import finite_values, CompactField, CompactMask
+from strainx.core.units import LENGTH_UNIT_ORDER
+from strainx.ui import render
+from strainx.ui.components import ResultColorBar
+from strainx.ui.render import RangeSpec
 
 if TYPE_CHECKING:
-    from pydic.ui.wizard import Wizard
+    from strainx.ui.wizard import Wizard
 
-from pydic.ui.image_canvas import ImageCanvas, marker_color
+from strainx.ui.image_canvas import ImageCanvas, marker_color
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from pydic.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_RAISED, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
+from strainx.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_RAISED, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
 
 _C_ACCENT = C_ACCENT
 _C_BG = C_BG
@@ -236,7 +236,7 @@ class _VideoWorker(QThread):
 
     def run(self):
         try:
-            from pydic.ui.video_export import export_video
+            from strainx.ui.video_export import export_video
             out = export_video(
                 self._analysis, self._spec, self._path, markers=self._markers,
                 results=self._temporal_results, pairs=self._temporal_pairs,
@@ -289,7 +289,7 @@ class _PairTask(QRunnable):
             if self._cancel_flag[0]:
                 raise RuntimeError("Temporal calculation cancelled.")
             if self._cache_path:
-                from pydic.core.temporal import save_temporal_result
+                from strainx.core.temporal import save_temporal_result
                 result = save_temporal_result(self._cache_path, result)
             self.signals.done.emit(
                 self._generation, self._index, result, "")
@@ -355,10 +355,10 @@ class _TemporalHistoryTask(QRunnable):
 
     def run(self) -> None:
         try:
-            from pydic.core.compact_field import CompactField
-            from pydic.core.strain import compute_velocity_strains
-            from pydic.core.strain_accum import StrainPathTracker
-            from pydic.core.temporal import save_temporal_result
+            from strainx.core.compact_field import CompactField
+            from strainx.core.strain import compute_velocity_strains
+            from strainx.core.strain_accum import StrainPathTracker
+            from strainx.core.temporal import save_temporal_result
 
             shape = tuple(int(value) for value in self._store[0].u.shape)
             roi = np.asarray(self._analysis._roi_mask, dtype=bool)
@@ -1130,7 +1130,7 @@ class ResultsPage(QWidget):
     def _on_calibration_changed(self, *_):
         if getattr(self, "_syncing_calibration", False):
             return
-        from pydic.core.units import Calibration
+        from strainx.core.units import Calibration
         unit = self._unit_combo.currentText()
         val = float(self._px_size_spin.value())
         self._wizard.analysis.calibration = (
@@ -1435,7 +1435,7 @@ class ResultsPage(QWidget):
             self._img_cache.move_to_end(path)
             return hit
         try:
-            from pydic.core.analysis import _load_image
+            from strainx.core.analysis import _load_image
             img = _load_image(path)
         except Exception as exc:
             print(f"Failed to load image {path}: {exc}")
@@ -1924,11 +1924,11 @@ class ResultsPage(QWidget):
         n = len(analysis.results)
         if n < 2:
             QMessageBox.information(
-                self, "PyDIC",
+                self, "strainX",
                 "Frame-pair averaging needs at least two analysed frames.")
             return
 
-        from pydic.ui.pages.frame_pair_dialog import FramePairDialog
+        from strainx.ui.pages.frame_pair_dialog import FramePairDialog
         dlg = FramePairDialog(
             n, analysis.fps, self._pair_list,
             strain_window=self._pair_strain_window,
@@ -2107,9 +2107,9 @@ class ResultsPage(QWidget):
 
     def _begin_pair_bulk(self) -> None:
         """Queue every generated temporal pair and expose aggregate progress."""
-        from pydic.core.temporal import TemporalResultSequence
+        from strainx.core.temporal import TemporalResultSequence
 
-        directory = tempfile.mkdtemp(prefix="pydic_temporal_")
+        directory = tempfile.mkdtemp(prefix="strainx_temporal_")
         self._pair_store = TemporalResultSequence(directory, self._pair_list)
         self._pair_store_dirs[self._pair_generation] = directory
         self._pair_bulk_ready.clear()
@@ -2130,7 +2130,7 @@ class ResultsPage(QWidget):
                 getattr(analysis, "last_backend", "cpu") == "gpu" and
                 getattr(analysis, "results", None)):
             return False
-        from pydic.core.cuda_native import native_cuda_available
+        from strainx.core.cuda_native import native_cuda_available
         return native_cuda_available()
 
     def _pair_backend_text(self) -> str:
@@ -2523,8 +2523,8 @@ class ResultsPage(QWidget):
             QMessageBox.warning(self, "Nothing to export", "Run an analysis first.")
             return
 
-        from pydic.ui.pages.video_export_dialog import VideoExportDialog
-        from pydic.ui.video_export import CODECS, export_video
+        from strainx.ui.pages.video_export_dialog import VideoExportDialog
+        from strainx.ui.video_export import CODECS, export_video
 
         temporal_export = (
             self._pair_mode and

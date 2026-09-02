@@ -1,6 +1,6 @@
-# PyDIC
+# strainX
 
-PyDIC is a desktop application for two-dimensional, full-field Digital Image
+strainX is a desktop application for two-dimensional, full-field Digital Image
 Correlation (DIC). It tracks a speckled surface through an image sequence and
 reports displacement, velocity, strain, and strain-rate fields through a PyQt6
 workflow. CPU analysis is always available; an optional native C++/CUDA backend
@@ -11,7 +11,7 @@ perform stereo DIC or reconstruct out-of-plane motion.
 
 ## Current result semantics
 
-PyDIC uses an updated-Lagrangian sequence: every image is correlated against the
+strainX uses an updated-Lagrangian sequence: every image is correlated against the
 immediately previous image. This distinction is important when interpreting the
 results.
 
@@ -56,8 +56,8 @@ with the out-of-plane term inferred from plastic incompressibility.
 Python 3.10 or newer is required.
 
 ```bash
-git clone https://github.com/anandroid29/PyDIC.git
-cd PyDIC
+git clone https://github.com/anandroid29/strainX.git
+cd strainX
 python -m venv .venv
 ```
 
@@ -78,7 +78,7 @@ root:
 
 ```bash
 python -m pip install -r requirements.txt
-python src/pydic/__main__.py
+python src/strainx/__main__.py
 ```
 
 The required packages are NumPy, SciPy, OpenCV, Matplotlib, PyQt6, Pillow,
@@ -116,20 +116,20 @@ semicolons; quote the value in shells that interpret semicolons:
 python scripts/build_cuda.py --arch "86;89;120"
 ```
 
-Run all commands from the `PyDIC` repository root. CMake configuration, object
+Run all commands from the `strainX` repository root. CMake configuration, object
 files, import libraries, and the final shared library are written under the
-ignored root-level directory `build/native_cuda/`, never under `src/pydic`.
+ignored root-level directory `build/native_cuda/`, never under `src/strainx`.
 Typical outputs are:
 
 ```text
-build/native_cuda/bin/Release/pydic_cuda.dll   Windows Release build
-build/native_cuda/bin/libpydic_cuda.so         Linux single-config build
+build/native_cuda/bin/Release/strainx_cuda.dll   Windows Release build
+build/native_cuda/bin/libstrainx_cuda.so         Linux single-config build
 ```
 
 Use `python scripts/build_cuda.py --clean` to remove only that native build tree
-before rebuilding. After a successful build, restart PyDIC and select **Use
+before rebuilding. After a successful build, restart strainX and select **Use
 native C++/CUDA acceleration** on the Parameters page. Advanced deployments may
-point `PYDIC_CUDA_LIBRARY` at an explicitly packaged shared library.
+point `STRAINX_CUDA_LIBRARY` at an explicitly packaged shared library.
 
 The GPU is an acceleration backend, not a different measurement convention.
 Native CUDA owns NCC seeding, affine IC-GN, reliability-guided wave propagation,
@@ -158,7 +158,7 @@ Choose one of the following sources:
 - **HDF5:** reopen a previously saved analysis directly in Results.
 
 The effective frame rate determines the interval used for velocity and strain
-rate. When no reliable rate is available, PyDIC uses an interval of one second.
+rate. When no reliable rate is available, strainX uses an interval of one second.
 
 ### 2. Static ROI
 
@@ -255,7 +255,7 @@ and feature scale; the defaults are starting points, not universal settings.
 
 ### 5. Analysis
 
-PyDIC tracks each current frame from the immediately previous one on a fresh
+strainX tracks each current frame from the immediately previous one on a fresh
 spatial grid. Integer-pixel NCC provides or repairs an initial guess, IC-GN
 refines it to sub-pixel precision, and a reliability-guided wavefront propagates
 good solutions through the ROI. The previous interval may supply numerical CPU
@@ -389,7 +389,7 @@ checks require their local sample frames.
 
 ## Important limitations
 
-- PyDIC is 2D DIC. Out-of-plane displacement, perspective change, defocus, and
+- strainX is 2D DIC. Out-of-plane displacement, perspective change, defocus, and
   major illumination changes can appear as false in-plane motion or correlation
   loss.
 - Reliable measurement requires a suitable random, high-contrast speckle pattern
@@ -410,7 +410,7 @@ checks require their local sample frames.
 ## Project structure
 
 ```text
-PyDIC/
+strainX/
 |-- README.md
 |-- requirements.txt
 |-- scripts/
@@ -418,7 +418,7 @@ PyDIC/
 |-- tests/
 |-- build/                 Generated and ignored; created by build_cuda.py
 `-- src/                   Python source root (not an import package)
-    `-- pydic/             The actual import package
+    `-- strainx/             The actual import package
         |-- __main__.py          Application entry point
         |-- core/
         |   |-- analysis.py       Sequence orchestration, results, and persistence
@@ -428,8 +428,8 @@ PyDIC/
         |   |-- ncc.py            Integer-pixel initial search
         |   |-- native_cuda/      C++/CUDA source and CMake project only
         |   |   |-- CMakeLists.txt
-        |   |   |-- pydic_cuda.cu
-        |   |   `-- pydic_cuda.h
+        |   |   |-- strainx_cuda.cu
+        |   |   `-- strainx_cuda.h
         |   |-- rg_dic.py         CPU reliability-guided DIC and parameters
         |   |-- strain.py         Gradient fitting and strain-rate calculation
         |   |-- strain_accum.py   Continuous material-path strain transport

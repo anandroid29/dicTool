@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from pydic.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_DANGER, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2
+from strainx.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_DANGER, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2
 
 _C_ACCENT = C_ACCENT
 _C_BORDER = C_BORDER
@@ -29,7 +29,7 @@ _C_TEXT2 = C_TEXT2
 
 
 if TYPE_CHECKING:
-    from pydic.ui.wizard import Wizard
+    from strainx.ui.wizard import Wizard
 
 
 
@@ -189,7 +189,7 @@ class AnalysisPage(QWidget):
         self._thread = threading.Thread(
             target=self._run_analysis,
             args=(analysis, seed_xy, use_gpu),
-            name="PyDIC-analysis",
+            name="strainX-analysis",
             daemon=True,
         )
         self._worker_poll.start()

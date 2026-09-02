@@ -19,20 +19,20 @@ from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QCheckBox, QDialogButtonBox, QLabel
 
-from pydic.core.units import Calibration
-from pydic.core.analysis import DICAnalysis
-from pydic.core.rg_dic import DICParams
-from pydic.ui.pages.params_page import ParamsPage
-from pydic.ui.pages.roi_page import ROIPage
-from pydic.ui.pages.dynamic_roi_page import DynamicROIPage
-from pydic.ui.pages.analysis_page import AnalysisPage
-from pydic.ui.pages.results_page import FIELDS, FIELD_GROUPS
-from pydic.ui.image_canvas import ImageCanvas, ROITool, _polyline_mask
-from pydic.ui.components import FooterButton
-from pydic.ui.pages.welcome_page import (
+from strainx.core.units import Calibration
+from strainx.core.analysis import DICAnalysis
+from strainx.core.rg_dic import DICParams
+from strainx.ui.pages.params_page import ParamsPage
+from strainx.ui.pages.roi_page import ROIPage
+from strainx.ui.pages.dynamic_roi_page import DynamicROIPage
+from strainx.ui.pages.analysis_page import AnalysisPage
+from strainx.ui.pages.results_page import FIELDS, FIELD_GROUPS
+from strainx.ui.image_canvas import ImageCanvas, ROITool, _polyline_mask
+from strainx.ui.components import FooterButton
+from strainx.ui.pages.welcome_page import (
     ImageLoadSettingsDialog, WelcomePage, _deduplicate_image_paths,
 )
-from pydic.ui.video_importer import VideoImporterDialog
+from strainx.ui.video_importer import VideoImporterDialog
 
 
 class ImportCalibrationUITests(unittest.TestCase):
@@ -564,7 +564,7 @@ class ImportCalibrationUITests(unittest.TestCase):
         page.close()
 
     def test_wizard_moves_from_analysis_to_results_after_worker_exit(self):
-        from pydic.ui.wizard import Wizard
+        from strainx.ui.wizard import Wizard
 
         wizard = Wizard()
         wizard.analysis.run = lambda progress_cb, seed_xy, use_gpu: None

@@ -1,4 +1,4 @@
-"""Configure and build PyDIC's native C++/CUDA runtime.
+"""Configure and build strainX's native C++/CUDA runtime.
 
 Usage:
     python scripts/build_cuda.py
@@ -18,7 +18,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src" / "pydic" / "core" / "native_cuda"
+SOURCE = ROOT / "src" / "strainx" / "core" / "native_cuda"
 BUILD = ROOT / "build" / "native_cuda"
 
 
@@ -57,14 +57,14 @@ def main() -> int:
     run(configure)
     run(["cmake", "--build", str(BUILD), "--config", args.config, "--parallel"])
 
-    names = ("pydic_cuda.dll", "libpydic_cuda.so", "libpydic_cuda.dylib")
+    names = ("strainx_cuda.dll", "libstrainx_cuda.so", "libstrainx_cuda.dylib")
     products = [path for name in names for path in (BUILD / "bin").glob(f"**/{name}")]
     if not products:
         raise SystemExit(
             "Build completed but the native CUDA library was not found under "
             f"{BUILD / 'bin'}.")
     print(f"Built {products[0]}")
-    print("Restart PyDIC; the Parameters page will detect the native backend.")
+    print("Restart strainX; the Parameters page will detect the native backend.")
     return 0
 
 

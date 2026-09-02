@@ -6,9 +6,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from pydic.core.units import Calibration
-from pydic.ui.pages.results_page import ResultsPage
-from pydic.ui.video_export import ViewRenderer
+from strainx.core.units import Calibration
+from strainx.ui.pages.results_page import ResultsPage
+from strainx.ui.video_export import ViewRenderer
 
 
 def test_three_digit_micrometre_velocity_promotes_to_millimetres():

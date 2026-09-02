@@ -9,11 +9,11 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pydic.core.analysis import DICAnalysis, PairResult
-from pydic.core.rg_dic import DICParams
-from pydic.core.strain_accum import StrainPathTracker
-from pydic.core.units import Calibration
-from pydic.ui.render import field_to_rgba
+from strainx.core.analysis import DICAnalysis, PairResult
+from strainx.core.rg_dic import DICParams
+from strainx.core.strain_accum import StrainPathTracker
+from strainx.core.units import Calibration
+from strainx.ui.render import field_to_rgba
 
 
 def full(shape, value):
@@ -301,7 +301,7 @@ class StatePersistenceTests(unittest.TestCase):
     def test_calibration_gpu_and_rescue_radius_are_cached(self):
         with tempfile.TemporaryDirectory() as td:
             settings = str(Path(td) / "settings.json")
-            with patch.dict("os.environ", {"PYDIC_SETTINGS_PATH": settings}):
+            with patch.dict("os.environ", {"STRAINX_SETTINGS_PATH": settings}):
                 saved = DICAnalysis()
                 saved.calibration = Calibration.from_pixel_size(12.5, "µm")
                 saved.prefer_gpu = False

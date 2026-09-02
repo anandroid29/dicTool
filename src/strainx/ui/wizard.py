@@ -7,15 +7,15 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QSizePolicy,
 )
 
-from pydic.core.analysis import DICAnalysis
-from pydic.ui.theme import STYLESHEET
-from pydic.ui.components import WizardStepper
-from pydic.ui.pages.welcome_page import WelcomePage
-from pydic.ui.pages.roi_page import ROIPage
-from pydic.ui.pages.dynamic_roi_page import DynamicROIPage
-from pydic.ui.pages.params_page import ParamsPage
-from pydic.ui.pages.analysis_page import AnalysisPage
-from pydic.ui.pages.results_page import ResultsPage
+from strainx.core.analysis import DICAnalysis
+from strainx.ui.theme import STYLESHEET
+from strainx.ui.components import WizardStepper
+from strainx.ui.pages.welcome_page import WelcomePage
+from strainx.ui.pages.roi_page import ROIPage
+from strainx.ui.pages.dynamic_roi_page import DynamicROIPage
+from strainx.ui.pages.params_page import ParamsPage
+from strainx.ui.pages.analysis_page import AnalysisPage
+from strainx.ui.pages.results_page import ResultsPage
 
 # Dynamic ROI sits between the static ROI and the numeric parameters: it is a
 # masking decision, so it belongs with the other masking step rather than as a
@@ -30,7 +30,7 @@ class Wizard(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("PyDIC  ·  Digital Image Correlation")
+        self.setWindowTitle("strainX  ·  Digital Image Correlation")
         self.setMinimumSize(1200, 720)
         self.resize(1440, 900)
 

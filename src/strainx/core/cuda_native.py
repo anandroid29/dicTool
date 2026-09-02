@@ -1,4 +1,4 @@
-"""Thin ctypes boundary to PyDIC's native C++/CUDA runtime.
+"""Thin ctypes boundary to strainX's native C++/CUDA runtime.
 
 The compiled library owns every numerical operation used by CUDA mode,
 including host-side NCC/wavefront scheduling. Python supplies contiguous input
@@ -31,9 +31,9 @@ _U8_P = C.POINTER(C.c_uint8)
 def _library_candidates() -> list[Path]:
     repository = Path(__file__).resolve().parents[3]
     build = repository / "build" / "native_cuda" / "bin"
-    names = ("pydic_cuda.dll", "libpydic_cuda.so", "libpydic_cuda.dylib")
+    names = ("strainx_cuda.dll", "libstrainx_cuda.so", "libstrainx_cuda.dylib")
     candidates: list[Path] = []
-    override = os.environ.get("PYDIC_CUDA_LIBRARY")
+    override = os.environ.get("STRAINX_CUDA_LIBRARY")
     if override:
         candidates.append(Path(override).expanduser())
     for directory in (build, build / "Release", build / "Debug"):
@@ -42,47 +42,47 @@ def _library_candidates() -> list[Path]:
 
 
 def _configure(lib) -> None:
-    lib.pydic_cuda_version.argtypes = []
-    lib.pydic_cuda_version.restype = C.c_char_p
-    lib.pydic_cuda_abi_version.argtypes = []
-    lib.pydic_cuda_abi_version.restype = C.c_uint32
-    lib.pydic_cuda_last_error.argtypes = []
-    lib.pydic_cuda_last_error.restype = C.c_char_p
-    lib.pydic_cuda_device_count.argtypes = []
-    lib.pydic_cuda_device_count.restype = C.c_int
-    lib.pydic_cuda_synchronize.argtypes = []
-    lib.pydic_cuda_synchronize.restype = C.c_int
-    lib.pydic_cuda_memory_info.argtypes = [
+    lib.strainx_cuda_version.argtypes = []
+    lib.strainx_cuda_version.restype = C.c_char_p
+    lib.strainx_cuda_abi_version.argtypes = []
+    lib.strainx_cuda_abi_version.restype = C.c_uint32
+    lib.strainx_cuda_last_error.argtypes = []
+    lib.strainx_cuda_last_error.restype = C.c_char_p
+    lib.strainx_cuda_device_count.argtypes = []
+    lib.strainx_cuda_device_count.restype = C.c_int
+    lib.strainx_cuda_synchronize.argtypes = []
+    lib.strainx_cuda_synchronize.restype = C.c_int
+    lib.strainx_cuda_memory_info.argtypes = [
         C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)]
-    lib.pydic_cuda_memory_info.restype = C.c_int
-    lib.pydic_cuda_solver_create.argtypes = [
+    lib.strainx_cuda_memory_info.restype = C.c_int
+    lib.strainx_cuda_solver_create.argtypes = [
         C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_double, C.c_double,
         C.c_int]
-    lib.pydic_cuda_solver_create.restype = C.c_void_p
-    lib.pydic_cuda_solver_destroy.argtypes = [C.c_void_p]
-    lib.pydic_cuda_solver_destroy.restype = None
-    lib.pydic_cuda_solver_precompute.argtypes = [
+    lib.strainx_cuda_solver_create.restype = C.c_void_p
+    lib.strainx_cuda_solver_destroy.argtypes = [C.c_void_p]
+    lib.strainx_cuda_solver_destroy.restype = None
+    lib.strainx_cuda_solver_precompute.argtypes = [
         C.c_void_p, _F64_P, _U8_P, C.c_int, C.c_int]
-    lib.pydic_cuda_solver_precompute.restype = C.c_int
-    lib.pydic_cuda_solver_ncc.argtypes = [
+    lib.strainx_cuda_solver_precompute.restype = C.c_int
+    lib.strainx_cuda_solver_ncc.argtypes = [
         C.c_void_p, _F64_P, C.c_int, C.c_double, C.c_double,
         C.POINTER(C.c_double), C.POINTER(C.c_double),
         C.POINTER(C.c_double)]
-    lib.pydic_cuda_solver_ncc.restype = C.c_int
-    lib.pydic_cuda_solver_icgn.argtypes = [
+    lib.strainx_cuda_solver_ncc.restype = C.c_int
+    lib.strainx_cuda_solver_icgn.argtypes = [
         C.c_void_p, _F64_P, C.c_int, _F64_P, _F64_P,
         C.POINTER(C.c_double), C.POINTER(C.c_uint8)]
-    lib.pydic_cuda_solver_icgn.restype = C.c_int
-    lib.pydic_cuda_solver_solve.argtypes = [
+    lib.strainx_cuda_solver_icgn.restype = C.c_int
+    lib.strainx_cuda_solver_solve.argtypes = [
         C.c_void_p, _F64_P, C.c_int, C.c_int, C.c_double, C.c_double,
         _F64_P, _F64_P, _F64_P, _F64_P, _F64_P, _F64_P, _F64_P]
-    lib.pydic_cuda_solver_solve.restype = C.c_int
-    lib.pydic_cuda_solver_update_reference.argtypes = [C.c_void_p, _F64_P]
-    lib.pydic_cuda_solver_update_reference.restype = C.c_int
-    lib.pydic_cuda_plane_fit.argtypes = [
+    lib.strainx_cuda_solver_solve.restype = C.c_int
+    lib.strainx_cuda_solver_update_reference.argtypes = [C.c_void_p, _F64_P]
+    lib.strainx_cuda_solver_update_reference.restype = C.c_int
+    lib.strainx_cuda_plane_fit.argtypes = [
         _F64_P, _F64_P, _U8_P, C.c_int, C.c_int, C.c_int,
         _F64_P, _F64_P, _F64_P, _F64_P]
-    lib.pydic_cuda_plane_fit.restype = C.c_int
+    lib.strainx_cuda_plane_fit.restype = C.c_int
 
 
 def _load_library():
@@ -99,7 +99,7 @@ def _load_library():
             try:
                 lib = C.CDLL(str(candidate))
                 _configure(lib)
-                abi = int(lib.pydic_cuda_abi_version())
+                abi = int(lib.strainx_cuda_abi_version())
                 if abi != 2:
                     raise OSError(
                         f"native CUDA ABI {abi} is incompatible; expected 2")
@@ -115,7 +115,7 @@ def _load_library():
 
 
 def _native_error(lib) -> str:
-    raw = lib.pydic_cuda_last_error()
+    raw = lib.strainx_cuda_last_error()
     return raw.decode("utf-8", errors="replace") if raw else "Unknown native CUDA error."
 
 
@@ -126,7 +126,7 @@ def native_cuda_available(*, refresh: bool = False) -> bool:
             _LIB = None
             _LOAD_ERROR = None
     try:
-        return _load_library().pydic_cuda_device_count() > 0
+        return _load_library().strainx_cuda_device_count() > 0
     except Exception:
         return False
 
@@ -139,10 +139,10 @@ def native_cuda_library_present() -> bool:
 def native_cuda_diagnostic() -> str:
     try:
         lib = _load_library()
-        count = int(lib.pydic_cuda_device_count())
+        count = int(lib.strainx_cuda_device_count())
         if count <= 0:
             return _native_error(lib)
-        version = (lib.pydic_cuda_version() or b"unknown").decode("ascii", "replace")
+        version = (lib.strainx_cuda_version() or b"unknown").decode("ascii", "replace")
         return f"Native CUDA {version}; {count} CUDA device(s) available"
     except Exception as exc:
         return str(exc)
@@ -152,7 +152,7 @@ def native_cuda_memory_info() -> tuple[int, int]:
     """Return (free_bytes, total_bytes) from the native CUDA runtime."""
     lib = _load_library()
     free_bytes, total_bytes = C.c_uint64(), C.c_uint64()
-    if lib.pydic_cuda_memory_info(C.byref(free_bytes), C.byref(total_bytes)) != 0:
+    if lib.strainx_cuda_memory_info(C.byref(free_bytes), C.byref(total_bytes)) != 0:
         raise NativeCudaError(_native_error(lib))
     return int(free_bytes.value), int(total_bytes.value)
 
@@ -183,9 +183,9 @@ class NativeCudaSolver:
                 "Native CUDA currently supports only first-order affine "
                 "shape functions; select CPU mode for second-order DIC.")
         self._lib = _load_library()
-        if self._lib.pydic_cuda_device_count() <= 0:
+        if self._lib.strainx_cuda_device_count() <= 0:
             raise NativeCudaError(_native_error(self._lib))
-        self._handle = self._lib.pydic_cuda_solver_create(
+        self._handle = self._lib.strainx_cuda_solver_create(
             int(params.subset_radius), int(params.subset_spacing),
             int(params.search_radius), int(getattr(params, "rescue_radius", 12)),
             int(params.max_iter), float(params.conv_tol), float(params.corr_cutoff),
@@ -198,7 +198,7 @@ class NativeCudaSolver:
     def close(self) -> None:
         handle, self._handle = self._handle, None
         if handle:
-            self._lib.pydic_cuda_solver_destroy(handle)
+            self._lib.strainx_cuda_solver_destroy(handle)
 
     def __del__(self):
         try:
@@ -220,7 +220,7 @@ class NativeCudaSolver:
         self.gx_flat = gx.ravel()
         self.gy_flat = gy.ravel()
         self.valid_mask = np.asarray(roi[self.gy_flat, self.gx_flat], dtype=bool)
-        status = self._lib.pydic_cuda_solver_precompute(
+        status = self._lib.strainx_cuda_solver_precompute(
             self._handle, _f64_ptr(reference), roi.ctypes.data_as(_U8_P),
             self.H, self.W)
         if status != 0:
@@ -241,7 +241,7 @@ class NativeCudaSolver:
         if current.shape != (self.H, self.W):
             raise ValueError("Current image shape does not match the reference.")
         u, v, zncc = C.c_double(), C.c_double(), C.c_double()
-        status = self._lib.pydic_cuda_solver_ncc(
+        status = self._lib.strainx_cuda_solver_ncc(
             self._handle, _f64_ptr(current), int(grid_index),
             float(guess_u), float(guess_v),
             C.byref(u), C.byref(v), C.byref(zncc))
@@ -262,7 +262,7 @@ class NativeCudaSolver:
             raise ValueError("Current image shape does not match the reference.")
         output = np.empty(6, dtype=np.float64)
         znssd, accepted = C.c_double(), C.c_uint8()
-        status = self._lib.pydic_cuda_solver_icgn(
+        status = self._lib.strainx_cuda_solver_icgn(
             self._handle, _f64_ptr(current), int(grid_index),
             _f64_ptr(initial), _f64_ptr(output), C.byref(znssd),
             C.byref(accepted))
@@ -278,7 +278,7 @@ class NativeCudaSolver:
         if current_array is not None and current_array.shape != (self.H, self.W):
             raise ValueError("Current image shape does not match the reference.")
         outputs = self._outputs()
-        status = self._lib.pydic_cuda_solver_solve(
+        status = self._lib.strainx_cuda_solver_solve(
             self._handle, _f64_ptr(current_array), int(mode), int(seed_idx),
             float(guess_u), float(guess_v),
             *(_f64_ptr(output) for output in outputs))
@@ -313,7 +313,7 @@ class NativeCudaSolver:
         array = None if promote else _f64(new_reference)
         if array is not None and array.shape != (self.H, self.W):
             raise ValueError("Updated reference shape does not match the solver.")
-        status = self._lib.pydic_cuda_solver_update_reference(
+        status = self._lib.strainx_cuda_solver_update_reference(
             self._handle, _f64_ptr(array))
         if status != 0:
             raise NativeCudaError(_native_error(self._lib))
@@ -322,14 +322,14 @@ class NativeCudaSolver:
     @staticmethod
     def release_temporary_memory() -> None:
         lib = _load_library()
-        if lib.pydic_cuda_synchronize() != 0:
+        if lib.strainx_cuda_synchronize() != 0:
             raise NativeCudaError(_native_error(lib))
 
 
 def native_plane_fit(vx: np.ndarray, vy: np.ndarray, component_mask: np.ndarray,
                      radius: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     lib = _load_library()
-    if lib.pydic_cuda_device_count() <= 0:
+    if lib.strainx_cuda_device_count() <= 0:
         raise NativeCudaError(_native_error(lib))
     vx = _f64(vx)
     vy = _f64(vy)
@@ -337,7 +337,7 @@ def native_plane_fit(vx: np.ndarray, vy: np.ndarray, component_mask: np.ndarray,
     if vx.ndim != 2 or vy.shape != vx.shape or mask.shape != vx.shape:
         raise ValueError("Plane-fit arrays must have matching 2-D shapes.")
     outputs = tuple(np.empty_like(vx) for _ in range(4))
-    status = lib.pydic_cuda_plane_fit(
+    status = lib.strainx_cuda_plane_fit(
         _f64_ptr(vx), _f64_ptr(vy), mask.ctypes.data_as(_U8_P),
         vx.shape[0], vx.shape[1], int(radius),
         *(_f64_ptr(output) for output in outputs))
