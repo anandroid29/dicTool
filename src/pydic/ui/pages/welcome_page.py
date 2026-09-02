@@ -13,16 +13,16 @@ from PyQt6.QtWidgets import (
     QMessageBox, QProgressDialog,
 )
 
-from src.core.units import Calibration
+from pydic.core.units import Calibration
 
 if TYPE_CHECKING:
-    from src.ui.wizard import Wizard
-from src.ui.components import FooterButton
-from src.ui.image_importer import ImageSequenceImporterDialog
+    from pydic.ui.wizard import Wizard
+from pydic.ui.components import FooterButton
+from pydic.ui.image_importer import ImageSequenceImporterDialog
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+from pydic.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_ACCENT = C_ACCENT
 _C_BG = C_BG
@@ -33,6 +33,36 @@ _C_SURFACE = C_SURFACE
 _C_TEXT = C_TEXT
 _C_TEXT2 = C_TEXT2
 _C_TEXT3 = C_TEXT3
+
+
+# When an export folder contains two encodings of the same numbered frame
+# (for example frame_000001.png and frame_000001.tiff), treating both files as
+# successive images creates a zero-motion pair between every real pair. Prefer
+# the highest-fidelity encoding and keep exactly one path per basename stem.
+_IMAGE_EXTENSION_PRIORITY = {
+    ".tiff": 0, ".tif": 1, ".png": 2,
+    ".bmp": 3, ".jpg": 4, ".jpeg": 5,
+}
+
+
+def _deduplicate_image_paths(paths: list[str]) -> tuple[list[str], int]:
+    """Return one deterministic image per case-insensitive basename stem."""
+    selected: dict[str, str] = {}
+    for path in paths:
+        stem, ext = os.path.splitext(os.path.basename(path))
+        key = stem.casefold()
+        incumbent = selected.get(key)
+        if incumbent is None:
+            selected[key] = path
+            continue
+        incumbent_ext = os.path.splitext(incumbent)[1].lower()
+        candidate_rank = _IMAGE_EXTENSION_PRIORITY.get(ext.lower(), 99)
+        incumbent_rank = _IMAGE_EXTENSION_PRIORITY.get(incumbent_ext, 99)
+        if (candidate_rank, path.casefold()) < (incumbent_rank,
+                                               incumbent.casefold()):
+            selected[key] = path
+    unique = sorted(selected.values(), key=str.casefold)
+    return unique, len(paths) - len(unique)
 
 
 # color shortcuts
@@ -52,7 +82,7 @@ class _HDF5LoadWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         try:
-            from src.core.analysis import DICAnalysis
+            from pydic.core.analysis import DICAnalysis
             analysis = DICAnalysis()
             analysis.load_hdf5(
                 self.path,
@@ -301,7 +331,7 @@ class WelcomePage(QWidget):
         root.addWidget(footer)
 
     def _import_video(self) -> None:
-        from src.ui.video_importer import VideoImporterDialog
+        from pydic.ui.video_importer import VideoImporterDialog
 
         start_dir = self._get_safe_start_dir("last_video_directory")
         dlg = VideoImporterDialog(
@@ -384,11 +414,18 @@ class WelcomePage(QWidget):
             QMessageBox.critical(self, "Could not read folder", f"Could not read folder:\n{e}")
             return
 
-        img_files.sort()
+        img_files, duplicate_count = _deduplicate_image_paths(img_files)
 
         if len(img_files) < 2:
             QMessageBox.warning(self, "Not enough images", "The folder must contain at least 2 images.")
             return
+
+        if duplicate_count:
+            QMessageBox.information(
+                self, "Duplicate frame encodings ignored",
+                f"Ignored {duplicate_count} image file(s) whose frame name "
+                "was already present in another format. One image per frame "
+                "will be analysed.")
 
         # Attempt to read metadata
         original_fps = None

@@ -7,13 +7,13 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "pydic"))
+sys.path.insert(0, str(ROOT / "src"))
 
-from src.core.analysis import DICAnalysis, PairResult
-from src.core.rg_dic import DICParams
-from src.core.strain_accum import StrainPathTracker
-from src.core.units import Calibration
-from src.ui.render import field_to_rgba
+from pydic.core.analysis import DICAnalysis, PairResult
+from pydic.core.rg_dic import DICParams
+from pydic.core.strain_accum import StrainPathTracker
+from pydic.core.units import Calibration
+from pydic.ui.render import field_to_rgba
 
 
 def full(shape, value):

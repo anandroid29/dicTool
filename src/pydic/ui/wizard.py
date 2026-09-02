@@ -7,15 +7,15 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QSizePolicy,
 )
 
-from src.core.analysis import DICAnalysis
-from src.ui.theme import STYLESHEET
-from src.ui.components import WizardStepper
-from src.ui.pages.welcome_page import WelcomePage
-from src.ui.pages.roi_page import ROIPage
-from src.ui.pages.dynamic_roi_page import DynamicROIPage
-from src.ui.pages.params_page import ParamsPage
-from src.ui.pages.analysis_page import AnalysisPage
-from src.ui.pages.results_page import ResultsPage
+from pydic.core.analysis import DICAnalysis
+from pydic.ui.theme import STYLESHEET
+from pydic.ui.components import WizardStepper
+from pydic.ui.pages.welcome_page import WelcomePage
+from pydic.ui.pages.roi_page import ROIPage
+from pydic.ui.pages.dynamic_roi_page import DynamicROIPage
+from pydic.ui.pages.params_page import ParamsPage
+from pydic.ui.pages.analysis_page import AnalysisPage
+from pydic.ui.pages.results_page import ResultsPage
 
 # Dynamic ROI sits between the static ROI and the numeric parameters: it is a
 # masking decision, so it belongs with the other masking step rather than as a

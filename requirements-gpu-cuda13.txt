@@ -1,2 +1,0 @@
--r requirements.txt
-cupy-cuda13x>=14.0,<15

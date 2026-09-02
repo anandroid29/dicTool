@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.ui.pages.results_page import _interpolate_between_subset_centres
+from pydic.ui.pages.results_page import _interpolate_between_subset_centres
 
 
 def _field():

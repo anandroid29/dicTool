@@ -13,24 +13,26 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "pydic"))
+sys.path.insert(0, str(ROOT / "src"))
 
 from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QCheckBox, QDialogButtonBox, QLabel
 
-from src.core.units import Calibration
-from src.core.analysis import DICAnalysis
-from src.core.rg_dic import DICParams
-from src.ui.pages.params_page import ParamsPage
-from src.ui.pages.roi_page import ROIPage
-from src.ui.pages.dynamic_roi_page import DynamicROIPage
-from src.ui.pages.analysis_page import AnalysisPage
-from src.ui.pages.results_page import FIELDS, FIELD_GROUPS
-from src.ui.image_canvas import ImageCanvas, ROITool, _polyline_mask
-from src.ui.components import FooterButton
-from src.ui.pages.welcome_page import ImageLoadSettingsDialog, WelcomePage
-from src.ui.video_importer import VideoImporterDialog
+from pydic.core.units import Calibration
+from pydic.core.analysis import DICAnalysis
+from pydic.core.rg_dic import DICParams
+from pydic.ui.pages.params_page import ParamsPage
+from pydic.ui.pages.roi_page import ROIPage
+from pydic.ui.pages.dynamic_roi_page import DynamicROIPage
+from pydic.ui.pages.analysis_page import AnalysisPage
+from pydic.ui.pages.results_page import FIELDS, FIELD_GROUPS
+from pydic.ui.image_canvas import ImageCanvas, ROITool, _polyline_mask
+from pydic.ui.components import FooterButton
+from pydic.ui.pages.welcome_page import (
+    ImageLoadSettingsDialog, WelcomePage, _deduplicate_image_paths,
+)
+from pydic.ui.video_importer import VideoImporterDialog
 
 
 class ImportCalibrationUITests(unittest.TestCase):
@@ -94,6 +96,23 @@ class ImportCalibrationUITests(unittest.TestCase):
         self.assertAlmostEqual(restored.pixel_size_in("mm"), 0.04)
         self.assertEqual(restored.display_unit, "mm")
         dialog.close()
+
+    def test_image_folder_deduplicates_same_frame_in_multiple_formats(self):
+        paths = [
+            os.path.join("frames", "frame_000002.png"),
+            os.path.join("frames", "frame_000001.png"),
+            os.path.join("frames", "frame_000001.tiff"),
+            os.path.join("frames", "frame_000002.tif"),
+            os.path.join("frames", "frame_000003.jpg"),
+        ]
+
+        unique, ignored = _deduplicate_image_paths(paths)
+
+        self.assertEqual(ignored, 2)
+        self.assertEqual(
+            [os.path.basename(path) for path in unique],
+            ["frame_000001.tiff", "frame_000002.tif", "frame_000003.jpg"],
+        )
 
     def test_image_importer_previews_exact_start_sample_and_limit(self):
         files = [f"frame_{index:03d}.png" for index in reversed(range(12))]
@@ -545,7 +564,7 @@ class ImportCalibrationUITests(unittest.TestCase):
         page.close()
 
     def test_wizard_moves_from_analysis_to_results_after_worker_exit(self):
-        from src.ui.wizard import Wizard
+        from pydic.ui.wizard import Wizard
 
         wizard = Wizard()
         wizard.analysis.run = lambda progress_cb, seed_xy, use_gpu: None

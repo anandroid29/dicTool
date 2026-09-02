@@ -44,7 +44,8 @@ class DICParams:
     # Half-width of the GPU solver's per-subset integer-shift rescue sweep.
     # Deliberately separate from search_radius and deliberately small: a wide
     # sweep over quasi-periodic speckle locks onto false ZNSSD minima. Raising
-    # this trades robustness for reach -- see icgn_gpu.py for the measurement.
+    # this trades robustness for reach; keep it narrow enough to avoid false
+    # minima in quasi-periodic speckle.
     rescue_radius:  int   = 12
     dynamic_roi:    str   = "Hybrid"
     # Texture threshold for the dynamic ROI, normalised to [0, 1]. None keeps

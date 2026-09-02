@@ -17,20 +17,20 @@ import numpy as np
 from PyQt6.QtWidgets import QApplication, QWidget, QScrollArea, QCheckBox
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "pydic"))
+sys.path.insert(0, str(ROOT / "src"))
 
-from src.core.analysis import DICAnalysis, PairResult
-from src.core.rg_dic import DICParams
-from src.core.units import Calibration
-from src.ui.pages.results_page import CMAPS, FIELDS, ResultsPage
-from src.ui.pages.params_page import ParamsPage
-from src.ui.pages.dynamic_roi_page import DynamicROIPage
-from src.ui.image_canvas import ROITool
-from src.ui.pages.video_export_dialog import VideoExportDialog
-from src.ui.render import PanelSpec, RangeSpec
-from src.ui.video_export import ExportSpec, export_video
-from src.ui.video_importer import VideoImporterDialog
-from src.ui.theme import STYLESHEET
+from pydic.core.analysis import DICAnalysis, PairResult
+from pydic.core.rg_dic import DICParams
+from pydic.core.units import Calibration
+from pydic.ui.pages.results_page import CMAPS, FIELDS, ResultsPage
+from pydic.ui.pages.params_page import ParamsPage
+from pydic.ui.pages.dynamic_roi_page import DynamicROIPage
+from pydic.ui.image_canvas import ROITool
+from pydic.ui.pages.video_export_dialog import VideoExportDialog
+from pydic.ui.render import PanelSpec, RangeSpec
+from pydic.ui.video_export import ExportSpec, export_video
+from pydic.ui.video_importer import VideoImporterDialog
+from pydic.ui.theme import STYLESHEET
 
 
 OUT = ROOT / "output" / "verification" / "ui"

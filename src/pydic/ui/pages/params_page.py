@@ -12,16 +12,16 @@ from PyQt6.QtWidgets import (
     QFrame, QGridLayout, QSizePolicy, QCheckBox, QComboBox, QScrollArea
 )
 
-from src.ui.components import FooterButton
+from pydic.ui.components import FooterButton
 
 if TYPE_CHECKING:
-    from src.ui.wizard import Wizard
+    from pydic.ui.wizard import Wizard
 
-from src.ui.image_canvas import ImageCanvas
+from pydic.ui.image_canvas import ImageCanvas
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from src.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+from pydic.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_ACCENT = C_ACCENT
 _C_BORDER = C_BORDER
@@ -33,10 +33,11 @@ _C_TEXT2 = C_TEXT2
 _C_TEXT3 = C_TEXT3
 
 
-# Do not import CuPy or touch a CUDA device while constructing the UI. On a
-# working installation that alone creates a large context. The analysis worker
-# performs authoritative driver/device validation when GPU execution is chosen.
-_HAS_GPU = importlib.util.find_spec("cupy") is not None
+from pydic.core.cuda_native import native_cuda_library_present
+
+# Library presence is a filesystem-only UI check. The analysis worker performs
+# authoritative driver/device validation when CUDA execution is chosen.
+_HAS_GPU = native_cuda_library_present()
 
 
 
@@ -330,7 +331,7 @@ class ParamsPage(QWidget):
         foot_lay.addStretch()
 
         # ── GPU Acceleration Toggle ───────────────────────────────────
-        self._gpu_chk = QPushButton("Use GPU acceleration (CuPy)")
+        self._gpu_chk = QPushButton("Use native C++/CUDA acceleration")
         self._gpu_chk.setCheckable(True)
         self._gpu_chk.toggled.connect(lambda *_: self._update_order_note())
         self._gpu_chk.setFixedHeight(32)
@@ -339,18 +340,21 @@ class ParamsPage(QWidget):
         if _HAS_GPU:
             self._gpu_chk.setChecked(bool(getattr(self._wizard, "use_gpu", True)))
             self._gpu_chk.setStyleSheet(
-                f"QPushButton:checked {{ background: {_C_ACCENT}; color: white; border: 1px solid {_C_ACCENT}; border-radius:3px; padding: 0 12px; }}"
+                f"QPushButton:checked {{ background: {_C_ACCENT}; color: #ffffff; border: none; border-radius:3px; padding: 0 12px; }}"
                 f"QPushButton:!checked {{ background: transparent; color: {_C_TEXT2}; border: 1px solid {_C_BORDER}; border-radius:3px; padding: 0 12px; }}"
             )
             self._gpu_chk.setToolTip(
-                "CuPy is installed. The device is checked when analysis starts.")
+                "The native CUDA runtime is built. The NVIDIA device and "
+                "driver are checked when analysis starts.")
         else:
             self._gpu_chk.setChecked(False)
             self._gpu_chk.setEnabled(False)
             self._gpu_chk.setStyleSheet(
                 f"background: transparent; color: {_C_BORDER}; border: 1px solid {_C_BORDER}; border-radius:3px; padding: 0 12px;"
             )
-            self._gpu_chk.setToolTip("No compatible NVIDIA GPU or CuPy installation detected.")
+            self._gpu_chk.setToolTip(
+                "Native CUDA library not built. Run scripts/build_cuda.py "
+                "from the repository root.")
 
         foot_lay.addWidget(self._gpu_chk)
 
@@ -534,9 +538,9 @@ class ParamsPage(QWidget):
         # The GPU wavefront solver has no 12-parameter path; it would silently
         # keep running first order, so say so rather than let it look applied.
         if self._gpu_chk.isChecked():
-            msgs.append("<b style='color:#c2954f;'>GPU solver does not support "
-                        "2nd order</b>, so it will run 1st order. Turn off GPU "
-                        "acceleration to use it.")
+            msgs.append("<b style='color:#c2954f;'>GPU solver supports only "
+                        "1st order.</b> Select 1st order or turn off GPU "
+                        "acceleration before running.")
         msgs.append("2nd order lowers systematic error where strain curves "
                     "inside a subset, but roughly doubles random error on a "
                     "weak pattern. Measure before choosing it.")
@@ -550,7 +554,7 @@ class ParamsPage(QWidget):
                                     "Load a reference image first.")
             return
         try:
-            from src.core.shape_order import shape_order_report
+            from pydic.core.shape_order import shape_order_report
             mask = (self._preview_roi_mask if self._preview_roi_mask is not None
                     else self._wizard.analysis.roi_mask)
             r = shape_order_report(img, mask,
@@ -576,7 +580,7 @@ class ParamsPage(QWidget):
             f"If your shear zone curvature is below that, stay on 1st order.")
 
     def _reset_defaults(self) -> None:
-        from src.core.rg_dic import DICParams
+        from pydic.core.rg_dic import DICParams
         from PyQt6.QtWidgets import QMessageBox
 
         # 1. Reset core settings and overwrite JSON
@@ -632,7 +636,16 @@ class ParamsPage(QWidget):
         else:
             self._wizard.use_gpu = False
 
-        self._wizard.analysis.prefer_gpu = self._wizard.use_gpu
+        if (self._wizard.use_gpu and
+                int(getattr(self._wizard.analysis.params,
+                            "shape_order", 1)) != 1):
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Unsupported CUDA shape function",
+                "Native CUDA currently supports first-order affine DIC only. "
+                "Select 1st order, or turn off GPU acceleration to run the "
+                "second-order CPU solver.")
+            return
 
         self._wizard.analysis.save_settings()
         self._wizard.go_analysis()

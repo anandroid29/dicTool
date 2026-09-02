@@ -11,10 +11,10 @@ from PyQt6.QtWidgets import (
     QFrame, QSizePolicy,
 )
 
-from src.ui import render
+from pydic.ui import render
 
 # Import your raw color tokens
-from src.ui.theme import (
+from pydic.ui.theme import (
     C_ACCENT, C_ACCENT_G, C_ACCENT_D,
     C_SURFACE, C_BORDER, C_TEXT2, C_TEXT3, C_WARNING,
 )

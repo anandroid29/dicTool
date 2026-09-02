@@ -22,54 +22,11 @@ try:
 except ImportError:
     _HAVE_CV2 = False
 
-# Importing CuPy creates a CUDA context on some installations. Merely opening
-# the UI must not reserve hundreds of MB before the operator starts analysis.
-# The real import and driver validation happen in the GPU analysis path.
-_HAS_CUPY = importlib.util.find_spec("cupy") is not None
-
 from .rg_dic import DICParams
 from .compact_field import CompactField, CompactMask, finite_values
 from .roi_loader import load_roi_mask
 from .stats import field_summary, robust_limits
 from .units import Calibration
-
-
-def _targeted_gpu_recovery_seeds(gpu_solver, prev_image, cur_image,
-                                 inc_u, inc_v, guess_u, guess_v,
-                                 max_seeds: int = 32):
-    """One NCC seed per failed connected grid region, largest regions first."""
-    from scipy.ndimage import label, distance_transform_edt
-    from .ncc import ncc_initial_guess
-
-    solved = (np.isfinite(inc_u[gpu_solver.gy_flat, gpu_solver.gx_flat]) &
-              np.isfinite(inc_v[gpu_solver.gy_flat, gpu_solver.gx_flat]))
-    failed = (np.asarray(gpu_solver.valid_mask, dtype=bool) & ~solved).reshape(
-        gpu_solver.grid_shape)
-    labels, count = label(failed)
-    components = []
-    for component in range(1, count + 1):
-        mask = labels == component
-        size = int(mask.sum())
-        if size:
-            # An interior seed gives propagation room in every direction and
-            # avoids choosing a ragged dropout boundary.
-            iy, ix = np.unravel_index(
-                int(np.argmax(distance_transform_edt(mask))), mask.shape)
-            components.append((size, int(iy), int(ix)))
-
-    seeds = []
-    nx = gpu_solver.grid_shape[1]
-    for _size, iy, ix in sorted(components, reverse=True)[:max_seeds]:
-        idx = iy * nx + ix
-        x = int(gpu_solver.gx_flat[idx])
-        y = int(gpu_solver.gy_flat[idx])
-        u, v, _score = ncc_initial_guess(
-            prev_image, cur_image, x, y,
-            gpu_solver.params.subset_radius,
-            gpu_solver.params.search_radius, guess_u, guess_v)
-        seeds.append((idx, np.array(
-            [u, v, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)))
-    return seeds
 
 
 # Native (uncalibrated) unit of each exportable field, used to label exports.
@@ -673,8 +630,11 @@ class DICAnalysis:
     ) -> None:
 
         if use_gpu:
-            if not _HAS_CUPY:
-                raise RuntimeError("GPU acceleration requested but CuPy is not installed or NVIDIA drivers are missing.")
+            from .cuda_native import native_cuda_available, native_cuda_diagnostic
+            if not native_cuda_available():
+                raise RuntimeError(
+                    "GPU acceleration requested but the native CUDA backend "
+                    f"is unavailable: {native_cuda_diagnostic()}")
             self.last_backend = "gpu"
             self._run_gpu(progress_cb, seed_xy)
             return
@@ -810,8 +770,8 @@ class DICAnalysis:
             progress_cb(0.0, "Initializing GPU solver and precomputing reference...")
 
         try:
-            from .icgn_gpu import GPUWavefrontDIC
-            gpu_solver = GPUWavefrontDIC(self.params)
+            from .cuda_native import NativeCudaSolver
+            gpu_solver = NativeCudaSolver(self.params)
             gpu_solver.precompute_reference(self._ref_image, self._roi_mask)
         except Exception as e:
             raise RuntimeError(f"GPU initialization failed: {e}")
@@ -861,20 +821,16 @@ class DICAnalysis:
 
             if not warm_start_active:
                 if progress_cb:
-                    progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.3, f"[{i + 1}/{n_frames}] Global NCC Search...")
-
-                guess_u, guess_v, _ = ncc_initial_guess(
-                    prev_image, cur_image, current_seed_x, current_seed_y,
-                    self.params.subset_radius, self.params.search_radius,
-                    guess_u, guess_v
-                )
-                seed_p = np.array([guess_u, guess_v, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                    progress_cb(
+                        0.90 * (i / n_frames) + (0.90 / n_frames) * 0.3,
+                        f"[{i + 1}/{n_frames}] Native CUDA NCC seed search...")
 
                 if progress_cb:
                     progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.6, f"[{i + 1}/{n_frames}] Growing Wavefront...")
 
                 inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx, inc_dv_dy, corr_f = gpu_solver.solve_frame(
-                    cur_image, seed_idx=seed_idx, seed_p=seed_p, warm_start=False
+                    cur_image, seed_idx=seed_idx,
+                    seed_guess=(guess_u, guess_v), warm_start=False
                 )
                 warm_start_active = True
 
@@ -890,7 +846,12 @@ class DICAnalysis:
                     np.isfinite(inc_u[self._roi_mask]) &
                     np.isfinite(inc_v[self._roi_mask]) &
                     np.isfinite(corr_f[self._roi_mask]))
-                survival_rate = valid_count / max(1, expected_subsets)
+                # Warm-start health is retention relative to the preceding
+                # solve, not coverage of the entire static ROI. The latter can
+                # be mostly outside the currently visible/textured material and
+                # caused sound warm pairs to be discarded on alternating frames.
+                survival_rate = valid_count / max(
+                    1, int(getattr(self, "_previous_solver_valid_count", valid_count)))
 
                 if survival_rate < 0.60:
                     print(f"\n[TARGETED RECOVERY] Frame {i+1} dropped to "
@@ -900,13 +861,14 @@ class DICAnalysis:
                     if progress_cb:
                         progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.7, f"[{i + 1}/{n_frames}] Jolt detected. Repairing via NCC...")
 
-                    recovery_seeds = _targeted_gpu_recovery_seeds(
-                        gpu_solver, prev_image, cur_image, inc_u, inc_v,
-                        guess_u, guess_v)
-                    if recovery_seeds:
-                        (inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx,
-                         inc_dv_dy, corr_f) = gpu_solver.solve_frame(
-                            cur_image, recovery_seeds=recovery_seeds)
+                    (inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx,
+                     inc_dv_dy, corr_f) = gpu_solver.solve_frame(
+                        cur_image, recovery_seeds=True, seed_guess=(guess_u, guess_v))
+
+            solver_valid = (np.isfinite(inc_u[self._roi_mask]) &
+                            np.isfinite(inc_v[self._roi_mask]) &
+                            np.isfinite(corr_f[self._roi_mask]))
+            self._previous_solver_valid_count = int(np.count_nonzero(solver_valid))
 
             # Dynamic ROI rejection must happen BEFORE strain accumulation. In
             # the old order, a subset that left the frame could contribute one
@@ -962,11 +924,8 @@ class DICAnalysis:
                 valid=CompactMask(self._ref_image.shape, indices), elapsed=elapsed,
             ))
 
-            # CuPy's pool deliberately caches freed rescue/IC-GN workspaces.
-            # Their shapes vary with each frame's active subset count, so a
-            # long sequence can retain many large, unusable blocks and appear
-            # to leak gigabytes. Persistent solver arrays remain referenced;
-            # this releases only blocks that are no longer in use.
+            # Release frame-temporary native workspaces while preserving the
+            # solver's reference coefficients and warm-start state.
             gpu_solver.release_temporary_memory()
 
         # The GPU solver owns persistent reference coefficients and warm-start
@@ -974,14 +933,7 @@ class DICAnalysis:
         # host-memory peak otherwise overlaps the still-live CUDA allocations
         # and pinned-memory pool on long sequences.
         gpu_solver.release_temporary_memory()
-        del gpu_solver
-        try:
-            import cupy as cp
-            cp.cuda.get_current_stream().synchronize()
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        gpu_solver.close()
 
         if not self._cancel[0] and self.results:
             self._compute_incremental_displacements()

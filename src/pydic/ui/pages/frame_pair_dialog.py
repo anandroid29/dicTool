@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from src.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_RAISED, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
+from pydic.ui.theme import C_ACCENT, C_BORDER, C_CARD, C_RAISED, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
 
 _C_ACCENT = C_ACCENT
 _C_BORDER = C_BORDER

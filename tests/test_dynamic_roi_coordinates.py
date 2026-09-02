@@ -5,9 +5,9 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "pydic"))
+sys.path.insert(0, str(ROOT / "src"))
 
-from src.core.analysis import DICAnalysis, DynamicROI, _dynamic_measurement_mask
+from pydic.core.analysis import DICAnalysis, DynamicROI, _dynamic_measurement_mask
 
 
 class DynamicROICoordinateTests(unittest.TestCase):

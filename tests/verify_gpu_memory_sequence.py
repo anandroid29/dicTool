@@ -11,12 +11,13 @@ import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "pydic"))
+sys.path.insert(0, str(ROOT / "src"))
 OUT = ROOT / "output" / "verification"
 OUT.mkdir(parents=True, exist_ok=True)
 os.environ["PYDIC_SETTINGS_PATH"] = str(OUT / "memory_test_settings.json")
 
-from src.core.analysis import DICAnalysis
+from pydic.core.analysis import DICAnalysis
+from pydic.core.cuda_native import native_cuda_memory_info
 
 
 class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
@@ -61,8 +62,6 @@ def retained_array_bytes(results) -> int:
 
 
 def main() -> None:
-    from cupy import get_default_memory_pool, get_default_pinned_memory_pool
-
     paths = [ROOT / "sample video_frames" / f"frame_{i:06d}.png"
              for i in range(21)]
     ref = cv2.imread(str(paths[0]), cv2.IMREAD_GRAYSCALE)
@@ -105,14 +104,13 @@ def main() -> None:
         if frame == last_frame:
             return
         last_frame = frame
-        pool = get_default_memory_pool()
-        pinned = get_default_pinned_memory_pool()
+        free_bytes, total_bytes = native_cuda_memory_info()
         samples.append({
             "completed_frames": frame,
             "rss_mib": rss_bytes() / (1024 ** 2),
-            "gpu_pool_used_mib": pool.used_bytes() / (1024 ** 2),
-            "gpu_pool_reserved_mib": pool.total_bytes() / (1024 ** 2),
-            "gpu_pinned_free_blocks": int(pinned.n_free_blocks()),
+            "gpu_used_mib": (total_bytes - free_bytes) / (1024 ** 2),
+            "gpu_free_mib": free_bytes / (1024 ** 2),
+            "gpu_total_mib": total_bytes / (1024 ** 2),
             "message": message,
         })
 

@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """PyDIC — Digital Image Correlation. Entry point."""
-import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+import sys
+from pathlib import Path
+
+# Permit ``python src/pydic/__main__.py`` from a source checkout. Installed entry
+# points already put the source root on sys.path.
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QCoreApplication
 from PyQt6.QtGui import QFont
-from src.ui.wizard import Wizard
+from pydic.ui.wizard import Wizard
 
 def main():
     # QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)

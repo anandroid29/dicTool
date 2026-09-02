@@ -7,8 +7,11 @@
 *.mp4
 *.pptx
 *.exe
-*.avi__pycache__/
+*.avi
+__pycache__/
+
 *.py[cod]
+/build/
 /output/
 sample video_frames
 tmp/

@@ -16,10 +16,10 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pydic"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from src.core.analysis import DICAnalysis  # noqa: E402
-from src.core.compact_field import CompactField  # noqa: E402
+from pydic.core.analysis import DICAnalysis  # noqa: E402
+from pydic.core.compact_field import CompactField  # noqa: E402
 
 H = W = 200
 GRID = 4  # subset spacing of the synthetic measurement grid

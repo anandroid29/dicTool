@@ -3,8 +3,8 @@
 PyDIC is a desktop application for two-dimensional, full-field Digital Image
 Correlation (DIC). It tracks a speckled surface through an image sequence and
 reports displacement, velocity, strain, and strain-rate fields through a PyQt6
-workflow. CPU analysis is always available; an optional CuPy backend accelerates
-supported analyses on NVIDIA CUDA GPUs.
+workflow. CPU analysis is always available; an optional native C++/CUDA backend
+accelerates correlation and supported post-processing on NVIDIA GPUs.
 
 The application is intended for planar, in-plane measurements. It does not
 perform stereo DIC or reconstruct out-of-plane motion.
@@ -36,7 +36,8 @@ with the out-of-plane term inferred from plastic incompressibility.
   region, then place the correlation propagation seed.
 - Optionally refine the static ROI on every frame with Contrast, Edge Detection,
   or Hybrid dynamic ROI masking.
-- Run reliability-guided IC-GN DIC on the CPU or use optional CuPy acceleration.
+- Run reliability-guided IC-GN DIC on the CPU or use the optional native CUDA
+  solver.
 - Choose first-order affine or second-order quadratic shape functions. The GPU
   solver currently uses first order; select CPU for a true second-order run.
 - Recover points after temporary dynamic-ROI or tracking dropout instead of
@@ -77,7 +78,7 @@ root:
 
 ```bash
 python -m pip install -r requirements.txt
-python pydic/main.py
+python src/pydic/__main__.py
 ```
 
 The required packages are NumPy, SciPy, OpenCV, Matplotlib, PyQt6, Pillow,
@@ -85,16 +86,58 @@ scikit-image, and h5py. MATLAB is not required.
 
 ### Optional GPU acceleration
 
-GPU analysis requires an NVIDIA CUDA-capable GPU, a compatible CUDA driver, and
-a CuPy package matching the installed CUDA version. CuPy is deliberately not in
-`requirements.txt`, because the correct package depends on the local CUDA
-installation. Install it using the official CuPy instructions, then select
-**Use GPU Acceleration (CuPy)** on the Parameters page.
+GPU analysis uses a native C++/CUDA shared library; CuPy is not required. To
+build it, install:
+
+- an NVIDIA CUDA-capable GPU and compatible display driver;
+- the NVIDIA CUDA Toolkit, including `nvcc`;
+- CMake 3.24 or newer; and
+- a CUDA-compatible C++ host compiler (64-bit Visual Studio C++ tools on
+  Windows, or a supported GCC/Clang toolchain on Linux).
+
+From the repository root, run:
+
+```bash
+python scripts/build_cuda.py
+```
+
+The default `--arch native` targets the GPU in the build machine. An explicit
+architecture can be supplied when needed—for example, the RTX 50-series build
+used during development is:
+
+```bash
+python scripts/build_cuda.py --arch 120
+```
+
+Multiple architectures for a distributable build can be separated with
+semicolons; quote the value in shells that interpret semicolons:
+
+```bash
+python scripts/build_cuda.py --arch "86;89;120"
+```
+
+Run all commands from the `PyDIC` repository root. CMake configuration, object
+files, import libraries, and the final shared library are written under the
+ignored root-level directory `build/native_cuda/`, never under `src/pydic`.
+Typical outputs are:
+
+```text
+build/native_cuda/bin/Release/pydic_cuda.dll   Windows Release build
+build/native_cuda/bin/libpydic_cuda.so         Linux single-config build
+```
+
+Use `python scripts/build_cuda.py --clean` to remove only that native build tree
+before rebuilding. After a successful build, restart PyDIC and select **Use
+native C++/CUDA acceleration** on the Parameters page. Advanced deployments may
+point `PYDIC_CUDA_LIBRARY` at an explicitly packaged shared library.
 
 The GPU is an acceleration backend, not a different measurement convention.
-Both backends feed the same validity, gradient, strain accumulation, velocity,
-and strain-rate post-processing. Very small floating-point differences are
-normal.
+Native CUDA owns NCC seeding, affine IC-GN, reliability-guided wave propagation,
+temporal warm starts, recovery, and the optional plane-fit calculation. Both
+backends then feed the same validity, dynamic-ROI, displacement, velocity, and
+strain-transport semantics. Very small floating-point differences are normal.
+The native solver currently supports first-order affine shape functions only;
+use CPU mode for second-order DIC.
 
 ## Application workflow
 
@@ -309,7 +352,8 @@ available video codecs.
 
 1. Input images are converted to grayscale and normalized.
 2. The CPU path constructs quintic B-spline coefficients for sub-pixel intensity
-   interpolation. The GPU backend uses its CUDA/CuPy interpolation path.
+   interpolation. The GPU path performs its corresponding interpolation and
+   solver work in the native C++/CUDA library.
 3. NCC finds an integer-pixel seed estimate when a global or rescue search is
    needed.
 4. Inverse-compositional Gauss–Newton minimizes ZNSSD for each circular subset.
@@ -339,9 +383,9 @@ python -m pytest tests -q
 
 The `tests/` directory also contains manual and hardware-dependent verification
 scripts for off-screen UI/export checks, real image sequences, GPU behaviour,
-memory use, CPU/GPU consistency, and HDF5 compatibility. GPU checks require a
-working CuPy/CUDA installation; data-dependent checks require their local sample
-frames.
+memory use, CPU/GPU consistency, and HDF5 compatibility. GPU checks require the
+compiled native CUDA library and compatible NVIDIA hardware; data-dependent
+checks require their local sample frames.
 
 ## Important limitations
 
@@ -369,16 +413,23 @@ frames.
 PyDIC/
 |-- README.md
 |-- requirements.txt
+|-- scripts/
+|   `-- build_cuda.py      Out-of-source native CUDA build entry point
 |-- tests/
-`-- pydic/
-    |-- main.py
-    `-- src/
+|-- build/                 Generated and ignored; created by build_cuda.py
+`-- src/                   Python source root (not an import package)
+    `-- pydic/             The actual import package
+        |-- __main__.py          Application entry point
         |-- core/
         |   |-- analysis.py       Sequence orchestration, results, and persistence
         |   |-- bspline.py        CPU B-spline interpolation
         |   |-- icgn.py           CPU IC-GN solver
-        |   |-- icgn_gpu.py       CuPy GPU solver
+        |   |-- cuda_native.py    ctypes boundary and native-library discovery
         |   |-- ncc.py            Integer-pixel initial search
+        |   |-- native_cuda/      C++/CUDA source and CMake project only
+        |   |   |-- CMakeLists.txt
+        |   |   |-- pydic_cuda.cu
+        |   |   `-- pydic_cuda.h
         |   |-- rg_dic.py         CPU reliability-guided DIC and parameters
         |   |-- strain.py         Gradient fitting and strain-rate calculation
         |   |-- strain_accum.py   Continuous material-path strain transport

@@ -8,10 +8,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pydic"))
 
-from src.core.analysis import DICAnalysis, PairResult
-from src.core.compact_field import CompactField, CompactMask
-from src.core.rg_dic import DICParams
-from src.core.units import Calibration
+from pydic.core.analysis import DICAnalysis, PairResult
+from pydic.core.compact_field import CompactField, CompactMask
+from pydic.core.rg_dic import DICParams
+from pydic.core.units import Calibration
 
 
 class CompactResultStorageTests(unittest.TestCase):

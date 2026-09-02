@@ -15,10 +15,10 @@ import h5py
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pydic"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import src.core.analysis as analysis_module
-from src.core.analysis import DICAnalysis
+import pydic.core.analysis as analysis_module
+from pydic.core.analysis import DICAnalysis
 
 FPS = 10.0
 N = 3

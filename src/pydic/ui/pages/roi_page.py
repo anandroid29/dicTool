@@ -12,16 +12,16 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QFileDialog, QMessageBox, QComboBox,
     QSpinBox,
 )
-from src.ui.components import FooterButton
+from pydic.ui.components import FooterButton
 
 if TYPE_CHECKING:
-    from src.ui.wizard import Wizard
+    from pydic.ui.wizard import Wizard
 
-from src.ui.image_canvas import ImageCanvas, ROITool
+from pydic.ui.image_canvas import ImageCanvas, ROITool
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
+from pydic.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3
 
 _C_ACCENT = C_ACCENT
 _C_BG = C_BG

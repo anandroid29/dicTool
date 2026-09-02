@@ -25,8 +25,8 @@ import numpy as np
 # Colour limits are a display concern but the analysis layer needs the same
 # definition for its sequence-wide range, so the primitive lives in core and
 # both sides import it from there.
-from src.core.stats import robust_limits
-from src.core.compact_field import CompactField
+from pydic.core.stats import robust_limits
+from pydic.core.compact_field import CompactField
 
 try:
     import cv2

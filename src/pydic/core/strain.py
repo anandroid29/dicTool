@@ -94,57 +94,18 @@ def compute_velocity_strains(
     Vy = np.asarray(Vy)[crop]
     valid = valid_full[crop]
 
-    # GPU startup and host/device transfer cost more than the filters on a
-    # small crop. Only use CuPy for a genuinely large finite-support box; any
-    # missing package, driver, or cupyx feature falls back to the identical CPU
-    # calculation. Pair playback passes the user's existing GPU preference.
-    gpu_enabled = bool(use_gpu and Vx.size >= 512 * 512)
-    cp = cp_correlate1d = None
-    gpu_arrays: dict[int, object] = {}
-    gpu_kernels: dict[bytes, object] = {}
+    gpu_enabled = bool(use_gpu)
+    native_plane_fit = None
     if gpu_enabled:
         try:
-            import cupy as cp  # type: ignore[no-redef]
-            from cupyx.scipy.ndimage import correlate1d as cp_correlate1d  # type: ignore[no-redef]
-            # This is the first operation that authoritatively validates the
-            # CUDA runtime/device instead of merely finding the Python module.
-            cp.cuda.runtime.getDeviceCount()
+            from .cuda_native import native_cuda_available, native_plane_fit as _native_plane_fit
+            gpu_enabled = native_cuda_available()
+            native_plane_fit = _native_plane_fit if gpu_enabled else None
         except Exception:
             gpu_enabled = False
-            cp = cp_correlate1d = None
 
     def sep_corr(arr: np.ndarray, ky: np.ndarray, kx: np.ndarray) -> np.ndarray:
-        """Apply a separable 2-D correlation on the selected backend."""
-        nonlocal gpu_enabled
-        if gpu_enabled:
-            try:
-                key = id(arr)
-                gpu_arr = gpu_arrays.get(key)
-                if gpu_arr is None:
-                    gpu_arr = cp.asarray(arr, dtype=cp.float64)
-                    gpu_arrays[key] = gpu_arr
-
-                def gpu_kernel(kernel):
-                    kkey = np.asarray(kernel, dtype=np.float64).tobytes()
-                    value = gpu_kernels.get(kkey)
-                    if value is None:
-                        value = cp.asarray(kernel, dtype=cp.float64)
-                        gpu_kernels[kkey] = value
-                    return value
-
-                temp = cp_correlate1d(
-                    gpu_arr, gpu_kernel(ky), axis=0,
-                    mode='constant', cval=0.0)
-                out = cp_correlate1d(
-                    temp, gpu_kernel(kx), axis=1,
-                    mode='constant', cval=0.0)
-                return cp.asnumpy(out)
-            except Exception as exc:
-                # A low-memory device or incompatible cupyx build should make
-                # this one calculation slower, never make pair strain fail.
-                print(f"[Pair strain] GPU filters unavailable ({exc}); using CPU.")
-                gpu_enabled = False
-                gpu_arrays.clear()
+        """Apply the unchanged separable SciPy CPU fallback."""
         temp = correlate1d(arr, ky, axis=0, mode='constant', cval=0.0)
         return correlate1d(temp, kx, axis=1, mode='constant', cval=0.0)
 
@@ -154,10 +115,20 @@ def compute_velocity_strains(
     # Usually one or two components. Each pass remains separable O(N), while
     # the component restriction prevents a least-squares plane crossing a cut.
     for component_id in range(1, n_components + 1):
-        gpu_arrays.clear()
+        
         component = valid & (labels == component_id)
         if np.count_nonzero(component) < 6:
             continue
+        if gpu_enabled and native_plane_fit is not None:
+            try:
+                fitted = native_plane_fit(Vx, Vy, component, r)
+                for output, values in zip(gradients, fitted):
+                    keep = component & np.isfinite(values)
+                    output[keep] = values[keep]
+                continue
+            except Exception as exc:
+                print(f"[Pair strain] Native CUDA plane fit unavailable ({exc}); using CPU.")
+                gpu_enabled = False
         cnt = component.astype(np.float64)
         u_z = np.where(component, Vx, 0.0).astype(np.float64, copy=False)
         v_z = np.where(component, Vy, 0.0).astype(np.float64, copy=False)

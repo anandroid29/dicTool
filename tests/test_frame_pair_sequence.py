@@ -13,19 +13,19 @@ from PyQt6.QtWidgets import QApplication, QPushButton
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
-PYDIC = os.path.join(ROOT, "pydic")
+PYDIC = os.path.join(ROOT, "src")
 if PYDIC not in sys.path:
     sys.path.insert(0, PYDIC)
 
-from src.core.analysis import DICAnalysis, PairResult
-from src.core.rg_dic import DICParams
-from src.core.temporal import TemporalResultSequence, save_temporal_result
-from src.ui.pages.frame_pair_dialog import FramePairDialog
-from src.ui.pages.results_page import ResultsPage
-from src.ui.pages.video_export_dialog import VideoExportDialog
-from src.ui.render import PanelSpec
-from src.ui.video_export import ExportSpec, ViewRenderer, export_video
-from src.ui.wizard import Wizard
+from pydic.core.analysis import DICAnalysis, PairResult
+from pydic.core.rg_dic import DICParams
+from pydic.core.temporal import TemporalResultSequence, save_temporal_result
+from pydic.ui.pages.frame_pair_dialog import FramePairDialog
+from pydic.ui.pages.results_page import ResultsPage
+from pydic.ui.pages.video_export_dialog import VideoExportDialog
+from pydic.ui.render import PanelSpec
+from pydic.ui.video_export import ExportSpec, ViewRenderer, export_video
+from pydic.ui.wizard import Wizard
 
 
 APP = QApplication.instance() or QApplication([])
@@ -165,7 +165,7 @@ def test_pair_rigid_translation_has_zero_green_lagrange_strain():
 
 
 def test_pair_rate_comes_from_composed_end_to_end_motion():
-    from src.core.strain import compute_velocity_strains
+    from pydic.core.strain import compute_velocity_strains
 
     shape, radius, spacing = (81, 81), 5, 5
     analysis = DICAnalysis()
@@ -203,7 +203,7 @@ def test_pair_rate_comes_from_composed_end_to_end_motion():
 
 
 def test_changed_pair_window_refits_spatial_strain_and_rate(monkeypatch):
-    from src.core import strain as strain_module
+    from pydic.core import strain as strain_module
 
     shape, radius, spacing = (61, 61), 5, 5
     analysis = DICAnalysis()
@@ -262,7 +262,7 @@ def test_temporal_history_stops_at_selected_pair_endpoint():
 
 
 def test_bulk_hides_rates_until_each_averaged_velocity_is_derived(monkeypatch):
-    from src.core import strain as strain_module
+    from pydic.core import strain as strain_module
 
     shape, radius, spacing = (41, 41), 5, 5
     analysis = DICAnalysis()

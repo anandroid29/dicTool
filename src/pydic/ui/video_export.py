@@ -14,9 +14,9 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from src.core.compact_field import finite_values
+from pydic.core.compact_field import finite_values
 
-from src.core.units import Calibration
+from pydic.core.units import Calibration
 from . import render as R
 
 try:
@@ -102,7 +102,7 @@ class ViewRenderer:
         source = self._source_index(idx)
         if source in self._img_cache:
             return self._img_cache[source]
-        from src.core.analysis import _load_image
+        from pydic.core.analysis import _load_image
         try:
             if self.pairs is not None and source < len(self.analysis.def_paths):
                 path = self.analysis.def_paths[source]
@@ -120,7 +120,7 @@ class ViewRenderer:
 
     def field_array(self, idx: int, field: str) -> Tuple[Optional[np.ndarray], str]:
         """Field in display units, plus its unit label."""
-        from src.ui.pages.results_page import FIELDS
+        from pydic.ui.pages.results_page import FIELDS
         res = self._result(idx)
         arr = getattr(res, field, None)
         base = FIELDS.get(field, ("", ""))[1]
@@ -156,7 +156,7 @@ class ViewRenderer:
 
     def global_range(self, field: str) -> Tuple[float, float]:
         lo, hi = self._native_global_range(field, 100.0)
-        from src.ui.pages.results_page import FIELDS
+        from pydic.ui.pages.results_page import FIELDS
         factor, _ = self._field_factor_and_unit(
             field, FIELDS.get(field, ("", ""))[1])
         return lo * factor, hi * factor
@@ -170,7 +170,7 @@ class ViewRenderer:
             value = self.analysis.get_global_range(field, coverage)
             self._global_cache[key] = value
             return value
-        from src.core.stats import robust_limits
+        from pydic.core.stats import robust_limits
         pooled = []
         stride = max(1, len(self.results) // 200)
         for idx in range(0, len(self.results), stride):
@@ -246,7 +246,7 @@ class ViewRenderer:
         if spec.content == "streaklines":
             return "Streaklines"
         if spec.content == "field":
-            from src.ui.pages.results_page import FIELDS
+            from pydic.ui.pages.results_page import FIELDS
             return FIELDS.get(spec.field, (spec.field, ""))[0]
         return ""
 

@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QFrame, QCheckBox, QComboBox,
 )
 
-from src.core.units import Calibration, LENGTH_UNIT_ORDER
+from pydic.core.units import Calibration, LENGTH_UNIT_ORDER
 
 # Defer CV2 import to prevent UI freeze on startup
 if TYPE_CHECKING:

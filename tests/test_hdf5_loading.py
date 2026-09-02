@@ -3,8 +3,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-import src.core.analysis as analysis_module
-from src.core.analysis import DICAnalysis
+import pydic.core.analysis as analysis_module
+from pydic.core.analysis import DICAnalysis
 
 
 def _write_minimal_session(path: Path, n_frames: int = 3) -> None:

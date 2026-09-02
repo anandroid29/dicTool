@@ -10,7 +10,6 @@ This is the correct behaviour — the canvas must show the deformed frame,
 not the fixed reference image.
 """
 from __future__ import annotations
-import importlib.util
 import os
 import shutil
 import tempfile
@@ -29,21 +28,21 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup,
 )
 
-from src.core.stats import field_summary
-from src.core.compact_field import finite_values, CompactField, CompactMask
-from src.core.units import LENGTH_UNIT_ORDER
-from src.ui import render
-from src.ui.components import ResultColorBar
-from src.ui.render import RangeSpec
+from pydic.core.stats import field_summary
+from pydic.core.compact_field import finite_values, CompactField, CompactMask
+from pydic.core.units import LENGTH_UNIT_ORDER
+from pydic.ui import render
+from pydic.ui.components import ResultColorBar
+from pydic.ui.render import RangeSpec
 
 if TYPE_CHECKING:
-    from src.ui.wizard import Wizard
+    from pydic.ui.wizard import Wizard
 
-from src.ui.image_canvas import ImageCanvas, marker_color
+from pydic.ui.image_canvas import ImageCanvas, marker_color
 
 # Palette comes from the single source of truth in theme.py. These were
 # duplicated literals, which is why re-theming previously left pages behind.
-from src.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_RAISED, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
+from pydic.ui.theme import C_ACCENT, C_BG, C_BORDER, C_CARD, C_RAISED, C_SUCCESS, C_SURFACE, C_TEXT, C_TEXT2, C_TEXT3, C_WARNING
 
 _C_ACCENT = C_ACCENT
 _C_BG = C_BG
@@ -237,7 +236,7 @@ class _VideoWorker(QThread):
 
     def run(self):
         try:
-            from src.ui.video_export import export_video
+            from pydic.ui.video_export import export_video
             out = export_video(
                 self._analysis, self._spec, self._path, markers=self._markers,
                 results=self._temporal_results, pairs=self._temporal_pairs,
@@ -290,7 +289,7 @@ class _PairTask(QRunnable):
             if self._cancel_flag[0]:
                 raise RuntimeError("Temporal calculation cancelled.")
             if self._cache_path:
-                from src.core.temporal import save_temporal_result
+                from pydic.core.temporal import save_temporal_result
                 result = save_temporal_result(self._cache_path, result)
             self.signals.done.emit(
                 self._generation, self._index, result, "")
@@ -356,10 +355,10 @@ class _TemporalHistoryTask(QRunnable):
 
     def run(self) -> None:
         try:
-            from src.core.compact_field import CompactField
-            from src.core.strain import compute_velocity_strains
-            from src.core.strain_accum import StrainPathTracker
-            from src.core.temporal import save_temporal_result
+            from pydic.core.compact_field import CompactField
+            from pydic.core.strain import compute_velocity_strains
+            from pydic.core.strain_accum import StrainPathTracker
+            from pydic.core.temporal import save_temporal_result
 
             shape = tuple(int(value) for value in self._store[0].u.shape)
             roi = np.asarray(self._analysis._roi_mask, dtype=bool)
@@ -1131,7 +1130,7 @@ class ResultsPage(QWidget):
     def _on_calibration_changed(self, *_):
         if getattr(self, "_syncing_calibration", False):
             return
-        from src.core.units import Calibration
+        from pydic.core.units import Calibration
         unit = self._unit_combo.currentText()
         val = float(self._px_size_spin.value())
         self._wizard.analysis.calibration = (
@@ -1436,7 +1435,7 @@ class ResultsPage(QWidget):
             self._img_cache.move_to_end(path)
             return hit
         try:
-            from src.core.analysis import _load_image
+            from pydic.core.analysis import _load_image
             img = _load_image(path)
         except Exception as exc:
             print(f"Failed to load image {path}: {exc}")
@@ -1929,7 +1928,7 @@ class ResultsPage(QWidget):
                 "Frame-pair averaging needs at least two analysed frames.")
             return
 
-        from src.ui.pages.frame_pair_dialog import FramePairDialog
+        from pydic.ui.pages.frame_pair_dialog import FramePairDialog
         dlg = FramePairDialog(
             n, analysis.fps, self._pair_list,
             strain_window=self._pair_strain_window,
@@ -2108,7 +2107,7 @@ class ResultsPage(QWidget):
 
     def _begin_pair_bulk(self) -> None:
         """Queue every generated temporal pair and expose aggregate progress."""
-        from src.core.temporal import TemporalResultSequence
+        from pydic.core.temporal import TemporalResultSequence
 
         directory = tempfile.mkdtemp(prefix="pydic_temporal_")
         self._pair_store = TemporalResultSequence(directory, self._pair_list)
@@ -2127,49 +2126,20 @@ class ResultsPage(QWidget):
 
     def _pair_use_gpu(self) -> bool:
         analysis = self._wizard.analysis
-        available = bool(
-            getattr(analysis, "prefer_gpu", False) and
-            getattr(analysis, "last_backend", "cpu") == "gpu" and
-            importlib.util.find_spec("cupy") is not None)
-        if not available or not getattr(analysis, "results", None):
+        if not (getattr(analysis, "prefer_gpu", False) and
+                getattr(analysis, "last_backend", "cpu") == "gpu" and
+                getattr(analysis, "results", None)):
             return False
-
-        # CuPy filters win only after transfer/launch overhead is amortised.
-        # Use the same finite-support crop estimate as strain.py. A small ROI on
-        # a large camera frame must not serialize the queue as a "GPU" job that
-        # the strain routine will immediately send back to CPU.
-        result = analysis.results[min(1, len(analysis.results) - 1)]
-        shape = tuple(int(v) for v in result.u.shape)
-        valid = getattr(result, "valid", None)
-        if isinstance(valid, CompactMask):
-            indices = valid.indices
-        elif isinstance(result.u, CompactField):
-            indices = result.u.indices
-        else:
-            mask = (np.asarray(valid, dtype=bool) if valid is not None else
-                    (np.isfinite(result.u) & np.isfinite(result.v)))
-            indices = np.flatnonzero(mask.reshape(-1))
-        if not len(indices):
-            return False
-        ys = np.asarray(indices, dtype=np.int64) // shape[1]
-        xs = np.asarray(indices, dtype=np.int64) % shape[1]
-        pad = (int(self._pair_strain_window) +
-               max(0, int(analysis.params.subset_spacing) // 2) + 1)
-        height = min(shape[0], int(ys.max()) + pad + 1) - max(
-            0, int(ys.min()) - pad)
-        width = min(shape[1], int(xs.max()) + pad + 1) - max(
-            0, int(xs.min()) - pad)
-        return height * width >= 512 * 512
+        from pydic.core.cuda_native import native_cuda_available
+        return native_cuda_available()
 
     def _pair_backend_text(self) -> str:
         if self._pair_use_gpu():
-            return "CuPy GPU derivatives for large spatial fits"
-        if importlib.util.find_spec("cupy") is None:
-            return "multithreaded CPU (CuPy unavailable)"
+            return "native C++/CUDA spatial derivatives"
         if not bool(getattr(self._wizard.analysis, "prefer_gpu", False)):
             return "multithreaded CPU (GPU disabled)"
         if getattr(self._wizard.analysis, "last_backend", "cpu") == "gpu":
-            return "multithreaded CPU (CuPy available; ROI below GPU crossover)"
+            return "multithreaded CPU (native CUDA unavailable)"
         return "multithreaded CPU (source analysis was CPU)"
 
     def _pair_worker_limit(self) -> int:
@@ -2553,8 +2523,8 @@ class ResultsPage(QWidget):
             QMessageBox.warning(self, "Nothing to export", "Run an analysis first.")
             return
 
-        from src.ui.pages.video_export_dialog import VideoExportDialog
-        from src.ui.video_export import CODECS, export_video
+        from pydic.ui.pages.video_export_dialog import VideoExportDialog
+        from pydic.ui.video_export import CODECS, export_video
 
         temporal_export = (
             self._pair_mode and
