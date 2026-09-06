@@ -110,9 +110,10 @@ def _dynamic_measurement_mask(
 ) -> np.ndarray:
     """Filter one adjacent-frame pair using the current-frame texture mask.
 
-    The source points and overrides are image-space labels on the immediately
-    previous frame. They meet ``current_mask`` after this pair's displacement;
-    no frame-0 position history is involved.
+    Every Dynamic ROI decision is made in current-frame image coordinates.
+    Source subset centres are displaced by this pair's measured increment, then
+    the automatic mask and every override are sampled at that destination.
+    No frame-0 position history is involved.
 
     Keeping this transform in one backend-neutral helper prevents the CPU and
     GPU paths from quietly using different ROI semantics. Include overrides win
@@ -136,33 +137,21 @@ def _dynamic_measurement_mask(
     x_pos = x_ref + du
     y_pos = y_ref + dv
     h, w = current.shape
-    in_bounds = (np.isfinite(x_pos) & np.isfinite(y_pos) &
-                 (x_pos >= 0) & (x_pos <= w - 1) &
-                 (y_pos >= 0) & (y_pos <= h - 1))
+    # The mask is sampled with nearest-neighbour pixels, so its bounds must be
+    # tested *after* rounding. Testing the floating coordinate first rejected
+    # legitimate border samples such as x=-0.2 -> pixel 0.
+    finite = np.isfinite(x_pos) & np.isfinite(y_pos)
+    x_cur = np.zeros(len(x_ref), dtype=np.intp)
+    y_cur = np.zeros(len(y_ref), dtype=np.intp)
+    x_cur[finite] = np.rint(x_pos[finite]).astype(np.intp)
+    y_cur[finite] = np.rint(y_pos[finite]).astype(np.intp)
+    in_bounds = (finite & (x_cur >= 0) & (x_cur < w) &
+                 (y_cur >= 0) & (y_cur < h))
 
     kept = np.zeros(len(x_ref), dtype=bool)
     ib = np.where(in_bounds)[0]
     if ib.size:
-        x_cur = np.rint(x_pos[ib]).astype(np.intp)
-        y_cur = np.rint(y_pos[ib]).astype(np.intp)
-        kept[ib] = current[y_cur, x_cur]
-
-    def _source_override(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        if mask is None:
-            return None
-        arr = np.asarray(mask, dtype=bool)
-        if arr.shape != valid.shape:
-            raise ValueError(
-                f"Dynamic ROI override shape {arr.shape} does not match result "
-                f"shape {valid.shape}.")
-        return arr[y_ref, x_ref]
-
-    excluded = _source_override(exclude_mask)
-    included = _source_override(include_mask)
-    if excluded is not None:
-        kept &= ~excluded
-    if included is not None:
-        kept = in_bounds & (kept | included)
+        kept[ib] = current[y_cur[ib], x_cur[ib]]
 
     def _destination_override(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if mask is None:
@@ -170,14 +159,26 @@ def _dynamic_measurement_mask(
         arr = np.asarray(mask, dtype=bool)
         if arr.shape != valid.shape:
             raise ValueError(
-                "Frame Dynamic ROI override shape does not match result shape.")
+                f"Dynamic ROI override shape {arr.shape} does not match result "
+                f"shape {valid.shape}.")
         selected = np.zeros(len(x_ref), dtype=bool)
         if ib.size:
-            selected[ib] = arr[y_cur, x_cur]
+            selected[ib] = arr[y_cur[ib], x_cur[ib]]
         return selected
 
-    # Exact-frame decisions are destination-image masks and take precedence
-    # over every global source-space decision. Include still cannot resurrect a
+    # Global and exact-frame overrides use the same destination coordinates as
+    # the automatic mask. Previously global overrides were sampled at the
+    # undisplaced source centre, contradicting the editor whenever material
+    # moved between frames.
+    excluded = _destination_override(exclude_mask)
+    included = _destination_override(include_mask)
+    if excluded is not None:
+        kept &= ~excluded
+    if included is not None:
+        kept = in_bounds & (kept | included)
+
+    # Exact-frame decisions take precedence over the global destination-space
+    # decisions. Include still cannot resurrect a
     # failed solver measurement or a point that moved off-frame.
     frame_excluded = _destination_override(frame_exclude_mask)
     frame_included = _destination_override(frame_include_mask)
@@ -423,6 +424,8 @@ class DICAnalysis:
             exclude_mask=self.dynamic_exclude_mask,
             roi_mask=self._roi_mask,
             fill_holes=getattr(self.params, "dynamic_roi_fill_holes", True),
+            hysteresis=(0.03 if bool(getattr(
+                self.params, "dynamic_roi_hysteresis", False)) else 0.0),
         )
 
     def dynamic_threshold_for_frame(self, frame_index: int) -> Optional[float]:
@@ -842,28 +845,32 @@ class DICAnalysis:
                     cur_image, warm_start=True
                 )
 
-                valid_count = np.count_nonzero(
-                    np.isfinite(inc_u[self._roi_mask]) &
-                    np.isfinite(inc_v[self._roi_mask]) &
-                    np.isfinite(corr_f[self._roi_mask]))
-                # Warm-start health is retention relative to the preceding
-                # solve, not coverage of the entire static ROI. The latter can
-                # be mostly outside the currently visible/textured material and
-                # caused sound warm pairs to be discarded on alternating frames.
-                survival_rate = valid_count / max(
-                    1, int(getattr(self, "_previous_solver_valid_count", valid_count)))
-
-                if survival_rate < 0.60:
-                    print(f"\n[TARGETED RECOVERY] Frame {i+1} dropped to "
-                          f"{survival_rate*100:.1f}% coverage. Repairing only "
-                          "failed connected regions.")
-
+            recovery = str(getattr(
+                self.params, "hole_recovery", "neighbour")).lower()
+            if recovery in ("neighbour", "ncc"):
+                max_passes = max(1, int(getattr(
+                    self.params, "hole_recovery_passes", 3)))
+                accepted = int(np.count_nonzero(
+                    np.isfinite(inc_u) & np.isfinite(inc_v) &
+                    np.isfinite(corr_f)))
+                for recovery_pass in range(max_passes):
                     if progress_cb:
-                        progress_cb(0.90 * (i / n_frames) + (0.90 / n_frames) * 0.7, f"[{i + 1}/{n_frames}] Jolt detected. Repairing via NCC...")
-
+                        label = ("neighbour seeds" if recovery == "neighbour"
+                                 else "NCC")
+                        progress_cb(
+                            0.90 * (i / n_frames) + (0.90 / n_frames) * 0.75,
+                            f"[{i + 1}/{n_frames}] Hole recovery pass "
+                            f"{recovery_pass + 1}/{max_passes} via {label}...")
+                    recovered = gpu_solver.recover_failed(
+                        guess_u, guess_v, strategy=recovery)
+                    new_accepted = int(np.count_nonzero(
+                        np.isfinite(recovered[0]) & np.isfinite(recovered[1]) &
+                        np.isfinite(recovered[6])))
                     (inc_u, inc_v, inc_du_dx, inc_du_dy, inc_dv_dx,
-                     inc_dv_dy, corr_f) = gpu_solver.solve_frame(
-                        cur_image, recovery_seeds=True, seed_guess=(guess_u, guess_v))
+                     inc_dv_dy, corr_f) = recovered
+                    if new_accepted <= accepted:
+                        break
+                    accepted = new_accepted
 
             solver_valid = (np.isfinite(inc_u[self._roi_mask]) &
                             np.isfinite(inc_v[self._roi_mask]) &
@@ -2402,6 +2409,12 @@ class DICAnalysis:
                     self.params, "dynamic_roi_min_area_frac", 0.02)),
                 dynamic_roi_fill_holes=bool(getattr(
                     self.params, "dynamic_roi_fill_holes", True)),
+                dynamic_roi_hysteresis=bool(getattr(
+                    self.params, "dynamic_roi_hysteresis", False)),
+                hole_recovery=str(getattr(
+                    self.params, "hole_recovery", "neighbour")),
+                hole_recovery_passes=int(getattr(
+                    self.params, "hole_recovery_passes", 3)),
                 dynamic_roi_override_semantics="pairwise_image_space",
             ))
 
@@ -2622,6 +2635,15 @@ class DICAnalysis:
                 self.params.dynamic_roi_fill_holes = bool(f.attrs.get(
                     "dynamic_roi_fill_holes",
                     getattr(self.params, "dynamic_roi_fill_holes", True)))
+                self.params.dynamic_roi_hysteresis = bool(f.attrs.get(
+                    "dynamic_roi_hysteresis",
+                    getattr(self.params, "dynamic_roi_hysteresis", False)))
+                self.params.hole_recovery = _attr_text(
+                    "hole_recovery",
+                    getattr(self.params, "hole_recovery", "neighbour"))
+                self.params.hole_recovery_passes = max(1, int(f.attrs.get(
+                    "hole_recovery_passes",
+                    getattr(self.params, "hole_recovery_passes", 3))))
 
             mpp = float(f.attrs.get("metres_per_pixel", 0.0) or 0.0)
             self.calibration = Calibration(
@@ -2994,6 +3016,9 @@ class DICAnalysis:
                 "dynamic_roi_threshold": getattr(self.params, "dynamic_roi_threshold", None),
                 "dynamic_roi_min_area_frac": getattr(self.params, "dynamic_roi_min_area_frac", 0.02),
                 "dynamic_roi_fill_holes": getattr(self.params, "dynamic_roi_fill_holes", True),
+                "dynamic_roi_hysteresis": getattr(self.params, "dynamic_roi_hysteresis", False),
+                "hole_recovery": getattr(self.params, "hole_recovery", "neighbour"),
+                "hole_recovery_passes": getattr(self.params, "hole_recovery_passes", 3),
                 "calibration": self.calibration.to_dict(),
                 "prefer_gpu": bool(getattr(self, "prefer_gpu", True)),
                 "shape_order": getattr(self.params, "shape_order", 1),
@@ -3069,7 +3094,7 @@ class DynamicROI:
                  exclude_mask: Optional[np.ndarray] = None,
                  roi_mask: Optional[np.ndarray] = None,
                  fill_holes: bool = True,
-                 hysteresis: float = 0.03):
+                 hysteresis: float = 0.0):
         self.method = method
         self.keep_min_area_frac = keep_min_area_frac
         # Fill regions that the texture metric rejected but which are completely
@@ -3096,9 +3121,8 @@ class DynamicROI:
         # or prevent a real scene change from moving the boundary.
         self.hysteresis = max(0.0, float(hysteresis))
         self._previous_mask: Optional[np.ndarray] = None
-        # Hard user overrides, in REFERENCE-frame coordinates. include wins over
-        # exclude wins over the texture metric, so a region the operator marked
-        # is never silently reinterpreted frame to frame.
+        # Hard user overrides in image coordinates. During a pair they are
+        # sampled at displaced subset centres, exactly like the texture mask.
         self.include_mask = include_mask
         self.exclude_mask = exclude_mask
         self.scale = None
@@ -3176,11 +3200,10 @@ class DynamicROI:
              reference_frame: bool = False) -> Optional[np.ndarray]:
         """Return the texture mask in the coordinate system of ``cur_image``.
 
-        ``roi_mask`` and manual overrides are image-space regions previewed on
-        the selected zero-strain image. During analysis, the unconstrained
-        current-frame texture mask is sampled at each previous-frame subset
-        centre plus that pair's displacement. Source-space overrides are then
-        applied by :func:`_dynamic_measurement_mask`.
+        ``roi_mask`` and manual overrides are image-space regions. During
+        analysis, the unconstrained current-frame texture mask and all
+        overrides are sampled at each previous-frame subset centre plus that
+        pair's displacement by :func:`_dynamic_measurement_mask`.
         """
         if not self.enabled:
             return None
@@ -3203,7 +3226,7 @@ class DynamicROI:
             mask = (m8 >= self.thresh).astype(np.uint8) * 255
 
         # Overrides participate directly in the dense setup preview. During a
-        # pair they are applied at source image-space centres by
+        # pair they are sampled at displaced current-frame centres by
         # _dynamic_measurement_mask.
         if reference_frame:
             if self.exclude_mask is not None:

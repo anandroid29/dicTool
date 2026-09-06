@@ -256,6 +256,35 @@ class ParamsPage(QWidget):
             "(lower = stricter; 0.8 is a good starting value).",
             self._sp_cutoff, ""))
 
+        self._cb_hole_recovery = QComboBox()
+        self._cb_hole_recovery.addItem("Off", "off")
+        self._cb_hole_recovery.addItem("Neighbour-seeded retry", "neighbour")
+        self._cb_hole_recovery.addItem("NCC-seeded retry", "ncc")
+        selected_recovery = str(getattr(
+            params, "hole_recovery", "neighbour")).lower()
+        selected_index = self._cb_hole_recovery.findData(selected_recovery)
+        self._cb_hole_recovery.setCurrentIndex(max(0, selected_index))
+        self._cb_hole_recovery.setFixedWidth(196)
+        self._cb_hole_recovery.currentIndexChanged.connect(
+            self._on_param_changed)
+        right_lay.addLayout(_param_row(
+            "Hole recovery",
+            "Optional second correlation pass for failed subsets.\n"
+            "Neighbour retry extrapolates a reliable adjacent affine result;\n"
+            "NCC retry performs a fresh integer-pixel search. Both then run\n"
+            "IC-GN and must pass the normal correlation cutoff—no values are\n"
+            "invented or interpolated into the result.",
+            self._cb_hole_recovery, ""))
+
+        self._sp_hole_passes = spin(
+            1, 20, int(getattr(params, "hole_recovery_passes", 3)), 1)
+        self._sp_hole_passes.valueChanged.connect(self._on_param_changed)
+        right_lay.addLayout(_param_row(
+            "Recovery passes",
+            "Maximum second-pass attempts. Recovery stops early as soon as a\n"
+            "pass produces no additional accepted correlations.",
+            self._sp_hole_passes, ""))
+
         right_lay.addWidget(self._separator())
         right_lay.addWidget(_section_label("Shape function"))
 
@@ -416,6 +445,8 @@ class ParamsPage(QWidget):
             (self._sp_tol, p.conv_tol),
             (self._sp_cutoff, p.corr_cutoff),
             (self._sp_search, p.search_radius),
+            (self._sp_hole_passes,
+             int(getattr(p, "hole_recovery_passes", 3))),
         )
         for widget, value in pairs:
             widget.blockSignals(True)
@@ -425,6 +456,11 @@ class ParamsPage(QWidget):
         self._cb_order.setCurrentIndex(
             1 if int(getattr(p, "shape_order", 1)) >= 2 else 0)
         self._cb_order.blockSignals(False)
+        self._cb_hole_recovery.blockSignals(True)
+        recovery_index = self._cb_hole_recovery.findData(str(getattr(
+            p, "hole_recovery", "neighbour")).lower())
+        self._cb_hole_recovery.setCurrentIndex(max(0, recovery_index))
+        self._cb_hole_recovery.blockSignals(False)
         if self._gpu_chk.isEnabled():
             self._gpu_chk.blockSignals(True)
             self._gpu_chk.setChecked(bool(getattr(
@@ -437,7 +473,9 @@ class ParamsPage(QWidget):
         p = self._wizard.analysis.params
         old = (p.subset_radius, p.subset_spacing, p.strain_window,
                p.max_iter, p.conv_tol, p.corr_cutoff, p.search_radius,
-               int(getattr(p, "shape_order", 1)))
+               int(getattr(p, "shape_order", 1)),
+               str(getattr(p, "hole_recovery", "neighbour")),
+               int(getattr(p, "hole_recovery_passes", 3)))
         p.subset_radius  = self._sp_radius.value()
         p.subset_spacing = self._sp_spacing.value()
         p.strain_window  = self._sp_strain.value()
@@ -446,9 +484,13 @@ class ParamsPage(QWidget):
         p.corr_cutoff    = self._sp_cutoff.value()
         p.search_radius  = self._sp_search.value()
         p.shape_order    = int(self._cb_order.currentData() or 1)
+        p.hole_recovery  = str(
+            self._cb_hole_recovery.currentData() or "off")
+        p.hole_recovery_passes = self._sp_hole_passes.value()
+        self._sp_hole_passes.setEnabled(p.hole_recovery != "off")
         new = (p.subset_radius, p.subset_spacing, p.strain_window,
                p.max_iter, p.conv_tol, p.corr_cutoff, p.search_radius,
-               p.shape_order)
+               p.shape_order, p.hole_recovery, p.hole_recovery_passes)
         if old != new:
             # Results belong to the parameter set that produced them. A visible
             # edit must not leave old contours looking current.
@@ -596,7 +638,8 @@ class ParamsPage(QWidget):
             (self._sp_maxiter, p.max_iter),
             (self._sp_search, p.search_radius),
             (self._sp_tol, p.conv_tol),
-            (self._sp_cutoff, p.corr_cutoff)
+            (self._sp_cutoff, p.corr_cutoff),
+            (self._sp_hole_passes, p.hole_recovery_passes),
         ]:
             sb.blockSignals(True)
             sb.setValue(val)
@@ -605,6 +648,11 @@ class ParamsPage(QWidget):
         self._cb_order.blockSignals(True)
         self._cb_order.setCurrentIndex(1 if int(getattr(p, 'shape_order', 1)) >= 2 else 0)
         self._cb_order.blockSignals(False)
+        self._cb_hole_recovery.blockSignals(True)
+        recovery_index = self._cb_hole_recovery.findData(
+            getattr(p, "hole_recovery", "neighbour"))
+        self._cb_hole_recovery.setCurrentIndex(max(0, recovery_index))
+        self._cb_hole_recovery.blockSignals(False)
         self._update_order_note()
 
         self._on_param_changed()  # Update the subset counter and dynamic-ROI summary

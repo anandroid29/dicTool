@@ -171,18 +171,28 @@ class ImportCalibrationUITests(unittest.TestCase):
         page._sp_tol.setValue(0.002)
         page._sp_cutoff.setValue(0.45)
         page._sp_search.setValue(90)
+        page._cb_hole_recovery.setCurrentIndex(
+            page._cb_hole_recovery.findData("ncc"))
+        page._sp_hole_passes.setValue(7)
         self.assertEqual(analysis.params.strain_window, 31)
         self.assertEqual(analysis.params.max_iter, 65)
         self.assertAlmostEqual(analysis.params.conv_tol, 0.002)
         self.assertAlmostEqual(analysis.params.corr_cutoff, 0.45)
         self.assertEqual(analysis.params.search_radius, 90)
+        self.assertEqual(analysis.params.hole_recovery, "ncc")
+        self.assertEqual(analysis.params.hole_recovery_passes, 7)
         self.assertEqual(analysis.results, [])
 
         analysis.params.strain_window = 43
         analysis.params.max_iter = 80
+        analysis.params.hole_recovery = "off"
+        analysis.params.hole_recovery_passes = 9
         page.on_enter()
         self.assertEqual(page._sp_strain.value(), 43)
         self.assertEqual(page._sp_maxiter.value(), 80)
+        self.assertEqual(page._cb_hole_recovery.currentData(), "off")
+        self.assertEqual(page._sp_hole_passes.value(), 9)
+        self.assertFalse(page._sp_hole_passes.isEnabled())
         page.close()
 
     def test_strain_window_warning_matches_actual_grid_support(self):

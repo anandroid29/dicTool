@@ -557,8 +557,11 @@ __global__ void solve_subsets_block_kernel(
         for (int lane = 0; lane < blockDim.x; ++lane)
             workspace.r_eff = fmax(workspace.r_eff,
                                    workspace.rescue_scores[lane]);
+        // A circular subset centred at a rectangular ROI corner retains about
+        // one quarter of its pixels. Do not silently skip that displayed ROI
+        // candidate before correlation; CPU uses the same 20% support floor.
         workspace.invalid = workspace.support < 6 ||
-                            workspace.support < 0.30 * n_pixels;
+                            workspace.support < 0.20 * n_pixels;
         workspace.ref_mean = workspace.support > 0
             ? workspace.sums[0] / workspace.support : 0.0;
         const double count = workspace.sums[1];
@@ -1057,6 +1060,44 @@ void initialize_recovery(Solver* solver, double guess_u, double guess_v) {
     }
 }
 
+void initialize_neighbour_recovery(Solver* solver) {
+    if (!solver->has_state)
+        throw std::runtime_error("Recovery requested before a solve.");
+    const int di[4] = {-1, 1, 0, 0};
+    const int dj[4] = {0, 0, -1, 1};
+    std::vector<int> parents(solver->total, -1);
+    // Select parents before changing any state, so this is a genuine second
+    // pass seeded only from correlations accepted by the preceding solve.
+    for (int index = 0; index < solver->total; ++index) {
+        if (!solver->valid[index] || solver->state[index] == 2) continue;
+        const int y = index / solver->grid_w, x = index % solver->grid_w;
+        double best = std::numeric_limits<double>::infinity();
+        for (int k = 0; k < 4; ++k) {
+            const int yy = y + dj[k], xx = x + di[k];
+            if (yy < 0 || yy >= solver->grid_h ||
+                xx < 0 || xx >= solver->grid_w) continue;
+            const int next = yy * solver->grid_w + xx;
+            if (solver->state[next] == 2 && solver->correlation[next] < best) {
+                best = solver->correlation[next];
+                parents[index] = next;
+            }
+        }
+    }
+    for (int index = 0; index < solver->total; ++index) {
+        const int parent = parents[index];
+        if (parent < 0) continue;
+        const double* source = &solver->parameters[parent * 6];
+        double* target = &solver->parameters[index * 6];
+        const double dx = static_cast<double>(solver->gx[index] - solver->gx[parent]);
+        const double dy = static_cast<double>(solver->gy[index] - solver->gy[parent]);
+        target[0] = source[0] + source[2] * dx + source[3] * dy;
+        target[1] = source[1] + source[4] * dx + source[5] * dy;
+        for (int k = 2; k < 6; ++k) target[k] = source[k];
+        solver->state[index] = 1;
+        solver->retry[index] = 0;
+    }
+}
+
 bool run_wavefront(Solver* solver, bool warm_start) {
     constexpr int max_batch = 40000;
     constexpr uint8_t max_retry = 3;
@@ -1204,7 +1245,7 @@ __global__ void plane_fit_kernel(
 
 extern "C" {
 
-const char* strainx_cuda_version(void) { return "2.0.0-native"; }
+const char* strainx_cuda_version(void) { return "2.1.0-native"; }
 uint32_t strainx_cuda_abi_version(void) { return 2; }
 const char* strainx_cuda_last_error(void) { return g_last_error.c_str(); }
 
@@ -1432,6 +1473,8 @@ int strainx_cuda_solver_solve(
             initialize_warm_start(solver);
         } else if (mode == STRAINX_CUDA_RECOVER_FAILED) {
             initialize_recovery(solver, guess_u, guess_v);
+        } else if (mode == STRAINX_CUDA_RECOVER_NEIGHBOURS) {
+            initialize_neighbour_recovery(solver);
         } else {
             throw std::runtime_error("Unknown native CUDA solve mode.");
         }

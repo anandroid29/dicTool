@@ -549,6 +549,36 @@ def test_stage_5_recovery_seeds_each_disconnected_failed_component():
         solver.close()
 
 
+def test_neighbour_recovery_pass_preserves_or_increases_accepted_coverage():
+    ref = _safe_texture(seed=145, shape=(96, 112))
+    current = shift(ref, shift=(-0.8, 1.7), order=3, mode="mirror")
+    roi = np.zeros(ref.shape, dtype=bool)
+    roi[14:-14, 14:-14] = True
+    params = DICParams(
+        subset_radius=8, subset_spacing=6, search_radius=5,
+        max_iter=30, conv_tol=1e-5, corr_cutoff=0.8, rescue_radius=3,
+        mask_subsets_to_roi=True)
+    solver = NativeCudaSolver(params)
+    try:
+        solver.precompute_reference(ref, roi)
+        candidates = np.flatnonzero(solver.valid_mask)
+        seed = int(candidates[len(candidates) // 2])
+        initial = solver.solve_frame(
+            current, seed_idx=seed, seed_guess=(0.0, 0.0), warm_start=False)
+        before = np.logical_and.reduce(
+            [np.isfinite(initial[0]), np.isfinite(initial[1]),
+             np.isfinite(initial[6])]).sum()
+
+        recovered = solver.recover_failed(strategy="neighbour")
+        after = np.logical_and.reduce(
+            [np.isfinite(recovered[0]), np.isfinite(recovered[1]),
+             np.isfinite(recovered[6])]).sum()
+
+        assert after >= before
+    finally:
+        solver.close()
+
+
 def test_stage_5_standalone_ncc_keeps_promotable_frame_state_coherent():
     ref = _safe_texture(seed=147, shape=(112, 120))
     frame_1 = shift(ref, shift=(-1.0, 2.0), order=3, mode="mirror")

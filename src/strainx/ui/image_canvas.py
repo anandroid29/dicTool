@@ -283,6 +283,9 @@ class ImageCanvas(QWidget):
         self._marker_sel: int = -1
         self._marker_drag: bool = False
         self.show_marker_labels: bool = True
+        # ResultsPage can retain marker seeds while hiding their visual heads
+        # when the streakline feature is off.
+        self.show_marker_heads: bool = True
         # ─────────────────────────────────────────────────────────────
 
         self._committed_poly: Optional[List[QPointF]] = None
@@ -901,7 +904,8 @@ class ImageCanvas(QWidget):
         # The head circle sits right on the streakline's leading end and buries
         # it, so it is suppressed while trajectories are on screen. Marker mode
         # keeps it: there it is the grab handle, not decoration.
-        if self._markers and not (self._streak_paths and not self._marker_mode):
+        if (self._markers and self.show_marker_heads and
+                not (self._streak_paths and not self._marker_mode)):
             r_out = 6.5 / self._zoom
             r_in = 2.4 / self._zoom
             for i in range(len(self._markers)):
@@ -939,7 +943,7 @@ class ImageCanvas(QWidget):
         if self._rect_edit is not None: self._paint_rect_edit(painter)
 
         # Marker numbers are drawn unscaled so they stay readable at any zoom.
-        if self._markers and self.show_marker_labels:
+        if self._markers and self.show_marker_heads and self.show_marker_labels:
             f = QFont(); f.setPointSize(8); f.setBold(True)
             painter.setFont(f)
             for i in range(len(self._markers)):
@@ -1296,6 +1300,11 @@ class ImageCanvas(QWidget):
         self._marker_draw_pts = [
             None if p is None else QPointF(float(p[0]), float(p[1])) for p in (pts or [])
         ]
+        self.update()
+
+    def set_marker_heads_visible(self, visible: bool) -> None:
+        """Show/hide marker heads without deleting their stored seed points."""
+        self.show_marker_heads = bool(visible)
         self.update()
 
     def add_marker(self, x: float, y: float) -> int:

@@ -47,6 +47,14 @@ class DICParams:
     # this trades robustness for reach; keep it narrow enough to avoid false
     # minima in quasi-periodic speckle.
     rescue_radius:  int   = 12
+    # Optional second pass for failed subsets: "neighbour" extrapolates a
+    # reliable adjacent affine solution, "ncc" performs a fresh integer search,
+    # and "off" leaves first-pass failures untouched. Both retry modes still
+    # require IC-GN and the normal correlation cutoff to pass.
+    hole_recovery: str = "neighbour"
+    # Maximum recovery passes. A sequence stops early as soon as a pass accepts
+    # no additional subsets.
+    hole_recovery_passes: int = 3
     dynamic_roi:    str   = "Hybrid"
     # Texture threshold for the dynamic ROI, normalised to [0, 1]. None keeps
     # the automatic (Otsu on the reference frame) choice.
@@ -57,6 +65,9 @@ class DICParams:
     # kept material -- a hole inside valid specimen is a local dropout, not a
     # gap in the material.
     dynamic_roi_fill_holes: bool = True
+    # Optional temporal Schmitt trigger. Disabled by default so each frame's
+    # Dynamic ROI is exactly the thresholded mask shown in the editor.
+    dynamic_roi_hysteresis: bool = False
     # Restrict subset pixels to the ROI. Correct when the ROI outlines a
     # material boundary (specimen edge, hole, grip). Turn off when the ROI is
     # just a crop of a larger uniform speckle field, where the surrounding
@@ -373,12 +384,15 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
 
             flush_progress()
 
-    # ---------------- hole healing ----------------
+    # ---------------- optional second-pass hole recovery ----------------
     # Points still unsolved but bordering solved neighbours get one more chance,
     # seeded from their single most reliable neighbour. This recovers subsets
     # that were only ever attempted from a poor parent, and it repeats until no
     # further progress is made so recovered points can heal their own borders.
-    for _sweep in range(6):
+    recovery_mode = str(getattr(params, "hole_recovery", "neighbour")).lower()
+    recovery_sweeps = (0 if recovery_mode == "off" else
+                       max(1, int(getattr(params, "hole_recovery_passes", 3))))
+    for _sweep in range(recovery_sweeps):
         if cancel_flag[0]:
             break
         pending = np.where(~solved)[0]
@@ -398,9 +412,18 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
             p_par = np.array([u_f[by, bx], v_f[by, bx], du_dx[by, bx],
                               du_dy[by, bx], dv_dx[by, bx], dv_dy[by, bx]])
             ddx, ddy = float(x - bx), float(y - by)
-            p_i = np.array([p_par[0] + p_par[2] * ddx + p_par[3] * ddy,
-                            p_par[1] + p_par[4] * ddx + p_par[5] * ddy,
-                            p_par[2], p_par[3], p_par[4], p_par[5]])
+            if recovery_mode == "ncc":
+                u0, v0, _ = ncc_initial_guess(
+                    ref_f64, cur_image_raw, x, y,
+                    params.subset_radius, params.search_radius,
+                    float(p_par[0]), float(p_par[1]))
+                p_i = np.array([u0, v0, p_par[2], p_par[3],
+                                p_par[4], p_par[5]])
+            else:
+                p_i = np.array([
+                    p_par[0] + p_par[2] * ddx + p_par[3] * ddy,
+                    p_par[1] + p_par[4] * ddx + p_par[5] * ddy,
+                    p_par[2], p_par[3], p_par[4], p_par[5]])
             good, p_opt, cls_opt = try_point(idx, p_i, cutoff_disp)
             local_steps += 1
             if good:

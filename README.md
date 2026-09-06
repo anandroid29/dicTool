@@ -202,9 +202,13 @@ Available controls are:
   of the largest retained region.
 - **Fill enclosed holes:** restore rejected islands completely enclosed by a
   retained material region.
+- **Temporal hysteresis (±3%):** optionally retain the preceding frame's
+  decision for borderline pixels. It is off by default, so the mask is the
+  independently thresholded frame shown in the editor.
 - **Include / Exclude overrides:** draw persistent image-space rectangle,
-  polygon, or circle overrides for each adjacent pair. Include wins if both
-  channels overlap.
+  polygon, or circle overrides. Like the automatic mask, every override is
+  sampled at the subset centre plus that pair's displacement. Include wins if
+  both channels overlap.
 - **Frame override toolbar:** scrub to any frame with the bottom transport, then
   draw frame-owned Include/Exclude/Erase corrections or set a threshold used
   only on that frame. **Replace base** makes the frame Include drawing the
@@ -230,12 +234,20 @@ The current defaults are:
 | Maximum iterations | 50 | IC-GN iteration limit per subset |
 | Convergence tolerance | 0.001 px | Subset-edge motion threshold for stopping IC-GN |
 | Correlation cutoff | 0.30 | Maximum accepted ZNSSD cost |
+| Hole recovery | Neighbour retry | Second IC-GN pass seeded from accepted neighbours |
+| Recovery passes | 3 | Maximum passes; stops when accepted coverage no longer grows |
 | Shape order | 1 | First-order affine, six-parameter warp |
 | NCC search radius | 50 px | Half-width of the integer-pixel seed search |
 
 For unit-normalized subsets, ZNSSD lies in `[0, 4]` and equals
 `2 × (1 − ZNCC)`. The default cutoff `0.30` therefore corresponds to
 `ZNCC >= 0.85`; lower cutoffs are stricter.
+
+Hole recovery can be disabled, seeded by an accepted neighbouring affine
+solution, or seeded by a fresh NCC search. Recovered subsets are never filled by
+interpolation: each one reruns IC-GN and must pass the same correlation cutoff.
+Recovery continues only while the accepted subset count grows and stops at the
+configured pass limit.
 
 The strain window is measured in image pixels while samples occur only at DIC
 grid points. Its regular support per axis is:

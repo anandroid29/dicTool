@@ -11,9 +11,13 @@ from typing import Optional
 from scipy.linalg import cho_factor, cho_solve, LinAlgError
 from .bspline import BSplineInterpolator
 
-# A subset must retain at least this fraction of its nominal pixels (after
-# image-bound and ROI clipping) to be considered trustworthy.
-MIN_SUPPORT_FRACTION = 0.30
+# A subset must retain at least this fraction of its nominal pixels after ROI
+# clipping. A centre at a rectangular ROI corner retains roughly one quarter
+# of its circular subset; the old 30% gate silently skipped those candidates
+# before correlation even ran, despite showing them on the Dynamic ROI screen.
+# Twenty percent admits ordinary edges and corners while still rejecting thin,
+# poorly constrained slivers. Texture/Hessian and correlation checks remain.
+MIN_SUPPORT_FRACTION = 0.20
 
 
 

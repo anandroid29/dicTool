@@ -18,6 +18,7 @@ this field look like", and the two paths cannot drift apart.
 from __future__ import annotations
 
 from dataclasses import dataclass, field as _dcfield
+from functools import lru_cache
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,6 +34,44 @@ try:
     _HAVE_CV2 = True
 except ImportError:
     _HAVE_CV2 = False
+
+
+@lru_cache(maxsize=8)
+def _export_font(size: int):
+    """Unicode-capable font for worker-thread image/video annotation."""
+    from PIL import ImageFont
+    try:
+        # Matplotlib is already a rendering dependency and ships DejaVu Sans on
+        # every supported platform, avoiding machine-specific font paths.
+        from matplotlib import font_manager
+        path = font_manager.findfont("DejaVu Sans", fallback_to_default=True)
+        return ImageFont.truetype(path, max(8, int(size)))
+    except Exception:
+        try:
+            return ImageFont.truetype("DejaVuSans.ttf", max(8, int(size)))
+        except Exception:
+            return ImageFont.load_default()
+
+
+def _unicode_text_size(text: str, size: int) -> tuple[int, int]:
+    from PIL import Image, ImageDraw
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    left, top, right, bottom = draw.textbbox(
+        (0, 0), str(text), font=_export_font(size), stroke_width=0)
+    return max(0, right - left), max(0, bottom - top)
+
+
+def _draw_unicode_text(
+        rgb: np.ndarray, text: str, xy: tuple[int, int], size: int,
+        fill=(235, 235, 235), stroke_width: int = 0,
+        stroke_fill=(0, 0, 0)) -> np.ndarray:
+    """Draw UTF-8 labels without OpenCV turning each byte into a question mark."""
+    from PIL import Image, ImageDraw
+    image = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
+    draw = ImageDraw.Draw(image)
+    draw.text(xy, str(text), font=_export_font(size), fill=fill,
+              stroke_width=max(0, int(stroke_width)), stroke_fill=stroke_fill)
+    return np.asarray(image).copy()
 
 
 # ---------------------------------------------------------------------------
@@ -379,14 +418,14 @@ def draw_colorbar(rgb: np.ndarray, cmap_name: str, vmin: float, vmax: float,
     if clipped_high:
         rgb[y0:y0 + height, x0 + bar_w:x0 + bar_w + cap] = OVER_RANGE_RGB
 
-    fs, th = 0.38, 1
+    font_size = 13
     suffix = f" {unit}" if unit else ""
     mid = 0.5 * (vmin + vmax)
     lo, md, hi = f"{vmin:.4g}", f"{mid:.4g}", f"{vmax:.4g}{suffix}"
     ty = y0 + height + 12
 
     def _tw(s):
-        return cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, fs, th)[0][0]
+        return _unicode_text_size(s, font_size)[0]
 
     placements = [(lo, x0), (hi, x0 + bar_w - _tw(hi))]
     # Only label the midpoint when it fits without colliding with the ends.
@@ -394,22 +433,23 @@ def draw_colorbar(rgb: np.ndarray, cmap_name: str, vmin: float, vmax: float,
     if mid_x > x0 + _tw(lo) + 10 and mid_x + _tw(md) < x0 + bar_w - _tw(hi) - 10:
         placements.insert(1, (md, mid_x))
 
+    # PIL/TrueType is used only for text. OpenCV Hershey fonts do not support
+    # Unicode and rendered s⁻¹, Ėxy and µm as runs of question marks.
     for text, tx in placements:
-        cv2.putText(rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2, cv2.LINE_AA)
-        cv2.putText(rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, (235, 235, 235), th, cv2.LINE_AA)
+        rgb = _draw_unicode_text(
+            rgb, text, (tx, ty - font_size), font_size,
+            stroke_width=2, stroke_fill=(0, 0, 0))
     return rgb
 
 
 def draw_label(rgb: np.ndarray, text: str, margin: int = 10) -> np.ndarray:
     if not _HAVE_CV2 or not text:
         return rgb
-    fs, th = 0.5, 1
-    (tw, tht), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+    font_size = 15
+    tw, tht = _unicode_text_size(text, font_size)
     cv2.rectangle(rgb, (margin - 5, margin - 4),
                   (margin + tw + 5, margin + tht + 6), (20, 20, 20), -1)
-    cv2.putText(rgb, text, (margin, margin + tht),
-                cv2.FONT_HERSHEY_SIMPLEX, fs, (235, 235, 235), th, cv2.LINE_AA)
-    return rgb
+    return _draw_unicode_text(rgb, text, (margin, margin), font_size)
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +470,10 @@ class PanelSpec:
       "empty"       - blank cell
     """
     content: str = "field"
+    # Result fields can independently use the normal or temporal sequence.
+    # If any panel is temporal, the export timeline follows the temporal pairs
+    # and normal-result panels are sampled at each pair's ending frame.
+    result_sequence: str = "standard"
     field: str = "Eeff_rate"
     cmap: str = "turbo"
     background: str = "Deformed frame"

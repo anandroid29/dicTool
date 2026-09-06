@@ -61,6 +61,8 @@ def test_frame_dynamic_roi_overrides_round_trip(tmp_path, monkeypatch):
     exclude[2, 1] = True
 
     analysis = DICAnalysis()
+    analysis.params.hole_recovery = "ncc"
+    analysis.params.hole_recovery_passes = 6
     analysis._roi_mask = np.ones((4, 4), dtype=bool)
     analysis.dynamic_frame_overrides = {
         7: {"threshold": 0.63, "replace": True,
@@ -75,6 +77,8 @@ def test_frame_dynamic_roi_overrides_round_trip(tmp_path, monkeypatch):
     loaded = DICAnalysis()
     try:
         loaded.load_hdf5(str(path))
+        assert loaded.params.hole_recovery == "ncc"
+        assert loaded.params.hole_recovery_passes == 6
         entry = loaded.dynamic_frame_overrides[7]
         assert entry["threshold"] == 0.63
         assert entry["replace"] is True

@@ -75,10 +75,15 @@ class ViewRenderer:
     """
 
     def __init__(self, analysis, markers: Optional[Sequence] = None,
-                 trail: int = 0, results=None, pairs=None) -> None:
+                 trail: int = 0, *, temporal_results=None, temporal_pairs=None,
+                 temporal_timeline: Optional[bool] = None) -> None:
         self.analysis = analysis
-        self.results = analysis.results if results is None else results
-        self.pairs = None if pairs is None else list(pairs)
+        self.temporal_results = temporal_results
+        self.temporal_pairs = (
+            None if temporal_pairs is None else list(temporal_pairs))
+        self.temporal_timeline = (
+            temporal_results is not None if temporal_timeline is None
+            else bool(temporal_timeline))
         self.markers = list(markers or [])
         self.trail = int(trail)
         self._img_cache: dict = {}
@@ -88,14 +93,28 @@ class ViewRenderer:
         self._global_cache: dict = {}
 
     def _source_index(self, idx: int) -> int:
-        return int(self.pairs[idx][1]) if self.pairs is not None else int(idx)
+        if self.temporal_timeline:
+            if self.temporal_pairs is None:
+                raise RuntimeError("Temporal export is missing its frame pairs.")
+            return int(self.temporal_pairs[idx][1])
+        return int(idx)
 
-    def _result(self, idx: int):
-        if idx not in self._result_cache:
+    def _result(self, idx: int, sequence: str = "standard"):
+        sequence = "temporal" if sequence == "temporal" else "standard"
+        key = (sequence, int(idx))
+        if key not in self._result_cache:
             if len(self._result_cache) >= 2:
                 self._result_cache.clear()
-            self._result_cache[idx] = self.results[idx]
-        return self._result_cache[idx]
+            if sequence == "temporal":
+                if self.temporal_results is None:
+                    raise RuntimeError(
+                        "This panel requests temporal results, but no temporal "
+                        "sequence is available.")
+                result = self.temporal_results[idx]
+            else:
+                result = self.analysis.results[self._source_index(idx)]
+            self._result_cache[key] = result
+        return self._result_cache[key]
 
     # -- data access ------------------------------------------------------
     def _deformed(self, idx: int) -> Optional[np.ndarray]:
@@ -104,7 +123,7 @@ class ViewRenderer:
             return self._img_cache[source]
         from strainx.core.analysis import _load_image
         try:
-            if self.pairs is not None and source < len(self.analysis.def_paths):
+            if source < len(self.analysis.def_paths):
                 path = self.analysis.def_paths[source]
             else:
                 path = self.analysis.results[source].image_path
@@ -118,63 +137,93 @@ class ViewRenderer:
         self._img_cache[source] = img
         return img
 
-    def field_array(self, idx: int, field: str) -> Tuple[Optional[np.ndarray], str]:
+    def field_array(self, idx: int, field: str,
+                    sequence: str = "standard") -> Tuple[Optional[np.ndarray], str]:
         """Field in display units, plus its unit label."""
         from strainx.ui.pages.results_page import FIELDS
-        res = self._result(idx)
+        res = self._result(idx, sequence)
         arr = getattr(res, field, None)
         base = FIELDS.get(field, ("", ""))[1]
         if (arr is not None and bool(getattr(self.analysis, "hdf5_lazy", False))
                 and not isinstance(arr, np.ndarray)):
             arr = np.asarray(arr)
-        factor, unit = self._field_factor_and_unit(field, base, arr)
+        factor, unit = self._field_factor_and_unit(
+            field, base, arr, sequence)
         if arr is None or factor == 1.0:
             return arr, unit
         return arr * factor, unit
 
     def _field_factor_and_unit(
-            self, field: str, base: str, native_arr=None) -> Tuple[float, str]:
+            self, field: str, base: str, native_arr=None,
+            sequence: str = "standard") -> Tuple[float, str]:
         """Use the same sequence-stable compact units as the results viewer."""
         cal: Calibration = self.analysis.calibration
-        key = (field, cal.metres_per_pixel, cal.display_unit)
+        sequence = "temporal" if sequence == "temporal" else "standard"
+        key = (field, sequence, cal.metres_per_pixel, cal.display_unit)
         cached = self._unit_cache.get(key)
         if cached is not None:
             return cached
         factor_unit = cal.factor_and_unit(field, base)
-        if cal.calibrated and self.results:
+        sequence_len = (len(self.temporal_results)
+                        if sequence == "temporal" and
+                        self.temporal_results is not None
+                        else len(self.analysis.results))
+        if cal.calibrated and sequence_len:
             if bool(getattr(self.analysis, "hdf5_lazy", False)) and native_arr is not None:
                 values = np.asarray(native_arr)
                 finite = np.abs(values[np.isfinite(values)])
                 magnitude = (float(np.percentile(finite, 99.0))
                              if finite.size else 0.0)
             else:
-                lo, hi = self._native_global_range(field, 99.0)
+                lo, hi = self._native_global_range(field, 99.0, sequence)
                 magnitude = max(abs(float(lo)), abs(float(hi)))
             factor_unit = cal.compact_factor_and_unit(field, magnitude, base)
         self._unit_cache[key] = factor_unit
         return factor_unit
 
-    def global_range(self, field: str) -> Tuple[float, float]:
-        lo, hi = self._native_global_range(field, 100.0)
+    def global_range(self, field: str,
+                     sequence: str = "standard") -> Tuple[float, float]:
+        lo, hi = self._native_global_range(field, 100.0, sequence)
         from strainx.ui.pages.results_page import FIELDS
         factor, _ = self._field_factor_and_unit(
-            field, FIELDS.get(field, ("", ""))[1])
+            field, FIELDS.get(field, ("", ""))[1], sequence=sequence)
         return lo * factor, hi * factor
 
-    def _native_global_range(self, field: str, coverage: float) -> Tuple[float, float]:
-        key = (field, float(coverage))
+    def _native_global_range(self, field: str, coverage: float,
+                             sequence: str = "standard") -> Tuple[float, float]:
+        sequence = "temporal" if sequence == "temporal" else "standard"
+        key = (sequence, field, float(coverage))
         cached = self._global_cache.get(key)
         if cached is not None:
             return cached
-        if self.results is self.analysis.results:
+        if sequence == "standard" and not self.temporal_timeline:
             value = self.analysis.get_global_range(field, coverage)
             self._global_cache[key] = value
             return value
+        count = (len(self.temporal_results)
+                 if sequence == "temporal" and self.temporal_results is not None
+                 else (len(self.temporal_pairs) if self.temporal_timeline and
+                       self.temporal_pairs is not None
+                       else len(self.analysis.results)))
+        if float(coverage) >= 100.0:
+            lo, hi = float("inf"), float("-inf")
+            for idx in range(count):
+                field_values = getattr(self._result(idx, sequence), field, None)
+                if field_values is None:
+                    continue
+                values = finite_values(field_values)
+                if values.size:
+                    lo = min(lo, float(values.min()))
+                    hi = max(hi, float(values.max()))
+            value = (lo, hi) if lo != float("inf") else (0.0, 1.0)
+            self._global_cache[key] = value
+            return value
+
         from strainx.core.stats import robust_limits
         pooled = []
-        stride = max(1, len(self.results) // 200)
-        for idx in range(0, len(self.results), stride):
-            field_values = getattr(self._result(idx), field, None)
+        stride = max(1, count // 200)
+        for idx in range(0, count, stride):
+            field_values = getattr(self._result(idx, sequence), field, None)
             if field_values is None:
                 continue
             values = finite_values(field_values)
@@ -208,9 +257,11 @@ class ViewRenderer:
         vmin = vmax = None
         clip_low = clip_high = False
         if spec.content == "field":
-            arr, unit = self.field_array(idx, spec.field)
+            sequence = spec.result_sequence
+            arr, unit = self.field_array(idx, spec.field, sequence)
             rng = spec.range_spec.resolve(
-                arr, self.global_range(spec.field) if spec.range_spec.mode == "global" else None)
+                arr, self.global_range(spec.field, sequence)
+                if spec.range_spec.mode == "global" else None)
             if rng is not None and arr is not None:
                 vmin, vmax = rng
                 rgba = R.field_to_rgba(
@@ -265,8 +316,14 @@ def export_video(analysis, spec: ExportSpec, path: str,
     """Render frames [first, last] and write them out. Returns the output path."""
     if not _HAVE_CV2:
         raise RuntimeError("OpenCV is required for video export.")
-    export_results = analysis.results if results is None else results
-    n = len(export_results)
+    temporal_export = any(
+        panel.content == "field" and panel.result_sequence == "temporal"
+        for panel in spec.panels[:spec.rows * spec.cols])
+    if temporal_export and (results is None or pairs is None):
+        raise RuntimeError(
+            "A panel requests temporal results, but no completed temporal "
+            "sequence was supplied.")
+    n = len(results) if temporal_export else len(analysis.results)
     if n == 0:
         raise RuntimeError("No results to export.")
 
@@ -276,7 +333,9 @@ def export_video(analysis, spec: ExportSpec, path: str,
         raise ValueError("Empty frame range.")
 
     renderer = ViewRenderer(
-        analysis, markers, spec.trail, results=export_results, pairs=pairs)
+        analysis, markers, spec.trail,
+        temporal_results=results, temporal_pairs=pairs,
+        temporal_timeline=temporal_export)
     cancel_flag = cancel_flag if cancel_flag is not None else [False]
 
     probe = renderer.render_frame(first, spec)

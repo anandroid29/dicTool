@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QDialogButtonBox,
-    QScrollArea, QWidget, QFrame, QColorDialog, QGroupBox,
+    QScrollArea, QWidget, QFrame, QColorDialog, QGroupBox, QLineEdit,
 )
 
 from strainx.ui.render import PanelSpec, RangeSpec, BACKGROUND_CHOICES
@@ -44,7 +44,9 @@ class _PanelEditor(QWidget):
     """Controls for one cell of the grid."""
 
     def __init__(self, index: int, fields: dict, cmaps: List[str],
-                 default_field: str, default_cmap: str, parent=None):
+                 default_field: str, default_cmap: str,
+                 temporal_available: bool = False,
+                 default_sequence: str = "standard", parent=None):
         super().__init__(parent)
         self._solid = (0, 0, 0)
         lay = QGridLayout(self)
@@ -59,11 +61,17 @@ class _PanelEditor(QWidget):
 
         title = QLabel(f"Panel {index + 1}")
         title.setStyleSheet(f"color:{_C_TEXT}; font-weight:600; font-size:12px;")
-        lay.addWidget(title, 0, 0, 1, 3)
+        lay.addWidget(title, 0, 0, 1, 2)
         self.label = QCheckBox("Label")
         self.label.setChecked(True)
-        self.label.setToolTip("Caption this panel with its field name.")
-        lay.addWidget(self.label, 0, 3)
+        self.label.setToolTip("Caption this panel; leave the text blank for the default name.")
+        self.label.toggled.connect(self._sync_enabled)
+        lay.addWidget(self.label, 0, 2)
+        self.custom_label = QLineEdit()
+        self.custom_label.setPlaceholderText("Custom label (blank = default)")
+        self.custom_label.setToolTip(
+            "Optional text drawn on this panel instead of its default field name.")
+        lay.addWidget(self.custom_label, 0, 3)
 
         # --- what this panel draws -----------------------------------------
         # Labels are kept as attributes so they can be greyed alongside their
@@ -95,37 +103,51 @@ class _PanelEditor(QWidget):
         self.colour_btn.clicked.connect(self._pick_colour)
         lay.addWidget(self.colour_btn, 2, 2, 1, 2)
 
+        self.lbl_sequence = QLabel("Result sequence")
+        lay.addWidget(self.lbl_sequence, 3, 0)
+        self.result_sequence = QComboBox()
+        self.result_sequence.addItem("Standard result sequence", "standard")
+        if temporal_available:
+            self.result_sequence.addItem("Temporal result sequence", "temporal")
+        selected = self.result_sequence.findData(default_sequence)
+        if selected >= 0:
+            self.result_sequence.setCurrentIndex(selected)
+        self.result_sequence.setToolTip(
+            "Select the result source for this panel. In a mixed export, "
+            "standard results are aligned to each temporal pair's ending frame.")
+        lay.addWidget(self.result_sequence, 3, 1, 1, 3)
+
         # --- colour mapping -------------------------------------------------
         self.colour_hdr = QLabel("COLOUR")
         self.colour_hdr.setStyleSheet(
             f"color:{_C_TEXT3}; font-size:9px; font-weight:700; letter-spacing:0.8px;")
-        lay.addWidget(self.colour_hdr, 3, 0, 1, 4)
+        lay.addWidget(self.colour_hdr, 4, 0, 1, 4)
 
         self.lbl_field = QLabel("Field")
-        lay.addWidget(self.lbl_field, 4, 0)
+        lay.addWidget(self.lbl_field, 5, 0)
         self.field = QComboBox()
         for key, (label, _u) in fields.items():
             self.field.addItem(label, key)
         i = self.field.findData(default_field)
         if i >= 0:
             self.field.setCurrentIndex(i)
-        lay.addWidget(self.field, 4, 1)
+        lay.addWidget(self.field, 5, 1)
 
         self.lbl_cmap = QLabel("Colormap")
-        lay.addWidget(self.lbl_cmap, 4, 2)
+        lay.addWidget(self.lbl_cmap, 5, 2)
         self.cmap = QComboBox()
         self.cmap.addItems(cmaps)
         self.cmap.setCurrentText(default_cmap)
-        lay.addWidget(self.cmap, 4, 3)
+        lay.addWidget(self.cmap, 5, 3)
 
         self.lbl_range = QLabel("Range")
-        lay.addWidget(self.lbl_range, 5, 0)
+        lay.addWidget(self.lbl_range, 6, 0)
         self.range_mode = QComboBox()
         self.range_mode.addItem("Auto (per frame)", "auto")
         self.range_mode.addItem("Global (sequence)", "global")
         self.range_mode.addItem("Manual", "manual")
         self.range_mode.currentIndexChanged.connect(self._sync_enabled)
-        lay.addWidget(self.range_mode, 5, 1)
+        lay.addWidget(self.range_mode, 6, 1)
 
         self.rng_row = rng_row = QWidget()
         rl = QHBoxLayout(rng_row)
@@ -137,13 +159,13 @@ class _PanelEditor(QWidget):
         for sb in (self.vmin, self.vmax):
             sb.setMinimumWidth(84)
             rl.addWidget(sb)
-        lay.addWidget(rng_row, 5, 2, 1, 2)
+        lay.addWidget(rng_row, 6, 2, 1, 2)
 
         self.symmetric = QCheckBox("Symmetric about 0")
-        lay.addWidget(self.symmetric, 6, 1)
+        lay.addWidget(self.symmetric, 7, 1)
         self.colorbar = QCheckBox("Colourbar")
         self.colorbar.setChecked(True)
-        lay.addWidget(self.colorbar, 6, 2, 1, 2)
+        lay.addWidget(self.colorbar, 7, 2, 1, 2)
 
         self.setStyleSheet(
             f"QLabel {{ color:{_C_TEXT2}; font-size:11px; }} "
@@ -183,7 +205,8 @@ class _PanelEditor(QWidget):
         manual = is_field and self.range_mode.currentData() == "manual"
 
         # Colour block: only meaningful for a result field.
-        for w in (self.colour_hdr, self.lbl_field, self.field,
+        for w in (self.lbl_sequence, self.result_sequence,
+                  self.colour_hdr, self.lbl_field, self.field,
                   self.lbl_cmap, self.cmap, self.lbl_range, self.range_mode,
                   self.rng_row, self.symmetric, self.colorbar):
             w.setVisible(is_field)
@@ -194,6 +217,7 @@ class _PanelEditor(QWidget):
         self.lbl_bg.setVisible(draws)
         self.background.setVisible(draws)
         self.label.setVisible(draws)
+        self.custom_label.setVisible(draws and self.label.isChecked())
 
         # The picker applies only to a solid background -- hide it otherwise
         # rather than leaving a permanently dead button on screen.
@@ -208,12 +232,14 @@ class _PanelEditor(QWidget):
     def spec(self) -> PanelSpec:
         return PanelSpec(
             content=self.content.currentData(),
+            result_sequence=self.result_sequence.currentData() or "standard",
             field=self.field.currentData(),
             cmap=self.cmap.currentText(),
             background=self.background.currentText(),
             solid_colour=self._solid,
             show_colorbar=self.colorbar.isChecked(),
             show_label=self.label.isChecked(),
+            label=self.custom_label.text().strip(),
             overlay_streaklines=self.streaks.isChecked(),
             range_spec=RangeSpec(
                 mode=self.range_mode.currentData(),
@@ -226,7 +252,9 @@ class _PanelEditor(QWidget):
 class VideoExportDialog(QDialog):
     def __init__(self, fields: dict, cmaps: List[str], n_frames: int,
                  current_field: str, current_cmap: str, fps: float = 25.0,
-                 parent=None, source_size: tuple[int, int] | None = None):
+                 parent=None, source_size: tuple[int, int] | None = None,
+                 temporal_n_frames: int = 0,
+                 default_sequence: str = "standard"):
         super().__init__(parent)
         self.setWindowTitle("Export video")
         self.setMinimumWidth(760)
@@ -235,6 +263,11 @@ class VideoExportDialog(QDialog):
         self._current_field = current_field
         self._current_cmap = current_cmap
         self._editors: List[_PanelEditor] = []
+        self._sequence_counts = {
+            "standard": max(1, int(n_frames)),
+            "temporal": max(0, int(temporal_n_frames)),
+        }
+        self._default_sequence = default_sequence
 
         root = QVBoxLayout(self)
 
@@ -309,6 +342,20 @@ class VideoExportDialog(QDialog):
 
         self.codec.currentTextChanged.connect(self._update_hint)
         self._rebuild_panels()
+        self._sync_sequence_range()
+
+    def _sync_sequence_range(self, *_):
+        """Use the temporal timeline whenever at least one field panel needs it."""
+        key = "temporal" if any(
+            e.content.currentData() == "field" and
+            e.result_sequence.currentData() == "temporal"
+            for e in self._editors) else "standard"
+        count = self._sequence_counts.get(key, 1)
+        count = max(1, int(count))
+        self.first.setRange(1, count)
+        self.last.setRange(1, count)
+        self.first.setValue(min(self.first.value(), count))
+        self.last.setValue(count)
 
     def _update_hint(self, *_):
         seq = CODECS.get(self.codec.currentText(), (None, None))[1] is None
@@ -335,16 +382,24 @@ class VideoExportDialog(QDialog):
             # First cell mirrors the current view; extra cells default to the
             # raw frame so a new grid is immediately meaningful.
             e = _PanelEditor(i, self._fields, self._cmaps,
-                             self._current_field, self._current_cmap)
+                             self._current_field, self._current_cmap,
+                             temporal_available=bool(
+                                 self._sequence_counts["temporal"]),
+                             default_sequence=(self._default_sequence
+                                               if i == 0 else "standard"))
             if i > 0:
                 e.content.setCurrentIndex(1)       # Raw frame
             e.background.currentTextChanged.connect(self._update_hint)
+            e.content.currentIndexChanged.connect(self._sync_sequence_range)
+            e.result_sequence.currentIndexChanged.connect(
+                self._sync_sequence_range)
             self._editors.append(e)
             self._panel_lay.addWidget(e)
             sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
             sep.setStyleSheet(f"background:{_C_BORDER}; max-height:1px;")
             self._panel_lay.addWidget(sep)
         self._update_hint()
+        self._sync_sequence_range()
 
     def spec(self) -> ExportSpec:
         return ExportSpec(

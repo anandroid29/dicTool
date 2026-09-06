@@ -449,17 +449,37 @@ def test_sidebar_export_buttons_and_marker_order_are_compact_but_unclipped():
     page.close()
 
 
-def test_video_export_uses_source_dimensions_without_streakline_only_panel():
+def test_video_export_selects_sequences_and_custom_labels_per_panel():
     dialog = VideoExportDialog(
         {"u": ("Horizontal displacement", "px")}, ["turbo"], 20,
-        "u", "turbo", source_size=(1920, 1080))
+        "u", "turbo", source_size=(1920, 1080),
+        temporal_n_frames=7, default_sequence="temporal")
 
     assert (dialog.cell_w.value(), dialog.cell_h.value()) == (1920, 1080)
-    choices = [dialog._editors[0].content.itemData(i)
-               for i in range(dialog._editors[0].content.count())]
+    first = dialog._editors[0]
+    assert first.result_sequence.currentData() == "temporal"
+    assert first.result_sequence.currentText() == "Temporal result sequence"
+    assert (dialog.first.maximum(), dialog.last.maximum()) == (7, 7)
+    first.custom_label.setText("Measured displacement")
+    assert dialog.spec().panels[0].result_sequence == "temporal"
+    assert dialog.spec().panels[0].label == "Measured displacement"
+    first.result_sequence.setCurrentIndex(
+        first.result_sequence.findData("standard"))
+    assert (dialog.first.maximum(), dialog.last.maximum()) == (20, 20)
+    dialog.cols.setValue(2)
+    second = dialog._editors[1]
+    second.content.setCurrentIndex(second.content.findData("field"))
+    second.result_sequence.setCurrentIndex(
+        second.result_sequence.findData("temporal"))
+    assert (dialog.first.maximum(), dialog.last.maximum()) == (7, 7)
+    spec = dialog.spec()
+    assert [panel.result_sequence for panel in spec.panels] == [
+        "standard", "temporal"]
+    choices = [first.content.itemData(i)
+               for i in range(first.content.count())]
     assert "streaklines" not in choices
     assert "image" in choices
-    assert dialog._editors[0].streaks.text() == "Overlay streaklines"
+    assert first.streaks.text() == "Overlay streaklines"
     dialog.close()
 
 
@@ -487,14 +507,23 @@ def test_streakline_toggle_never_traces_on_the_ui_thread(monkeypatch):
     page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))
     page._frame = 2
     page._canvas.set_markers([(radius, radius)])
+    assert not page._canvas.show_marker_heads
 
     started = time.monotonic()
     page._streak_chk.setChecked(True)
     returned_in = time.monotonic() - started
 
     assert returned_in < 0.1
+    assert page._canvas.show_marker_heads
     assert len(page._canvas._streak_paths) == 0
     assert _wait_until(lambda: len(page._canvas._streak_paths) == 1)
+
+    # Disabling streaklines hides the visual head and label, but retains the
+    # seed so enabling the feature again can retrace it.
+    page._streak_chk.setChecked(False)
+    assert not page._canvas.show_marker_heads
+    assert page._canvas.markers == [(radius, radius)]
+    page._streak_chk.setChecked(True)
 
     # Clearing while a different path is still running must not let that stale
     # worker completion put a deleted marker back on the canvas.
@@ -599,7 +628,7 @@ def test_new_session_cancels_temporal_worker_without_render_reentry(monkeypatch)
     wizard.close()
 
 
-def test_pair_fixed_colour_range_does_not_jump_between_pairs():
+def test_temporal_global_colour_range_pools_the_whole_sequence(tmp_path):
     shape, radius, spacing = (41, 41), 5, 5
     analysis = DICAnalysis()
     analysis.params = DICParams(
@@ -612,20 +641,37 @@ def test_pair_fixed_colour_range_does_not_jump_between_pairs():
         lambda _x, y: np.zeros_like(y, dtype=float),
     )
     analysis.results = [frame, frame]
+    for name in ("Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate",
+                 "Exx_gl", "Exy_gl", "Eyy_gl", "Eeff_gl"):
+        setattr(frame, name, np.where(frame.valid, 0.0, np.nan).astype(np.float32))
+    second = _increment(
+        shape, radius, spacing,
+        lambda x, _y: np.full_like(x, 10.0, dtype=float),
+        lambda _x, y: np.zeros_like(y, dtype=float),
+    )
+    for name in ("Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate",
+                 "Exx_gl", "Exy_gl", "Eyy_gl", "Eeff_gl"):
+        setattr(second, name, np.where(second.valid, 0.0, np.nan).astype(np.float32))
+    store_dir = tmp_path / "global_temporal"
+    store_dir.mkdir()
+    sequence = TemporalResultSequence(str(store_dir), [(0, 1), (0, 1)])
+    save_temporal_result(sequence.path_for(0), frame)
+    save_temporal_result(sequence.path_for(1), second)
     page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))
     page._pair_mode = True
-    page._pair_list = [(0, 1)]
+    page._pair_list = [(0, 1), (0, 1)]
+    page._pair_store = sequence
+    page._pair_bulk_ready = {0, 1}
     page._field = "u"
     page._scale_global_rb.setChecked(True)
-    page._pair_avg = frame
+    page._pair_avg = sequence[0]
 
     first = np.where(frame.valid, frame.u, np.nan)
     page._apply_overlay(first)
-    saved = dict(page._pair_fixed_ranges)
-    page._apply_overlay(first * 100.0)
+    limits = page._temporal_global_range("u", 100.0)
 
-    assert saved
-    assert page._pair_fixed_ranges == saved
+    assert page._scale_global_rb.text() == "Global"
+    assert limits == pytest.approx((0.1, 10.0))
     page._clear_pair_average()
     page.close()
 
@@ -747,8 +793,10 @@ def test_video_renderer_reads_temporal_results_and_pair_endpoint(tmp_path):
     save_temporal_result(sequence.path_for(0), pair)
 
     renderer = ViewRenderer(
-        analysis, results=sequence, pairs=[(0, 2)])
-    values, _unit = renderer.field_array(0, "u")
+        analysis, temporal_results=sequence, temporal_pairs=[(0, 2)],
+        temporal_timeline=True)
+    values, _unit = renderer.field_array(0, "u", "temporal")
+    standard_values, _ = renderer.field_array(0, "u", "standard")
 
     assert renderer._source_index(0) == 2
     stored = np.nanmedian(np.asarray(sequence[0].u))
@@ -756,9 +804,12 @@ def test_video_renderer_reads_temporal_results_and_pair_endpoint(tmp_path):
     assert stored == pytest.approx(0.4, rel=1e-5)
     assert np.nanmedian(np.asarray(values)) == pytest.approx(
         stored * factor, rel=1e-5)
+    assert np.nanmedian(np.asarray(standard_values)) == pytest.approx(
+        0.2 * factor, rel=1e-5)
 
     spec = ExportSpec(
-        panels=[PanelSpec(field="u", background="Reference frame")],
+        panels=[PanelSpec(field="u", result_sequence="temporal",
+                          background="Reference frame")],
         cell_w=96, cell_h=72, codec="PNG image sequence",
         first=0, last=0)
     output = export_video(

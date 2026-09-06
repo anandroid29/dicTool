@@ -22,6 +22,7 @@ enum strainx_cuda_solve_mode {
     STRAINX_CUDA_FRESH = 0,
     STRAINX_CUDA_WARM_START = 1,
     STRAINX_CUDA_RECOVER_FAILED = 2,
+    STRAINX_CUDA_RECOVER_NEIGHBOURS = 3,
 };
 
 STRAINX_CUDA_API const char* strainx_cuda_version(void);

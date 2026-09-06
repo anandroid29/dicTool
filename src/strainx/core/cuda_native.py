@@ -175,6 +175,7 @@ class NativeCudaSolver:
     FRESH = 0
     WARM_START = 1
     RECOVER_FAILED = 2
+    RECOVER_NEIGHBOURS = 3
 
     def __init__(self, params) -> None:
         self.params = params
@@ -194,6 +195,10 @@ class NativeCudaSolver:
             raise NativeCudaError(_native_error(self._lib))
         self._initialized = False
         self._current_image = None
+        # Mode 3 was added without changing the ABI because it only extends an
+        # existing integer enum. Keep older 2.0 DLLs usable until the process
+        # can be restarted and the rebuilt DLL loaded.
+        self._neighbour_recovery_supported = True
 
     def close(self) -> None:
         handle, self._handle = self._handle, None
@@ -305,8 +310,24 @@ class NativeCudaSolver:
             guess_u = guess_v = 0.0
         return self._solve(current, self.FRESH, seed_idx, guess_u, guess_v)
 
-    def recover_failed(self, guess_u: float = 0.0, guess_v: float = 0.0):
-        return self._solve(None, self.RECOVER_FAILED, -1, guess_u, guess_v)
+    def recover_failed(self, guess_u: float = 0.0, guess_v: float = 0.0,
+                       strategy: str = "ncc"):
+        neighbour = str(strategy).lower() == "neighbour"
+        if neighbour and self._neighbour_recovery_supported:
+            try:
+                return self._solve(
+                    None, self.RECOVER_NEIGHBOURS, -1, guess_u, guess_v)
+            except NativeCudaError as exc:
+                # A running strainX instance can keep the previous Windows DLL
+                # locked while updated Python files are installed. That DLL
+                # reports this exact error for the newly added enum value.
+                if "Unknown native CUDA solve mode" not in str(exc):
+                    raise
+                self._neighbour_recovery_supported = False
+        # NCC recovery is supported by both the old and new native runtimes and
+        # is a safe compatibility fallback; subsequent passes avoid mode 3.
+        return self._solve(
+            None, self.RECOVER_FAILED, -1, guess_u, guess_v)
 
     def update_reference_image(self, new_reference: np.ndarray) -> None:
         promote = self._current_image is new_reference

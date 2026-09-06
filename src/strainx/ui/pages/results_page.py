@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup,
 )
 
-from strainx.core.stats import field_summary
+from strainx.core.stats import field_summary, robust_limits
 from strainx.core.compact_field import finite_values, CompactField, CompactMask
 from strainx.core.units import LENGTH_UNIT_ORDER
 from strainx.ui import render
@@ -484,7 +484,7 @@ class ResultsPage(QWidget):
         self._pair_queue: "OrderedDict[int, None]" = OrderedDict()
         self._pair_active: set[tuple[int, int]] = set()
         self._pair_tasks: dict[tuple[int, int], _PairTask] = {}
-        self._pair_fixed_ranges: dict[tuple, tuple[float, float]] = {}
+        self._pair_global_ranges: dict[tuple, tuple[float, float]] = {}
         self._pair_sequence_mode = "custom"
         self._pair_store = None
         self._pair_store_dirs: dict[int, str] = {}
@@ -775,6 +775,7 @@ class ResultsPage(QWidget):
 
         # Canvas
         self._canvas = ImageCanvas()
+        self._canvas.set_marker_heads_visible(self._streak_chk.isChecked())
         self._canvas.seed_enabled = False  # Disable seed placement here
         self._canvas.marker_requested.connect(self._on_marker_requested)
         self._canvas.markers_changed.connect(self._on_markers_changed)
@@ -1157,6 +1158,7 @@ class ResultsPage(QWidget):
     # Trajectory markers
     # ------------------------------------------------------------------
     def _on_streak_toggled(self, on: bool) -> None:
+        self._canvas.set_marker_heads_visible(on)
         for w in (self._place_btn, self._marker_count_lbl, self._clear_markers_btn,
                   self._trail_lbl, self._trail_combo):
             w.setVisible(on)
@@ -1224,6 +1226,7 @@ class ResultsPage(QWidget):
         self._traj_cache.clear()
         self._place_btn.setChecked(False)
         self._streak_chk.setChecked(False)
+        self._canvas.set_marker_heads_visible(False)
         self._trail_combo.setCurrentIndex(0)
         self._canvas.set_marker_mode(False)
         # clear_markers() emits markers_changed, whose slot immediately tries
@@ -1629,23 +1632,15 @@ class ResultsPage(QWidget):
             lo, hi = analysis.get_global_range(self._field, spec.percentile)
             global_rng = (lo * factor, hi * factor)
         elif spec.mode == "global":
-            # Pair fields have different interval semantics from stored
-            # single-frame fields, so their limits cannot use analysis' normal
-            # global range. Establish the limits once from the first displayed
-            # pair and keep them fixed for every subsequent pair. Previously we
-            # silently changed Global back to Auto here, making both overlay and
-            # colourbar jump during playback.
+            # Temporal fields have different interval semantics from stored
+            # single-frame fields, so pool the actual temporal sequence. This is
+            # a true sequence-global scale, not the old first-pair snapshot.
             factor, _ = self._unit_factor(result=self._pair_avg)
-            key = (self._pair_generation, self._field,
-                   float(spec.percentile), float(factor))
-            global_rng = self._pair_fixed_ranges.get(key)
-            if global_rng is None:
-                seed_spec = RangeSpec(
-                    mode="auto", symmetric=False,
-                    percentile=spec.percentile)
-                global_rng = seed_spec.resolve(arr)
-                if global_rng is not None:
-                    self._pair_fixed_ranges[key] = global_rng
+            native_rng = self._temporal_global_range(
+                self._field, spec.percentile)
+            if native_rng is not None:
+                global_rng = (native_rng[0] * factor,
+                              native_rng[1] * factor)
 
         rng = spec.resolve(arr, global_rng)
         if rng is None:
@@ -1674,6 +1669,58 @@ class ResultsPage(QWidget):
         except Exception as exc:
             print(f"Overlay error: {exc}")
             self._canvas.set_result_overlay_rgba(None)
+
+    def _temporal_global_range(
+            self, field: str, coverage: float) -> Optional[tuple[float, float]]:
+        """Pool a field across every currently completed temporal result."""
+        store = self._pair_store
+        if store is None:
+            return None
+        ready = len(self._pair_bulk_ready)
+        completed = (len(store) if ready == len(store)
+                     else store.completed_count())
+        key = (self._pair_generation, field, float(coverage), completed, ready)
+        cached = self._pair_global_ranges.get(key)
+        if cached is not None:
+            return cached
+
+        cov = float(np.clip(coverage, 1.0, 100.0))
+        if cov >= 100.0:
+            lo, hi = float("inf"), float("-inf")
+            for index in range(len(store)):
+                if not store.has(index):
+                    continue
+                field_values = getattr(store[index], field, None)
+                if field_values is None:
+                    continue
+                values = finite_values(field_values)
+                if values.size:
+                    lo = min(lo, float(values.min()))
+                    hi = max(hi, float(values.max()))
+            limits = None if lo == float("inf") else (lo, hi)
+        else:
+            pooled = []
+            for index in range(len(store)):
+                if not store.has(index):
+                    continue
+                field_values = getattr(store[index], field, None)
+                if field_values is None:
+                    continue
+                values = finite_values(field_values)
+                if values.size > 50_000:
+                    values = values[::values.size // 50_000 + 1]
+                if values.size:
+                    pooled.append(values)
+            limits = robust_limits(np.concatenate(pooled), cov) if pooled else None
+
+        if limits is not None:
+            # Drop superseded snapshots for this field: while preprocessing is
+            # active the completed/ready counts grow and the range must follow.
+            for old_key in list(self._pair_global_ranges):
+                if old_key[:3] == key[:3]:
+                    self._pair_global_ranges.pop(old_key, None)
+            self._pair_global_ranges[key] = limits
+        return limits
 
     # ------------------------------------------------------------------
     # Physical units
@@ -2010,10 +2057,9 @@ class ResultsPage(QWidget):
         self._pair_banner.setVisible(False)
         self._pair_exit_btn.setVisible(active)
         self._pair_clear_btn.setVisible(bool(self._pair_list))
-        self._scale_global_rb.setText("Pair-fixed" if active else "Global")
+        self._scale_global_rb.setText("Global")
         self._scale_global_rb.setToolTip(
-            "Keep the limits from the first pair so the sequence stays "
-            "comparable."
+            "Fix the scale to the min/max across the whole temporal sequence."
             if active else
             "Fix the scale to the min/max across the whole sequence.")
         self._pair_btn.setText(
@@ -2080,7 +2126,7 @@ class ResultsPage(QWidget):
         self._pair_generation += 1
         self._pair_queue.clear()
         self._pair_cache.clear()
-        self._pair_fixed_ranges.clear()
+        self._pair_global_ranges.clear()
         self._pair_avg = None
         self._pair_store = None
         self._pair_bulk_ready.clear()
@@ -2220,7 +2266,7 @@ class ResultsPage(QWidget):
         self._export_progress.setValue(0)
         self._export_progress.setFormat("Strain rates 0/"
                                         f"{len(self._pair_list)} · %p%")
-        self._pair_fixed_ranges.clear()
+        self._pair_global_ranges.clear()
         task = _TemporalHistoryTask(
             self._wizard.analysis, self._pair_generation, self._pair_list,
             self._pair_strain_window, self._pair_use_gpu(),
@@ -2526,33 +2572,20 @@ class ResultsPage(QWidget):
         from strainx.ui.pages.video_export_dialog import VideoExportDialog
         from strainx.ui.video_export import CODECS, export_video
 
-        temporal_export = (
-            self._pair_mode and
-            self._pair_sequence_mode in ("sliding", "non_overlapping"))
-        if temporal_export and (
-                self._pair_store is None or
-                len(self._pair_bulk_ready) != len(self._pair_list)):
-            if self._pair_store is not None:
-                for index in range(len(self._pair_list)):
-                    if not self._pair_store.has(index):
-                        self._request_pair(index, priority=False)
-            QMessageBox.information(
-                self, "Temporal preprocessing",
-                "The temporal sequence is still being calculated. The progress "
-                "bar reads Temporal sequence ready when averaged video "
-                "export becomes available.")
-            return
-        export_count = (len(self._pair_list) if temporal_export
-                        else len(analysis.results))
+        temporal_available = bool(self._pair_store is not None and self._pair_list)
+        temporal_count = len(self._pair_list) if temporal_available else 0
 
         shape = analysis._ref_shape
         source_size = ((int(shape[1]), int(shape[0]))
                        if shape is not None else None)
         dlg = VideoExportDialog(
-            FIELDS, CMAPS, export_count,
+            FIELDS, CMAPS, len(analysis.results),
             self._field, self._cmap_combo.currentText(),
             fps=float(self._fps_spin.value()), parent=self,
-            source_size=source_size)
+            source_size=source_size,
+            temporal_n_frames=temporal_count,
+            default_sequence=("temporal" if self._pair_mode and temporal_available
+                              else "standard"))
         # Carry the on-screen colour range into panel 1 so "export what I'm
         # looking at" is the default rather than something to reconstruct.
         rng = self.current_range_spec()
@@ -2569,6 +2602,23 @@ class ResultsPage(QWidget):
         if dlg.exec() == 0:
             return
         spec = dlg.spec()
+        temporal_export = any(
+            panel.content == "field" and
+            panel.result_sequence == "temporal"
+            for panel in spec.panels)
+        if temporal_export and (
+                self._pair_store is None or
+                len(self._pair_bulk_ready) != len(self._pair_list)):
+            if self._pair_store is not None:
+                for index in range(len(self._pair_list)):
+                    if not self._pair_store.has(index):
+                        self._request_pair(index, priority=False)
+            QMessageBox.information(
+                self, "Temporal preprocessing",
+                "The temporal sequence is still being calculated. The progress "
+                "bar reads Temporal sequence ready when averaged video "
+                "export becomes available.")
+            return
 
         # Coverage and clip-flagging have no per-panel control in the export
         # dialog, so they inherit the viewer's settings. Without this an export

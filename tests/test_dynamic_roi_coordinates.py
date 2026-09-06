@@ -8,9 +8,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from strainx.core.analysis import DICAnalysis, DynamicROI, _dynamic_measurement_mask
+from strainx.core.rg_dic import DICParams
 
 
 class DynamicROICoordinateTests(unittest.TestCase):
+    def test_temporal_hysteresis_is_explicit_and_off_by_default(self):
+        analysis = object.__new__(DICAnalysis)
+        analysis.params = DICParams()
+        analysis._roi_mask = np.ones((3, 4), dtype=bool)
+        analysis.dynamic_include_mask = None
+        analysis.dynamic_exclude_mask = None
+
+        self.assertEqual(analysis.make_dynamic_roi().hysteresis, 0.0)
+        analysis.params.dynamic_roi_hysteresis = True
+        self.assertAlmostEqual(analysis.make_dynamic_roi().hysteresis, 0.03)
+
     def test_exact_frame_override_precedence_and_threshold(self):
         analysis = object.__new__(DICAnalysis)
         analysis._roi_mask = np.ones((5, 7), dtype=bool)
@@ -113,7 +125,7 @@ class DynamicROICoordinateTests(unittest.TestCase):
                 points, current, inc_u, inc_v)
             self.assertTrue(valid[points].all(), frame)
 
-    def test_source_grid_overrides_apply_each_pair_and_include_wins(self):
+    def test_global_overrides_sample_displaced_destination_and_include_wins(self):
         shape = (7, 12)
         points = np.zeros(shape, dtype=bool)
         points[3, 2:5] = True
@@ -125,8 +137,8 @@ class DynamicROICoordinateTests(unittest.TestCase):
 
         include = np.zeros(shape, dtype=bool)
         exclude = np.zeros(shape, dtype=bool)
-        include[3, 3] = True
-        exclude[3, 2:4] = True
+        include[3, 7] = True
+        exclude[3, 6:8] = True
 
         valid = _dynamic_measurement_mask(
             points, current, inc_u, inc_v,
@@ -135,6 +147,23 @@ class DynamicROICoordinateTests(unittest.TestCase):
         self.assertFalse(valid[3, 2])
         self.assertTrue(valid[3, 3])
         self.assertTrue(valid[3, 4])
+
+    def test_nearest_border_pixel_is_not_rejected_before_sampling(self):
+        shape = (5, 6)
+        points = np.zeros(shape, dtype=bool)
+        points[2, 0] = True
+        inc_u = np.where(points, -0.2, np.nan)
+        inc_v = np.where(points, 0.0, np.nan)
+        current = np.zeros(shape, dtype=bool)
+        current[2, 0] = True
+
+        valid = _dynamic_measurement_mask(points, current, inc_u, inc_v)
+
+        self.assertTrue(valid[2, 0])
+
+        inc_u[2, 0] = -0.51
+        valid = _dynamic_measurement_mask(points, current, inc_u, inc_v)
+        self.assertFalse(valid[2, 0])
 
     def test_exact_frame_destination_override_beats_global_base(self):
         shape = (7, 12)

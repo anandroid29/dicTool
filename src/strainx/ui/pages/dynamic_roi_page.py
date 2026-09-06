@@ -339,6 +339,16 @@ class DynamicROIPage(QWidget):
         self._fill_chk.toggled.connect(self._on_threshold_changed)
         lay.addWidget(self._fill_chk)
 
+        self._hysteresis_chk = QCheckBox("Temporal hysteresis (±3%)")
+        self._hysteresis_chk.setChecked(False)
+        self._hysteresis_chk.setToolTip(
+            "Optional edge stabilisation across consecutive frames.\n"
+            "Previously kept pixels leave below threshold − 3%; previously\n"
+            "rejected pixels enter above threshold + 3%. Off means every\n"
+            "frame uses exactly its displayed threshold mask.")
+        self._hysteresis_chk.toggled.connect(self._on_threshold_changed)
+        lay.addWidget(self._hysteresis_chk)
+
         lay.addWidget(self._sep())
 
         # -- manual overrides --
@@ -580,6 +590,8 @@ class DynamicROIPage(QWidget):
             self._slider.setValue(int(round(float(thr) * 100)))
         self._area_spin.setValue(float(getattr(a.params, "dynamic_roi_min_area_frac", 0.02)))
         self._fill_chk.setChecked(bool(getattr(a.params, "dynamic_roi_fill_holes", True)))
+        self._hysteresis_chk.setChecked(bool(getattr(
+            a.params, "dynamic_roi_hysteresis", False)))
         self._updating = False
 
         self._load_frame_controls()
@@ -1017,6 +1029,7 @@ class DynamicROIPage(QWidget):
             getattr(a.params, "dynamic_roi_threshold", None),
             getattr(a.params, "dynamic_roi_min_area_frac", 0.02),
             getattr(a.params, "dynamic_roi_fill_holes", True),
+            getattr(a.params, "dynamic_roi_hysteresis", False),
         )
         old_inc = a.dynamic_include_mask
         old_exc = a.dynamic_exclude_mask
@@ -1027,6 +1040,7 @@ class DynamicROIPage(QWidget):
             None if self._auto_chk.isChecked() else self._slider.value() / 100.0)
         a.params.dynamic_roi_min_area_frac = float(self._area_spin.value())
         a.params.dynamic_roi_fill_holes = bool(self._fill_chk.isChecked())
+        a.params.dynamic_roi_hysteresis = bool(self._hysteresis_chk.isChecked())
 
         # Overrides only mean anything inside the static ROI, so clip them to it
         # rather than storing regions the solver will discard.
@@ -1070,6 +1084,7 @@ class DynamicROIPage(QWidget):
             a.params.dynamic_roi, a.params.dynamic_roi_threshold,
             a.params.dynamic_roi_min_area_frac,
             a.params.dynamic_roi_fill_holes,
+            a.params.dynamic_roi_hysteresis,
         )
         masks_changed = not (
             (old_inc is None and a.dynamic_include_mask is None or
