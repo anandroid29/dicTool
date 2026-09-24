@@ -36,3 +36,8 @@ def test_hover_does_not_replace_missing_value_at_subset_centre():
     arr[2, 2] = np.nan
     assert _interpolate_between_subset_centres(
         arr, x=2, y=2, spacing=4, origin=2) is None
+
+
+def test_hover_reads_valid_subset_centre():
+    assert _interpolate_between_subset_centres(
+        _field(), x=6, y=2, spacing=4, origin=2) == 4.0

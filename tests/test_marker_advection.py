@@ -201,13 +201,46 @@ def test_survives_a_gap_in_the_correlated_grid():
     assert traj["points"][-1][1] < 100.0, "did not reach the chip"
 
 
-def test_marker_lost_outside_the_measured_region():
-    """A seed with no data anywhere still reports loss rather than inventing a path."""
+def test_marker_waits_when_early_frames_have_no_measurement():
+    """An unmeasured seed remains available to start in a later interval."""
     a = _build(cutting, 20, hole=lambda x, y: np.ones_like(x, dtype=bool))
     traj = a.get_trajectories_from_seeds([(20.0, 150.0)], 19)[0]
-    assert traj["lost_at"] == 0
+    assert traj["lost_at"] is None
+    assert traj["started_at"] is None
     assert traj["points"] == [(20.0, 150.0)]
-    assert a.marker_positions([(20.0, 150.0)], 19)[0] is None
+    assert a.marker_positions([(20.0, 150.0)], 19)[0] == (20.0, 150.0)
+
+
+def test_marker_starts_at_first_later_valid_interval():
+    a = _build(uniform, 8)
+    for result in a.results[:3]:
+        result.u[:] = np.nan
+        result.v[:] = np.nan
+    trajectory = a.get_trajectories_from_seeds([(50.0, 120.0)], 7)[0]
+    assert trajectory["started_at"] == 3
+    assert trajectory["lost_at"] is None
+    assert trajectory["points"][0] == (50.0, 120.0)
+    assert trajectory["points"][-1] == pytest.approx((57.5, 117.5))
+    assert a.marker_positions([(50.0, 120.0)], 2)[0] == (50.0, 120.0)
+
+
+def test_marker_timeseries_is_sampled_only_after_late_tracking_begins():
+    a = _build(uniform, 6)
+    for result in a.results:
+        result.Vx = result.u.copy()
+    for result in a.results[:2]:
+        result.u[:] = np.nan
+        result.v[:] = np.nan
+    history = a.marker_timeseries(
+        [(50.0, 120.0, 0)], fields=("Vx",))["markers"][0]
+
+    assert np.isnan(history["x"][0])
+    assert history["x"][1] == 50.0
+    assert not history["tracked"][:2].any()
+    assert history["tracked"][2:].all()
+    assert history["x"][2:] == pytest.approx([51.5, 53.0, 54.5, 56.0])
+    assert history["fields"]["Vx"][2:] == pytest.approx([1.5] * 4)
+    assert history["time"] == pytest.approx(np.arange(1.0, 7.0))
 
 
 @pytest.mark.parametrize("flow", [cutting, rotation, uniform])

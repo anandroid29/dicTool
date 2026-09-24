@@ -295,11 +295,8 @@ class NativeCudaSolver:
 
     def solve_frame(self, current: np.ndarray, seed_idx: int = -1,
                     seed_p: Optional[np.ndarray] = None,
-                    warm_start: bool = False, *, recovery_seeds=None,
+                    warm_start: bool = False, *,
                     seed_guess: Optional[tuple[float, float]] = None):
-        if recovery_seeds is not None:
-            guess = seed_guess or (0.0, 0.0)
-            return self._solve(None, self.RECOVER_FAILED, -1, *guess)
         if warm_start:
             return self._solve(current, self.WARM_START, -1, 0.0, 0.0)
         if seed_guess is not None:
@@ -339,13 +336,6 @@ class NativeCudaSolver:
         if status != 0:
             raise NativeCudaError(_native_error(self._lib))
         self._current_image = None
-
-    @staticmethod
-    def release_temporary_memory() -> None:
-        lib = _load_library()
-        if lib.strainx_cuda_synchronize() != 0:
-            raise NativeCudaError(_native_error(lib))
-
 
 def native_plane_fit(vx: np.ndarray, vy: np.ndarray, component_mask: np.ndarray,
                      radius: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

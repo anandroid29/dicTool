@@ -82,6 +82,21 @@ class _HDF5LoadWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         try:
+            import h5py
+            with h5py.File(self.path, "r") as handle:
+                is_parametric = any(name in handle.attrs for name in (
+                    "sweep_cache_schema", "derived_cache_schema",
+                    "temporal_cache_schema")) or (
+                    os.path.basename(self.path) == "_sweep_source.h5" and
+                    os.path.isfile(os.path.join(
+                        os.path.dirname(self.path), "manifest.json")))
+            if is_parametric:
+                from strainx.core.parametric import ParametricSweep
+                self.progress.emit(15, "Reading parametric sweep manifest…")
+                sweep = ParametricSweep.from_hdf5(self.path)
+                self.progress.emit(100, "Parametric sweep ready")
+                self.loaded.emit(sweep, self.path)
+                return
             from strainx.core.analysis import DICAnalysis
             analysis = DICAnalysis()
             analysis.load_hdf5(
@@ -99,6 +114,7 @@ class _ImportCard(QFrame):
     def __init__(self, source_type: str, title: str, subtitle: str,
                  action: str, parent=None):
         super().__init__(parent)
+        self.setObjectName("importCard")
         self.setFrameShape(QFrame.Shape.Box)
         self.setMinimumSize(230, 176)
         self.setMaximumWidth(310)
@@ -106,11 +122,11 @@ class _ImportCard(QFrame):
                            QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._normal_style = (
-            f"QFrame {{ background:{_C_CARD}; border:1px solid {_C_BORDER}; "
+            f"QFrame#importCard {{ background:{_C_CARD}; border:1px solid {_C_BORDER}; "
             f"border-radius:3px; }}"
         )
         self._hover_style = (
-            f"QFrame {{ background:#31353a; border:1px solid {_C_ACCENT}; "
+            f"QFrame#importCard {{ background:#31353a; border:1px solid {_C_ACCENT}; "
             f"border-radius:3px; }}"
         )
         self.setStyleSheet(self._normal_style)
@@ -280,10 +296,12 @@ class WelcomePage(QWidget):
         body_lay.addLayout(cards_row)
 
         self._status_box = QFrame()
+        self._status_box.setObjectName("welcomeStatusBox")
         self._status_box.setMinimumHeight(96)
         self._status_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._status_box.setStyleSheet(
-            f"background:#0f2035; border:1px solid #245079; border-radius:3px;"
+            "QFrame#welcomeStatusBox{background:#0f2035;"
+            "border:1px solid #245079;border-radius:3px;}"
         )
         self._status_box.setVisible(False)
         status_lay = QVBoxLayout(self._status_box)
@@ -314,10 +332,19 @@ class WelcomePage(QWidget):
         root.addWidget(body, 1)
 
         footer = QWidget()
+        footer.setObjectName("welcomeFooter")
         footer.setStyleSheet(
-            f"background:{_C_SURFACE}; border-top:1px solid {_C_BORDER};")
+            f"QWidget#welcomeFooter{{background:{_C_SURFACE};"
+            f"border-top:1px solid {_C_BORDER};}}")
         footer_lay = QHBoxLayout(footer)
         footer_lay.setContentsMargins(60, 14, 60, 14)
+        modes = QPushButton("← Analysis modes")
+        go_modes = getattr(self._wizard, "go_modes", None)
+        if callable(go_modes):
+            modes.clicked.connect(go_modes)
+        else:
+            modes.setVisible(False)
+        footer_lay.addWidget(modes)
         footer_lay.addStretch()
 
         self._next_btn = FooterButton("Continue to ROI")
@@ -535,6 +562,10 @@ class WelcomePage(QWidget):
         self._hdf5_worker = worker
         thread.start()
 
+    def open_hdf5(self) -> None:
+        """Public entry used by the workflow selection screen."""
+        self._load_hdf5()
+
     def _on_hdf5_progress(self, value: int, message: str) -> None:
         if self._hdf5_progress is not None:
             self._hdf5_progress.setLabelText(message)
@@ -549,6 +580,12 @@ class WelcomePage(QWidget):
 
     def _on_hdf5_loaded(self, analysis, path: str) -> None:
         self._close_hdf5_progress()
+        from strainx.core.parametric import ParametricSweep
+        if isinstance(analysis, ParametricSweep):
+            self._wizard.parametric_sweep = analysis
+            self._wizard.analysis_mode = "parametric"
+            self._wizard.go_parametric_results()
+            return
         analysis.last_hdf5_directory = os.path.dirname(path)
         try:
             analysis.save_settings()

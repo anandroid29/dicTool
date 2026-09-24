@@ -7,11 +7,7 @@ Normalized Cross-Correlation (NCC) initial guess for DIC.
 from __future__ import annotations
 import numpy as np
 
-try:
-    import cv2
-    _HAVE_CV2 = True
-except ImportError:
-    _HAVE_CV2 = False
+import cv2
 
 def ncc_initial_guess(
     ref_image: np.ndarray,
@@ -52,20 +48,9 @@ def ncc_initial_guess(
     if search.shape[0] < th or search.shape[1] < tw:
         return guess_u, guess_v, 0.0
 
-    # ---- Correlation ----
-    if _HAVE_CV2:
-        # TM_CCOEFF_NORMED (zero-mean NCC), NOT TM_CCORR_NORMED. The latter does
-        # not subtract the local mean, so under any illumination gradient it peaks
-        # on the brightest region rather than the best-matching one. This also makes
-        # the cv2 path agree with the _fft_ncc fallback, which is a true ZNCC.
-        result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-        _, score, _, max_loc = cv2.minMaxLoc(result)
-        col0, row0 = max_loc
-    else:
-        result = _fft_ncc(search, template)
-        idx = np.unravel_index(np.argmax(result), result.shape)
-        row0, col0 = idx
-        score = float(result[row0, col0])
+    # OpenCV is a required application dependency. Use zero-mean NCC.
+    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, (col0, row0) = cv2.minMaxLoc(result)
 
     match_row = sr1 + row0
     match_col = sc1 + col0
@@ -74,33 +59,3 @@ def ncc_initial_guess(
     v0 = float(match_row - r1)
 
     return u0, v0, float(score)
-
-def _fft_ncc(image: np.ndarray, template: np.ndarray) -> np.ndarray:
-    ih, iw = image.shape
-    th, tw = template.shape
-    t = template - template.mean()
-    t_norm = np.sqrt((t ** 2).sum())
-    if t_norm < 1e-12:
-        return np.zeros((ih - th + 1, iw - tw + 1), dtype=np.float32)
-
-    t_norm_inv = 1.0 / t_norm
-
-    pad_h = ih
-    pad_w = iw
-    F = np.fft.rfft2(image, s=(pad_h, pad_w))
-    T = np.fft.rfft2(np.flipud(np.fliplr(t)), s=(pad_h, pad_w))
-    cross = np.fft.irfft2(F * T, s=(pad_h, pad_w))
-    from scipy.ndimage import uniform_filter
-    img2 = image ** 2
-    local_sum = uniform_filter(image.astype(np.float64), size=(th, tw)) * th * tw
-    local_sum2 = uniform_filter(img2.astype(np.float64), size=(th, tw)) * th * tw
-    local_std = np.sqrt(np.maximum(local_sum2 - local_sum ** 2 / (th * tw), 0.0))
-    local_std = np.maximum(local_std, 1e-12)
-
-    r_h = ih - th + 1
-    r_w = iw - tw + 1
-    cross_valid = cross[th - 1:th - 1 + r_h, tw - 1:tw - 1 + r_w]
-    std_valid   = local_std[th // 2: th // 2 + r_h, tw // 2: tw // 2 + r_w]
-
-    ncc = cross_valid * t_norm_inv / (std_valid * np.sqrt(th * tw) + 1e-12)
-    return ncc.astype(np.float32)

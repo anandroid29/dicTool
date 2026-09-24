@@ -131,7 +131,6 @@ def run_rg_dic(
     cancel_flag: Optional[list] = None,
     guess_u: float = 0.0,
     guess_v: float = 0.0,
-    use_gpu = False
 ) -> DICResult:
     (BSplineInterpolator, circular_subset, image_gradient, _, _, _,
      infer_intensity_scale) = _solver_components()
@@ -271,7 +270,7 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
         sd_nb = get_sd(idx, x, y)
         if not sd_nb.valid:
             return False, None, np.inf
-        p_opt, cls_opt, conv = run_icgn(cur_interp, sd_nb, p_guess,
+        p_opt, cls_opt, _ = run_icgn(cur_interp, sd_nb, p_guess,
                                         params.max_iter, params.conv_tol,
                                         intensity_scale=intensity_scale)
         good = (cls_opt < params.corr_cutoff and
@@ -354,9 +353,7 @@ def _run_domain(ref_f64, cur_image_raw, cur_interp, grad_x, grad_y,
 
     # ---------------- reliability-guided propagation ----------------
     while heap and not cancel_flag[0]:
-        cls_p, pidx, p_par = heapq.heappop(heap)
-        if cls_p > best_cls[pidx] + 1e-12:
-            continue  # stale heap entry, a better estimate for this point exists
+        _, pidx, p_par = heapq.heappop(heap)
         px, py = int(domain_gx[pidx]), int(domain_gy[pidx])
 
         for nx, ny in [(px + step, py), (px - step, py), (px, py + step), (px, py - step)]:

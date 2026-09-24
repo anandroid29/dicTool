@@ -10,12 +10,14 @@ from PyQt6.QtWidgets import (
 from strainx.core.analysis import DICAnalysis
 from strainx.ui.theme import STYLESHEET
 from strainx.ui.components import WizardStepper
+from strainx.ui.pages.mode_page import ModePage
 from strainx.ui.pages.welcome_page import WelcomePage
 from strainx.ui.pages.roi_page import ROIPage
 from strainx.ui.pages.dynamic_roi_page import DynamicROIPage
 from strainx.ui.pages.params_page import ParamsPage
 from strainx.ui.pages.analysis_page import AnalysisPage
 from strainx.ui.pages.results_page import ResultsPage
+from strainx.ui.pages.parametric_results_page import ParametricResultsPage
 
 # Dynamic ROI sits between the static ROI and the numeric parameters: it is a
 # masking decision, so it belongs with the other masking step rather than as a
@@ -37,6 +39,15 @@ class Wizard(QMainWindow):
         self.analysis = DICAnalysis()
         self.seed_xy = None
         self.use_gpu = bool(getattr(self.analysis, "prefer_gpu", True))
+        self.analysis_mode = None
+        self.parametric_ranges = {
+            "subset_radius": (5, 12, 1),
+            "subset_spacing": (1, 5, 1),
+            "strain_window": (1, 15, 1),
+            "temporal_span": (1, 1, 1),
+        }
+        self.parametric_precompute_temporal = False
+        self.parametric_sweep = None
 
         self.setStyleSheet(STYLESHEET)
         self._build_ui()
@@ -85,18 +96,22 @@ class Wizard(QMainWindow):
         root.setSpacing(0)
 
         self._step_bar = WizardStepper(_STEPS, current_index=0)
+        self._step_bar.setVisible(False)
         root.addWidget(self._step_bar)
 
         self._stack = QStackedWidget()
+        self._mode = ModePage(self)
         self._welcome = WelcomePage(self)
         self._roi = ROIPage(self)
         self._dynroi = DynamicROIPage(self)
         self._params = ParamsPage(self)
         self._analysis = AnalysisPage(self)
         self._results = ResultsPage(self)
+        self._parametric_results = ParametricResultsPage(self)
 
-        for page in (self._welcome, self._roi, self._dynroi, self._params,
-                     self._analysis, self._results):
+        for page in (self._mode, self._welcome, self._roi, self._dynroi,
+                     self._params, self._analysis, self._results,
+                     self._parametric_results):
             self._stack.addWidget(page)
 
         root.addWidget(self._stack, 1)
@@ -127,7 +142,11 @@ class Wizard(QMainWindow):
             page_with_enter.on_before_show()
 
         self._stack.setCurrentIndex(idx)
-        self._step_bar.set_step(idx)
+        if page_with_enter in (self._mode, self._parametric_results):
+            self._step_bar.setVisible(False)
+        else:
+            self._step_bar.setVisible(True)
+            self._step_bar.set_step(max(0, idx - 1))
 
         # Populate the incoming page before control returns to Qt's event loop.
         # The old 50 ms timer let the newly selected page paint once with stale
@@ -153,6 +172,8 @@ class Wizard(QMainWindow):
         self.analysis = DICAnalysis()
         self.seed_xy = None
         self.use_gpu = bool(getattr(self.analysis, "prefer_gpu", True))
+        self.analysis_mode = None
+        self.parametric_sweep = None
         # These are concrete lifecycle operations, not optional plugin hooks.
         # Calling them explicitly makes ownership visible to readers and static
         # analysis, which previously misreported all three methods as dead.
@@ -170,25 +191,45 @@ class Wizard(QMainWindow):
                 pass
         # The analysis object was deliberately replaced above. Do not let an
         # outgoing page commit stale controls into the new session.
-        self._go(0, self._welcome, run_leave_hook=False)
+        self._go(0, self._mode, run_leave_hook=False)
+
+    def select_mode(self, mode: str) -> None:
+        """Choose a workflow before entering the shared import screens."""
+        if mode not in ("single", "parametric"):
+            raise ValueError(f"Unknown analysis mode: {mode}")
+        self.analysis_mode = mode
+        self.go_welcome()
+
+    def go_modes(self) -> None:
+        """Return to workflow selection without discarding imported data."""
+        self.analysis_mode = None
+        self._go(0, self._mode)
+
+    def open_hdf5(self) -> None:
+        """Open the shared loader; it auto-detects result-file type."""
+        self.analysis_mode = "load"
+        self._welcome.open_hdf5()
 
     def go_welcome(self) -> None:
-        self._go(0, self._welcome)
+        self._go(1, self._welcome)
 
     def go_roi(self) -> None:
-        self._go(1, self._roi)
+        self._go(2, self._roi)
 
     def go_dynamic_roi(self) -> None:
-        self._go(2, self._dynroi)
+        self._go(3, self._dynroi)
 
     def go_params(self) -> None:
-        self._go(3, self._params)
+        self._go(4, self._params)
 
     def go_analysis(self) -> None:
-        self._go(4, self._analysis)
+        self._go(5, self._analysis)
 
     def go_results(self) -> None:
-        self._go(5, self._results)
+        self._go(6, self._results)
+
+    def go_parametric_results(self) -> None:
+        self._go(7, self._parametric_results)
 
     def closeEvent(self, event) -> None:
         self.analysis.cancel()

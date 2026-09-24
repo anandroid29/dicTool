@@ -581,9 +581,9 @@ class ImportCalibrationUITests(unittest.TestCase):
         wizard.go_analysis()
         for _ in range(20):
             QTest.qWait(10)
-            if wizard._stack.currentIndex() == 5:
+            if wizard._stack.currentIndex() == 6:
                 break
-        self.assertEqual(wizard._stack.currentIndex(), 5)
+        self.assertEqual(wizard._stack.currentIndex(), 6)
         wizard.close()
 
 

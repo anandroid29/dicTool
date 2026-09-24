@@ -1,7 +1,5 @@
-# src/core/analysis.py
 """
 analysis.py — DICAnalysis with strain rate computation, frame-sync support, and batched GPU execution.
-Fixed: Survival rate denominator uses valid ROI subset count to prevent false Auto-Fallback triggers.
 """
 from __future__ import annotations
 import importlib.util
@@ -629,8 +627,14 @@ class DICAnalysis:
             self,
             progress_cb: Optional[Callable[[float, str], None]] = None,
             seed_xy: Optional[tuple] = None,
-            use_gpu: bool = False
+            use_gpu: bool = False,
+            postprocess: bool = True,
+            result_cb: Optional[Callable[[int, PairResult], None]] = None,
+            retain_results: bool = True,
     ) -> None:
+
+        if postprocess and not retain_results:
+            raise ValueError("Post-processing requires retained correlation results.")
 
         if use_gpu:
             from .cuda_native import native_cuda_available, native_cuda_diagnostic
@@ -639,7 +643,9 @@ class DICAnalysis:
                     "GPU acceleration requested but the native CUDA backend "
                     f"is unavailable: {native_cuda_diagnostic()}")
             self.last_backend = "gpu"
-            self._run_gpu(progress_cb, seed_xy)
+            self._run_gpu(
+                progress_cb, seed_xy, postprocess=postprocess,
+                result_cb=result_cb, retain_results=retain_results)
             return
 
         self.last_backend = "cpu"
@@ -689,7 +695,6 @@ class DICAnalysis:
                 prev_image, cur, mask, self.params,
                 seed_xy=seed_xy, progress_cb=pair_cb, cancel_flag=self._cancel,
                 guess_u=guess_u, guess_v=guess_v,
-                use_gpu=use_gpu,
             )
             elapsed = time.perf_counter() - t0
 
@@ -722,27 +727,36 @@ class DICAnalysis:
 
             u_out = _result_f32(np.where(valid, dic.u, np.nan))
             v_out = _result_f32(np.where(valid, dic.v, np.nan))
-            gradients = self._pair_displacement_gradients(u_out, v_out, valid)
+            gradients = (self._pair_displacement_gradients(u_out, v_out, valid)
+                         if postprocess else None)
             indices = np.flatnonzero(valid.reshape(-1)).astype(np.uint32, copy=False)
 
-            self.results.append(PairResult(
+            result = PairResult(
                 image_path=def_path,
                 u=_compact_field(u_out, valid, indices),
                 v=_compact_field(v_out, valid, indices),
                 Exx=None, Exy=None, Eyy=None, Eeff=None,
-                du_dx=_compact_field(gradients["du_dx"], valid, indices),
-                du_dy=_compact_field(gradients["du_dy"], valid, indices),
-                dv_dx=_compact_field(gradients["dv_dx"], valid, indices),
-                dv_dy=_compact_field(gradients["dv_dy"], valid, indices),
+                du_dx=(None if gradients is None else
+                       _compact_field(gradients["du_dx"], valid, indices)),
+                du_dy=(None if gradients is None else
+                       _compact_field(gradients["du_dy"], valid, indices)),
+                dv_dx=(None if gradients is None else
+                       _compact_field(gradients["dv_dx"], valid, indices)),
+                dv_dy=(None if gradients is None else
+                       _compact_field(gradients["dv_dy"], valid, indices)),
                 corr=_compact_field(dic.corr, valid, indices),
                 valid=CompactMask(ref.shape, indices), elapsed=elapsed,
-            ))
+            )
+            if result_cb is not None:
+                result_cb(i, result)
+            if retain_results:
+                self.results.append(result)
 
             # Immediate-frame analysis: the current image becomes the next
             # reference. Previous displacement is used only as a seed hint.
             prev_image = cur
 
-        if not self._cancel[0] and self.results:
+        if postprocess and not self._cancel[0] and self.results:
             self._compute_incremental_displacements()
             self._compute_velocities_and_rates(progress_cb)
             self._transport_accumulated_strain(progress_cb)
@@ -753,10 +767,13 @@ class DICAnalysis:
     def _run_gpu(
             self,
             progress_cb: Optional[Callable[[float, str], None]] = None,
-            seed_xy: Optional[tuple] = None
+            seed_xy: Optional[tuple] = None,
+            postprocess: bool = True,
+            result_cb: Optional[Callable[[int, PairResult], None]] = None,
+            retain_results: bool = True,
     ) -> None:
         """
-        Executes the Wavefront GPU pipeline with intelligent Global Seed Tracking and Auto-Fallback.
+        Execute native pairwise correlation followed by shared post-processing.
         """
         self._cancel[0] = False
         self._release_loaded_hdf5()
@@ -792,15 +809,9 @@ class DICAnalysis:
         actual_seed_x = int(gpu_solver.gx_flat[seed_idx])
         actual_seed_y = int(gpu_solver.gy_flat[seed_idx])
 
-        # CORRECTED EXPECTED SUBSETS: Count only subsets strictly inside the ROI
-        expected_subsets = int(gpu_solver.valid_mask.sum())
-
-        from .ncc import ncc_initial_guess
-
         warm_start_active = False
         guess_u, guess_v = 0.0, 0.0
 
-        prev_image = self._ref_image  # first reference is frame 0
         dyn_roi = self.make_dynamic_roi()
         dyn_roi.calibrate(self.strain_reference_image())
 
@@ -815,12 +826,6 @@ class DICAnalysis:
                 progress_cb(0.90 * (i / n_frames), f"[{i + 1}/{n_frames}] Loading {os.path.basename(def_path)}...")
 
             cur_image = _load_image(def_path)
-
-            # Pairwise DIC is spatially reinitialised on the previous frame.
-            # Keep the seed in that image-space ROI; accumulated material
-            # coordinates are strain state, not solver geometry.
-            current_seed_x = actual_seed_x
-            current_seed_y = actual_seed_y
 
             if not warm_start_active:
                 if progress_cb:
@@ -872,11 +877,6 @@ class DICAnalysis:
                         break
                     accepted = new_accepted
 
-            solver_valid = (np.isfinite(inc_u[self._roi_mask]) &
-                            np.isfinite(inc_v[self._roi_mask]) &
-                            np.isfinite(corr_f[self._roi_mask]))
-            self._previous_solver_valid_count = int(np.count_nonzero(solver_valid))
-
             # Dynamic ROI rejection must happen BEFORE strain accumulation. In
             # the old order, a subset that left the frame could contribute one
             # huge affine increment permanently and was only hidden afterwards.
@@ -908,41 +908,43 @@ class DICAnalysis:
 
             # --- Updated Lagrangian: swap reference to current frame for next iteration ---
             gpu_solver.update_reference_image(cur_image)
-            prev_image = cur_image
 
             elapsed = time.perf_counter() - t0
 
             u_out = _result_f32(np.where(frame_valid, inc_u, np.nan))
             v_out = _result_f32(np.where(frame_valid, inc_v, np.nan))
-            gradients = self._pair_displacement_gradients(
-                u_out, v_out, frame_valid)
+            gradients = (self._pair_displacement_gradients(
+                u_out, v_out, frame_valid) if postprocess else None)
             indices = np.flatnonzero(frame_valid.reshape(-1)).astype(
                 np.uint32, copy=False)
-            self.results.append(PairResult(
+            result = PairResult(
                 image_path=def_path,
                 u=_compact_field(u_out, frame_valid, indices),
                 v=_compact_field(v_out, frame_valid, indices),
                 Exx=None, Exy=None, Eyy=None, Eeff=None,
-                du_dx=_compact_field(gradients["du_dx"], frame_valid, indices),
-                du_dy=_compact_field(gradients["du_dy"], frame_valid, indices),
-                dv_dx=_compact_field(gradients["dv_dx"], frame_valid, indices),
-                dv_dy=_compact_field(gradients["dv_dy"], frame_valid, indices),
+                du_dx=(None if gradients is None else
+                       _compact_field(gradients["du_dx"], frame_valid, indices)),
+                du_dy=(None if gradients is None else
+                       _compact_field(gradients["du_dy"], frame_valid, indices)),
+                dv_dx=(None if gradients is None else
+                       _compact_field(gradients["dv_dx"], frame_valid, indices)),
+                dv_dy=(None if gradients is None else
+                       _compact_field(gradients["dv_dy"], frame_valid, indices)),
                 corr=_compact_field(corr_f, frame_valid, indices),
                 valid=CompactMask(self._ref_image.shape, indices), elapsed=elapsed,
-            ))
-
-            # Release frame-temporary native workspaces while preserving the
-            # solver's reference coefficients and warm-start state.
-            gpu_solver.release_temporary_memory()
+            )
+            if result_cb is not None:
+                result_cb(i, result)
+            if retain_results:
+                self.results.append(result)
 
         # The GPU solver owns persistent reference coefficients and warm-start
         # state. Release it before CPU velocity/strain post-processing, whose
         # host-memory peak otherwise overlaps the still-live CUDA allocations
         # and pinned-memory pool on long sequences.
-        gpu_solver.release_temporary_memory()
         gpu_solver.close()
 
-        if not self._cancel[0] and self.results:
+        if postprocess and not self._cancel[0] and self.results:
             self._compute_incremental_displacements()
             self._compute_velocities_and_rates(progress_cb)
             self._transport_accumulated_strain(progress_cb)
@@ -965,6 +967,48 @@ class DICAnalysis:
             "dv_dx": _result_f32(fitted["dVy_dx"]),
             "dv_dy": _result_f32(fitted["dVy_dy"]),
         }
+
+    def postprocess_correlations(
+            self, strain_window: int,
+            progress_cb: Optional[Callable[[float, str], None]] = None
+            ) -> None:
+        """Rebuild every strain-derived field from existing correlations.
+
+        This is intentionally separate from :meth:`run` so parameter sweeps can
+        solve displacement once for a subset-radius/grid-spacing pair and reuse
+        it for several spatial strain windows.  ``run(postprocess=False)`` must
+        have populated ``results`` first.  The displacement and validity fields
+        are retained; gradients, rates and accumulated strain are replaced.
+        """
+        if not self.results:
+            raise RuntimeError("No correlation results to post-process.")
+        self.params.strain_window = int(strain_window)
+        for i, res in enumerate(self.results):
+            if progress_cb:
+                progress_cb(
+                    0.70 * (i / max(1, len(self.results))),
+                    f"[{i + 1}/{len(self.results)}] Fitting displacement gradients…")
+            valid = (np.asarray(res.valid, dtype=bool) if res.valid is not None
+                     else (np.isfinite(np.asarray(res.u)) &
+                           np.isfinite(np.asarray(res.v))))
+            gradients = self._pair_displacement_gradients(res.u, res.v, valid)
+            indices = (res.valid.indices
+                       if isinstance(res.valid, CompactMask)
+                       else np.flatnonzero(valid.reshape(-1)).astype(
+                           np.uint32, copy=False))
+            for name, values in gradients.items():
+                setattr(res, name, _compact_field(values, valid, indices))
+
+        self._compute_incremental_displacements()
+
+        def downstream_progress(fraction: float, message: str) -> None:
+            if progress_cb:
+                progress_cb(0.70 + 0.30 * float(fraction), message)
+
+        self._compute_velocities_and_rates(downstream_progress)
+        self._transport_accumulated_strain(downstream_progress)
+        if progress_cb:
+            progress_cb(1.0, "Post-processing complete.")
 
     @staticmethod
     def _set_strain_fields(res: PairResult,
@@ -1401,7 +1445,8 @@ class DICAnalysis:
             pts.append((x, y))
         return pts, None
 
-    def reference_from_current(self, x: float, y: float, frame_idx: int
+    def reference_from_current(self, x: float, y: float, frame_idx: int,
+                               exhaustive: bool = True
                               ) -> Optional[tuple[tuple[float, float], float]]:
         """
         Map a click on the DISPLAYED (deformed) frame back to reference coordinates.
@@ -1423,9 +1468,16 @@ class DICAnalysis:
         # minute. Each inverse step solves q + d_i(q) = current by fixed-point
         # iteration, so the work stays linear in sequence length.
         reverse = self._reverse_advect_path(float(x), float(y), idx)
-        best = (self._shoot_to(x, y, idx, reverse[0], reverse[1], max_iter=4)
+        best = (self._shoot_to(
+            x, y, idx, reverse[0], reverse[1], max_iter=4 if exhaustive else 2)
                 if reverse is not None else None)
         if best is not None and best[1] < 1.0:
+            return best
+
+        # Interactive placement needs a quick, exact fallback on the current
+        # frame. The exhaustive reference-grid search remains available to API
+        # callers that need the oldest recoverable material seed.
+        if not exhaustive:
             return best
 
         # Never start the old exhaustive reference-grid fallback on a long
@@ -1545,18 +1597,34 @@ class DICAnalysis:
                 gy = min(max(gy, 0.0), H - 1.0)
         return best
 
+    @staticmethod
+    def _marker_seed_parts(seed) -> tuple[float, float, int]:
+        """Return x, y and the first interval a marker may traverse."""
+        if len(seed) == 2:
+            x, y = seed
+            return float(x), float(y), 0
+        x, y, start_interval = seed[:3]
+        return float(x), float(y), max(0, int(start_interval))
+
     def marker_positions(self, seeds, frame_idx: int) -> list[Optional[tuple[float, float]]]:
-        """Where each reference-frame marker sits on the displayed frame."""
+        """Where each reference or later-frame marker sits on this frame."""
         if not self.results or not seeds:
             return [None] * len(seeds)
         idx = max(0, min(int(frame_idx), len(self.results) - 1))
         out = []
-        for (sx, sy) in seeds:
-            path = self._traced_path(float(sx), float(sy), idx)
-            pts, lost_at = path["points"], path["lost_at"]
-            out.append(tuple(pts[idx + 1])
-                       if (lost_at is None or lost_at > idx) and idx + 1 < len(pts)
-                       else None)
+        for seed in seeds:
+            sx, sy, start = self._marker_seed_parts(seed)
+            if idx < start - 1:
+                out.append(None)
+                continue
+            path = self._traced_path(sx, sy, idx, start)
+            first, lost = path["started_at"], path["lost_at"]
+            if first is None or idx < first:
+                out.append((sx, sy))
+            elif lost is not None and idx >= lost:
+                out.append(None)
+            else:
+                out.append(tuple(path["points"][idx - first + 1]))
         return out
 
     def get_trajectories_from_seeds(self, seeds, max_frame: int, trail: int = 0
@@ -1564,7 +1632,7 @@ class DICAnalysis:
         """
         Trace one trajectory per user-placed marker.
 
-        seeds      : list of (x, y) in REFERENCE-frame coordinates
+        seeds      : (x, y) reference seeds, or (x, y, start_interval) late seeds
         max_frame  : trace up to and including this displayed frame
         trail      : 0 = full history, else keep only the last `trail` segments
 
@@ -1577,15 +1645,22 @@ class DICAnalysis:
             return []
         last = min(int(max_frame), len(self.results) - 1)
         out: list[dict] = []
-        for (sx, sy) in seeds:
-            path = self._traced_path(float(sx), float(sy), last)
-            pts, lost_at = list(path["points"][:last + 2]), path["lost_at"]
+        for seed in seeds:
+            sx, sy, start = self._marker_seed_parts(seed)
+            if last < start - 1:
+                out.append({"points": [], "lost_at": None,
+                            "started_at": None, "start_interval": start,
+                            "seed": (sx, sy)})
+                continue
+            path = self._traced_path(sx, sy, last, start)
+            pts, lost_at = list(path["points"]), path["lost_at"]
             if lost_at is not None and lost_at > last:
                 lost_at = None
             if trail and trail > 0 and len(pts) > trail + 1:
                 pts = pts[-(trail + 1):]
             out.append({"points": pts, "lost_at": lost_at,
-                        "seed": (float(sx), float(sy))})
+                        "started_at": path["started_at"],
+                        "start_interval": start, "seed": (sx, sy)})
         return out
 
     def _results_token(self) -> tuple:
@@ -1593,8 +1668,9 @@ class DICAnalysis:
         last = id(self.results[-1]) if self.results else 0
         return len(self.results), first, last
 
-    def _traced_path(self, sx: float, sy: float, last: int) -> dict:
-        """Thread-safe material path cache, extended only for unseen frames."""
+    def _traced_path(self, sx: float, sy: float, last: int,
+                     start_interval: int = 0) -> dict:
+        """Thread-safe path cache that can wait for a valid later interval."""
         lock = self._path_lock
         if lock is None:
             lock = self._path_lock = threading.RLock()
@@ -1602,20 +1678,27 @@ class DICAnalysis:
             cache = self._path_cache
             if cache is None:
                 cache = self._path_cache = {}
-            key = (round(sx, 3), round(sy, 3))
+            start = max(0, int(start_interval))
+            key = (round(sx, 3), round(sy, 3), start)
             token = self._results_token()
             entry = cache.get(key)
             if entry is None or entry["token"] != token:
                 entry = {"token": token, "points": [(sx, sy)],
-                         "traced_to": -1, "lost_at": None}
+                         "traced_to": start - 1, "lost_at": None,
+                         "started_at": None}
                 cache[key] = entry
             if entry["lost_at"] is None:
                 x, y = entry["points"][-1]
                 for i in range(entry["traced_to"] + 1, last + 1):
                     nxt = self._advect_step(self.results[i], x, y)
                     if nxt is None:
+                        entry["traced_to"] = i
+                        if entry["started_at"] is None:
+                            continue
                         entry["lost_at"] = i
                         break
+                    if entry["started_at"] is None:
+                        entry["started_at"] = i
                     x, y = nxt
                     entry["points"].append((x, y))
                     entry["traced_to"] = i
@@ -2243,6 +2326,73 @@ class DICAnalysis:
         "dVx_dx", "dVx_dy", "dVy_dx", "dVy_dy",
         "Exx_rate", "Exy_rate", "Gxy_rate", "Eyy_rate", "Eeff_rate", "corr")
 
+    def marker_timeseries(self, seeds, fields=None, labels=None,
+                          max_frame: Optional[int] = None) -> dict:
+        """Compute selected marker histories on demand along their moving paths."""
+        if not self.results or not seeds:
+            raise ValueError("Place at least one marker after running an analysis.")
+        last = len(self.results) - 1 if max_frame is None else min(
+            int(max_frame), len(self.results) - 1)
+        fields = tuple(self.MARKER_TIMESERIES_FIELDS if fields is None else fields)
+        names = [name for name in fields if any(
+            getattr(result, name, None) is not None
+            for result in self.results[:last + 1])]
+        fps = float(getattr(self, "fps", 0.0) or 0.0)
+        times = ((np.arange(last + 1, dtype=np.float64) + 1.0) / fps
+                 if fps > 0 else np.arange(last + 1, dtype=np.float64))
+        calibration = getattr(self, "calibration", Calibration())
+        units = {name: calibration.factor_and_unit(
+            name, _FIELD_BASE_UNIT.get(name, ""))[1] for name in names}
+        position_unit = calibration.display_unit if calibration.calibrated else "px"
+        histories = []
+
+        for marker_index, seed in enumerate(seeds):
+            sx, sy, start = self._marker_seed_parts(seed)
+            x_values = np.full(last + 1, np.nan, dtype=np.float64)
+            y_values = np.full(last + 1, np.nan, dtype=np.float64)
+            tracked = np.zeros(last + 1, dtype=bool)
+            sampled = {name: np.full(last + 1, np.nan, dtype=np.float64)
+                       for name in names}
+            birth = start - 1
+            if 0 <= birth <= last:
+                x_values[birth], y_values[birth] = sx, sy
+
+            x, y = sx, sy
+            started = False
+            for frame in range(start, last + 1):
+                result = self.results[frame]
+                nxt = self._advect_step(result, x, y)
+                if nxt is None:
+                    if started:
+                        break
+                    continue
+                if not started and frame > 0:
+                    x_values[frame - 1], y_values[frame - 1] = x, y
+                started = True
+                for name in names:
+                    value = self._sample_sparse(getattr(result, name, None), x, y)
+                    if np.isfinite(value):
+                        sampled[name][frame] = value
+                x, y = nxt
+                x_values[frame], y_values[frame] = x, y
+                tracked[frame] = True
+
+            x_values, _ = calibration.convert("u", x_values, "px")
+            y_values, _ = calibration.convert("u", y_values, "px")
+            for name in names:
+                sampled[name], _ = calibration.convert(
+                    name, sampled[name], _FIELD_BASE_UNIT.get(name, ""))
+            histories.append({
+                "marker": marker_index,
+                "label": labels[marker_index] if labels and marker_index < len(labels)
+                else f"M{marker_index + 1}",
+                "time": times.copy(), "x": x_values, "y": y_values,
+                "tracked": tracked, "fields": sampled, "start_interval": start,
+            })
+        return {"markers": histories, "fields": names, "units": units,
+                "position_unit": position_unit,
+                "time_unit": "s" if fps > 0 else "frame"}
+
     def export_marker_timeseries(self, seeds, path: str,
                                  labels=None, max_frame: Optional[int] = None) -> int:
         """
@@ -2253,11 +2403,9 @@ class DICAnalysis:
         what you plot to get a strain-rate-versus-time curve for a location.
 
         Each row is one (frame, marker) pair, with the marker's tracked position
-        on that frame followed by every field sampled at it. Fields are sampled
-        at the marker's REFERENCE-frame seed, because that is the grid the fields
-        are indexed on -- the same convention :meth:`marker_positions` uses to
-        follow a material point. Values pass through the same calibration as the
-        per-frame CSV, and units are stated in the header row.
+        on that frame followed by every field sampled along its moving material
+        path. Values pass through the same calibration as the per-frame CSV, and
+        units are stated in the header row.
 
         A marker that leaves the correlated region has blank field columns from
         the frame it was lost onward, so a gap in a plot is visibly a dropout
@@ -2265,25 +2413,10 @@ class DICAnalysis:
 
         Returns the number of data rows written.
         """
-        if not self.results or not seeds:
-            raise ValueError("Nothing to export: place at least one marker first.")
-        seeds = [(float(sx), float(sy)) for (sx, sy) in seeds]
-        last = len(self.results) - 1 if max_frame is None else min(int(max_frame), len(self.results) - 1)
-        last = max(0, last)
-        fps = float(getattr(self, "fps", 0.0) or 0.0)
-
-        # Only export fields this run actually has, so the sheet has no dead
-        # columns; probe every frame because e.g. rates are absent on frame 0.
-        names = [n for n in self.MARKER_TIMESERIES_FIELDS
-                 if any(getattr(self.results[i], n, None) is not None
-                        for i in range(last + 1))]
-        units = {}
-        for n in names:
-            arr = next((getattr(self.results[i], n) for i in range(last + 1)
-                        if getattr(self.results[i], n, None) is not None), None)
-            _, units[n] = self.calibration.convert(n, np.zeros(1), _FIELD_BASE_UNIT.get(n, ""))
-
-        pos_unit = self.calibration.describe() if self.calibration.calibrated else "px"
+        history = self.marker_timeseries(
+            seeds, labels=labels, max_frame=max_frame)
+        names, units = history["fields"], history["units"]
+        pos_unit = history["position_unit"]
         header = ["frame", "time_s", "marker", "marker_label",
                   f"x [{pos_unit}]", f"y [{pos_unit}]", "x_px", "y_px", "tracked"]
         header += [f"{n} [{units[n]}]" if units[n] else n for n in names]
@@ -2292,38 +2425,21 @@ class DICAnalysis:
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(header)
-            for m, (sx, sy) in enumerate(seeds):
-                label = (labels[m] if labels and m < len(labels) else f"M{m + 1}")
-                u_total = v_total = 0.0
-                tracked = True
-                for i in range(last + 1):
-                    res = self.results[i]
-                    if tracked:
-                        du = self._sample_sparse(res.u, sx, sy)
-                        dv = self._sample_sparse(res.v, sx, sy)
-                        if np.isfinite(du) and np.isfinite(dv):
-                            u_total += du
-                            v_total += dv
-                        else:
-                            tracked = False
-                    x_px, y_px = sx + u_total, sy + v_total
-                    xc, _ = self.calibration.convert("u", np.array([x_px]), "px")
-                    yc, _ = self.calibration.convert("u", np.array([y_px]), "px")
-                    row = [i, (i / fps if fps > 0 else ""), m, label,
-                           f"{float(xc[0]):.6g}", f"{float(yc[0]):.6g}",
-                           f"{x_px:.4f}", f"{y_px:.4f}", int(tracked)]
+            position_factor = self.calibration.factor_and_unit("u", "px")[0]
+            for marker in history["markers"]:
+                for i, time_value in enumerate(marker["time"]):
+                    x_value, y_value = marker["x"][i], marker["y"][i]
+                    x_px = x_value / position_factor if np.isfinite(x_value) else np.nan
+                    y_px = y_value / position_factor if np.isfinite(y_value) else np.nan
+                    row = [i, f"{time_value:.9g}", marker["marker"], marker["label"],
+                           f"{x_value:.6g}" if np.isfinite(x_value) else "",
+                           f"{y_value:.6g}" if np.isfinite(y_value) else "",
+                           f"{x_px:.4f}" if np.isfinite(x_px) else "",
+                           f"{y_px:.4f}" if np.isfinite(y_px) else "",
+                           int(marker["tracked"][i])]
                     for n in names:
-                        arr = getattr(res, n, None)
-                        if arr is None or not tracked:
-                            row.append("")
-                            continue
-                        val = self._sample_sparse(arr, sx, sy)
-                        if not np.isfinite(val):
-                            row.append("")
-                            continue
-                        conv, _ = self.calibration.convert(
-                            n, np.array([val]), _FIELD_BASE_UNIT.get(n, ""))
-                        row.append(f"{float(conv[0]):.6g}")
+                        value = marker["fields"][n][i]
+                        row.append(f"{value:.6g}" if np.isfinite(value) else "")
                     w.writerow(row)
                     rows += 1
         return rows
@@ -2375,6 +2491,9 @@ class DICAnalysis:
             temporal_results=None, temporal_pairs=None,
             temporal_metadata: Optional[dict] = None) -> None:
         import h5py
+        from .temporal import (
+            MEASUREMENT_FIELDS, RATE_FIELDS, STRAIN_FIELDS, _packed_common,
+        )
         with h5py.File(path, "w") as f:
             # 1. Save Global Attributes
             f.attrs.update(dict(
@@ -2391,6 +2510,13 @@ class DICAnalysis:
                 subset_radius=self.params.subset_radius,
                 subset_spacing=self.params.subset_spacing,
                 strain_window=self.params.strain_window,
+                max_iter=self.params.max_iter,
+                conv_tol=self.params.conv_tol,
+                corr_cutoff=self.params.corr_cutoff,
+                search_radius=self.params.search_radius,
+                rescue_radius=self.params.rescue_radius,
+                shape_order=self.params.shape_order,
+                mask_subsets_to_roi=self.params.mask_subsets_to_roi,
                 fps=self.fps,
                 # Datasets stay in the solver's native pixel units so a file
                 # round-trips exactly; the calibration rides along as metadata
@@ -2438,31 +2564,18 @@ class DICAnalysis:
                     f.create_dataset(
                         name, data=np.asarray(mask, dtype=bool),
                         compression="gzip", compression_opts=4)
-            frame_overrides = getattr(self, "dynamic_frame_overrides", {})
-            if frame_overrides:
-                overrides_group = f.create_group("dynamic_frame_overrides")
-                overrides_group.attrs["semantics"] = "exact_displayed_frame"
-                for frame_index, entry in sorted(frame_overrides.items()):
+            for name, prefix, semantics in (
+                    ("dynamic_frame_overrides", "frame", "exact_displayed_frame"),
+                    ("dynamic_future_overrides", "from", "default_from_displayed_frame")):
+                overrides = getattr(self, name, {})
+                if not overrides:
+                    continue
+                overrides_group = f.create_group(name)
+                overrides_group.attrs["semantics"] = semantics
+                for frame_index, entry in sorted(overrides.items()):
                     group = overrides_group.create_group(
-                        f"frame_{int(frame_index):06d}")
-                    if entry.get("threshold") is not None:
-                        group.attrs["threshold"] = float(entry["threshold"])
-                    if "replace" in entry:
-                        group.attrs["replace"] = bool(entry["replace"])
-                    for channel in ("include", "exclude"):
-                        mask = entry.get(channel)
-                        if mask is not None and np.asarray(mask, dtype=bool).any():
-                            group.create_dataset(
-                                channel, data=np.asarray(mask, dtype=bool),
-                                compression="gzip", compression_opts=4)
-            future_overrides = getattr(self, "dynamic_future_overrides", {})
-            if future_overrides:
-                future_group = f.create_group("dynamic_future_overrides")
-                future_group.attrs["semantics"] = "default_from_displayed_frame"
-                for start_frame, entry in sorted(future_overrides.items()):
-                    group = future_group.create_group(
-                        f"from_{int(start_frame):06d}")
-                    if bool(entry.get("reset", False)):
+                        f"{prefix}_{int(frame_index):06d}")
+                    if prefix == "from" and bool(entry.get("reset", False)):
                         group.attrs["reset"] = True
                     if entry.get("threshold") is not None:
                         group.attrs["threshold"] = float(entry["threshold"])
@@ -2478,31 +2591,6 @@ class DICAnalysis:
             # 3. Save only independent, user-facing data. Velocity and
             # displacement magnitudes are deterministic views of u/v and dt;
             # gradients/correlation are solver workspaces, not result history.
-            measurement_fields = ("u", "v")
-            rate_fields = ("Exx_rate", "Exy_rate", "Eyy_rate", "Eeff_rate")
-            strain_fields = ("Exx_gl", "Exy_gl", "Eyy_gl", "Eeff_gl")
-
-            def packed_common(res, names):
-                packed = []
-                for name in names:
-                    field = getattr(res, name, None)
-                    if field is None:
-                        return np.zeros(0, np.uint32), []
-                    if isinstance(field, CompactField):
-                        idx, vals = field.indices, field.values
-                    else:
-                        dense = np.asarray(field)
-                        idx = np.flatnonzero(np.isfinite(dense).reshape(-1)).astype(
-                            np.uint32, copy=False)
-                        vals = dense.reshape(-1)[idx].astype(np.float32, copy=False)
-                    packed.append((idx, vals))
-                common = packed[0][0]
-                for idx, _ in packed[1:]:
-                    common = np.intersect1d(common, idx, assume_unique=True)
-                aligned = [vals[np.searchsorted(idx, common)]
-                           for idx, vals in packed]
-                return common, aligned
-
             def write_result_group(group, res) -> None:
                 group.attrs["image_path"] = res.image_path
                 group.attrs["elapsed_s"] = res.elapsed
@@ -2510,10 +2598,10 @@ class DICAnalysis:
                 if shape is None:
                     shape = self._roi_mask.shape
                 group.attrs["field_shape"] = np.asarray(shape, dtype=np.int64)
-                for prefix, names in (("valid", measurement_fields),
-                                      ("rate", rate_fields),
-                                      ("strain", strain_fields)):
-                    indices, values = packed_common(res, names)
+                for prefix, names in (("valid", MEASUREMENT_FIELDS),
+                                      ("rate", RATE_FIELDS),
+                                      ("strain", STRAIN_FIELDS)):
+                    indices, values = _packed_common(res, names, fill_missing=False)
                     group.create_dataset(
                         f"{prefix}_indices", data=indices,
                         compression="gzip", compression_opts=4)
@@ -2613,6 +2701,12 @@ class DICAnalysis:
             self.params.subset_radius = int(f.attrs.get("subset_radius", self.params.subset_radius))
             self.params.subset_spacing = int(f.attrs.get("subset_spacing", self.params.subset_spacing))
             self.params.strain_window = int(f.attrs.get("strain_window", self.params.strain_window))
+            for name, cast in (("max_iter", int), ("conv_tol", float),
+                               ("corr_cutoff", float), ("search_radius", int),
+                               ("rescue_radius", int), ("shape_order", int),
+                               ("mask_subsets_to_roi", bool)):
+                if name in f.attrs:
+                    setattr(self.params, name, cast(f.attrs[name]))
             self.fps = float(f.attrs.get("fps", 1.0))
             self.strain_start_frame = int(np.clip(
                 int(f.attrs.get("strain_start_frame", 0)), 0, len(frame_keys)))
@@ -2665,32 +2759,18 @@ class DICAnalysis:
             self.dynamic_exclude_mask = (
                 f["dynamic_exclude_mask"][:].astype(bool)
                 if "dynamic_exclude_mask" in f else None)
-            if "dynamic_frame_overrides" in f:
-                overrides_group = f["dynamic_frame_overrides"]
-                for key, group in overrides_group.items():
+            for name in ("dynamic_frame_overrides", "dynamic_future_overrides"):
+                if name not in f:
+                    continue
+                overrides = getattr(self, name)
+                for key, group in f[name].items():
                     try:
                         frame_index = int(key.rsplit("_", 1)[-1])
                     except (TypeError, ValueError):
                         continue
                     entry: dict[str, object] = {}
-                    if "threshold" in group.attrs:
-                        entry["threshold"] = float(group.attrs["threshold"])
-                    if "replace" in group.attrs:
-                        entry["replace"] = bool(group.attrs["replace"])
-                    for channel in ("include", "exclude"):
-                        if channel in group:
-                            entry[channel] = group[channel][:].astype(bool)
-                    if entry:
-                        self.dynamic_frame_overrides[frame_index] = entry
-            if "dynamic_future_overrides" in f:
-                future_group = f["dynamic_future_overrides"]
-                for key, group in future_group.items():
-                    try:
-                        start_frame = int(key.rsplit("_", 1)[-1])
-                    except (TypeError, ValueError):
-                        continue
-                    entry: dict[str, object] = {}
-                    if bool(group.attrs.get("reset", False)):
+                    if (name == "dynamic_future_overrides" and
+                            bool(group.attrs.get("reset", False))):
                         entry["reset"] = True
                     if "threshold" in group.attrs:
                         entry["threshold"] = float(group.attrs["threshold"])
@@ -2700,7 +2780,7 @@ class DICAnalysis:
                         if channel in group:
                             entry[channel] = group[channel][:].astype(bool)
                     if entry:
-                        self.dynamic_future_overrides[start_frame] = entry
+                        overrides[frame_index] = entry
 
             # 3. Restore Frame Data
             n_frames = len(frame_keys)

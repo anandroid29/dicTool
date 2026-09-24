@@ -434,6 +434,66 @@ def test_temporal_mode_streakline_uses_the_pair_endpoint():
     page.close()
 
 
+def test_unmappable_marker_stays_at_click_and_starts_on_current_frame(monkeypatch):
+    shape, radius, spacing = (41, 41), 5, 5
+    analysis = DICAnalysis()
+    analysis.params = DICParams(
+        subset_radius=radius, subset_spacing=spacing, strain_window=5)
+    analysis._roi_mask = np.ones(shape, dtype=bool)
+    analysis._ref_image = np.zeros(shape, dtype=float)
+    analysis.results = [
+        _increment(shape, radius, spacing,
+                   lambda x, _y: np.full_like(x, 0.1, dtype=float),
+                   lambda _x, y: np.zeros_like(y, dtype=float))
+        for _ in range(4)]
+    analysis.def_paths = []
+    monkeypatch.setattr(analysis, "reference_from_current", lambda *_, **__: None)
+    page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))
+    page._frame = 2
+    page._streak_chk.setChecked(True)
+
+    page._on_marker_requested(17.25, 23.75)
+
+    assert page._canvas.markers == [(17.25, 23.75)]
+    assert page._marker_specs() == [(17.25, 23.75, 3)]
+    drawn = page._canvas._marker_render_pt(0)
+    assert (drawn.x(), drawn.y()) == pytest.approx((17.25, 23.75))
+    assert analysis.marker_positions(page._marker_specs(), 1) == [None]
+    assert analysis.marker_positions(page._marker_specs(), 2)[0] == pytest.approx(
+        (17.25, 23.75))
+    page._pair_pool.waitForDone(3000)
+    page.close()
+
+
+def test_marker_graph_offers_all_families_and_computes_on_demand():
+    shape, radius, spacing = (41, 41), 5, 5
+    analysis = DICAnalysis()
+    analysis.params = DICParams(
+        subset_radius=radius, subset_spacing=spacing, strain_window=5)
+    analysis._roi_mask = np.ones(shape, dtype=bool)
+    analysis._ref_image = np.zeros(shape, dtype=float)
+    analysis.results = [
+        _increment(shape, radius, spacing,
+                   lambda x, _y: np.full_like(x, 0.1, dtype=float),
+                   lambda _x, y: np.zeros_like(y, dtype=float))
+        for _ in range(3)]
+    analysis.def_paths = []
+    page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))
+    page._canvas.set_markers([(radius, radius), (radius + spacing, radius)])
+    page._show_marker_history()
+    dialog = page._marker_plot_dialog
+
+    assert [dialog.group_combo.itemText(i) for i in range(dialog.group_combo.count())] == [
+        "Position", "Velocity", "Strain", "Strain rate"]
+    assert dialog.marker_list.count() == 2
+    assert _wait_until(lambda: dialog.update_btn.isEnabled())
+    assert len(dialog.figure.axes) == 2
+    assert dialog.figure.axes[-1].get_xlabel() == "Time [s]"
+    dialog.close()
+    page._pair_pool.waitForDone(3000)
+    page.close()
+
+
 def test_sidebar_export_buttons_and_marker_order_are_compact_but_unclipped():
     analysis = DICAnalysis()
     page = ResultsPage(SimpleNamespace(analysis=analysis, new_session=lambda: None))

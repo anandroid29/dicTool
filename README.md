@@ -19,13 +19,23 @@ results.
 |---|---|
 | Displacement `u`, `v`, magnitude | Motion from the immediately previous frame to the current frame; it is not accumulated |
 | Velocity `Vx`, `Vy`, effective velocity | Immediate displacement divided by the frame interval |
-| Strain `Exx`, `Eyy`, `Exy` | Material-path strain since the point crossed the selected strain-origin line; Green–Lagrange components come from composed incremental deformation gradients |
+| Strain `Exx`, `Eyy`, `Exy` | First-arrival history of material-path strain from the selected origin; each spatial cell retains its first value, rather than the strain of material currently occupying it |
 | Equivalent strain | Non-negative path integral of equivalent strain rate; it never decreases along a valid material path |
-| Strain rate | Instantaneous symmetric spatial gradient of the velocity field; it is not obtained by differentiating accumulated strain in time |
+| Strain rate | Small-increment approximation from the symmetric gradient of pair displacement divided by the frame interval |
 
 `Exy` is tensor shear strain, not engineering shear (`Gxy = 2 Exy`). The
 equivalent strain and strain-rate fields use the same von Mises-style magnitude,
 with the out-of-plane term inferred from plastic incompressibility.
+
+The strain-rate and equivalent-strain estimates assume small deformation and
+rotation **per image interval**. Pair displacement divided by time is an average
+velocity on the source grid, so these are not exact instantaneous spatial rates
+for finite steps. For example, a pure 10-degree rotation in one interval produces
+about 0.03038 spurious equivalent strain in this approximation, although the
+composed Green–Lagrange tensor correctly remains zero. Use temporal convergence
+checks when interpreting these fields. Plastic incompressibility is a modelling
+assumption; in-plane DIC alone cannot establish out-of-plane strain or separate
+plastic strain from elastic strain.
 
 ## Features
 
@@ -46,8 +56,10 @@ with the out-of-plane term inferred from plastic incompressibility.
 - Inspect fields with an FEA-style `turbo` colourmap by default, plus alternative
   sequential and diverging maps.
 - Use per-frame, sequence-global, symmetric, or manually entered colour limits.
-- Place trajectory markers, display streaklines, and average selected frame
-  pairs for displacement, velocity, and strain rate.
+- Place trajectory markers, display streaklines, and graph position, velocity,
+  strain, or strain rate against time for any selected markers. Markers can wait
+  for a later valid frame when they are absent at the start of the sequence.
+- Average selected frame pairs for displacement, velocity, and strain rate.
 - Export the current frame to CSV, save/load HDF5 result sessions, or render a
   configurable multi-panel video or PNG image sequence.
 
@@ -247,7 +259,12 @@ Hole recovery can be disabled, seeded by an accepted neighbouring affine
 solution, or seeded by a fresh NCC search. Recovered subsets are never filled by
 interpolation: each one reruns IC-GN and must pass the same correlation cutoff.
 Recovery continues only while the accepted subset count grows and stops at the
-configured pass limit.
+configured pass limit. GPU NCC recovery searches every failed subset and uses
+accepted neighbouring motion when available. Every disconnected ROI component
+is independently initialized, including after complete tracking dropout. The GPU
+tries the supplied affine guess before integer rescue and uses the same
+subset-edge convergence units as the CPU. These corrections require native
+runtime 2.2.0 or newer; rebuild and restart after updating the source.
 
 The strain window is measured in image pixels while samples occur only at DIC
 grid points. Its regular support per axis is:

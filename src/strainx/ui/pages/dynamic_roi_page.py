@@ -116,8 +116,11 @@ class DynamicROIPage(QWidget):
         root.setSpacing(0)
 
         top = QWidget()
+        top.setObjectName("dynamicRoiTopBar")
         top.setFixedHeight(52)
-        top.setStyleSheet(f"background:{_C_SURFACE}; border-bottom:1px solid {_C_BORDER};")
+        top.setStyleSheet(
+            f"QWidget#dynamicRoiTopBar{{background:{_C_SURFACE};"
+            f"border-bottom:1px solid {_C_BORDER};}}")
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(20, 0, 20, 0)
         back = QPushButton("← Back")
@@ -138,12 +141,20 @@ class DynamicROIPage(QWidget):
         # Frame-specific controls stay above the image, like a video editor's
         # active-clip toolbar. They always operate on exactly the displayed frame.
         frame_bar = QWidget()
-        frame_bar.setFixedHeight(58)
+        frame_bar.setObjectName("dynamicRoiFrameBar")
+        frame_bar.setFixedHeight(96)
         frame_bar.setStyleSheet(
-            f"background:{_C_CARD}; border-bottom:1px solid {_C_BORDER};")
-        fbar = QHBoxLayout(frame_bar)
-        fbar.setContentsMargins(14, 8, 14, 8)
+            f"QWidget#dynamicRoiFrameBar{{background:{_C_CARD};"
+            f"border-bottom:1px solid {_C_BORDER};}}")
+        frame_rows = QVBoxLayout(frame_bar)
+        frame_rows.setContentsMargins(14, 5, 14, 5)
+        frame_rows.setSpacing(3)
+        fbar = QHBoxLayout()
         fbar.setSpacing(7)
+        actions = QHBoxLayout()
+        actions.setSpacing(7)
+        frame_rows.addLayout(fbar)
+        frame_rows.addLayout(actions)
         self._frame_override_lbl = QPushButton("FRAME 0 OVERRIDE")
         self._frame_override_lbl.setCheckable(True)
         self._frame_override_lbl.setStyleSheet(
@@ -161,42 +172,19 @@ class DynamicROIPage(QWidget):
         self._frame_replace_chk.toggled.connect(self._on_frame_replace_toggled)
         fbar.addWidget(self._frame_replace_chk)
 
-        self._frame_btn_inc = QPushButton("Include")
-        self._frame_btn_exc = QPushButton("Exclude")
-        self._frame_channel_group = QButtonGroup(self)
-        self._frame_channel_group.setExclusive(True)
-        for button, channel in ((self._frame_btn_inc, "include"),
-                                (self._frame_btn_exc, "exclude")):
-            button.setCheckable(True)
-            button.setFixedHeight(30)
-            button.setStyleSheet(_CHOICE_STYLE)
-            self._frame_channel_group.addButton(button)
-            button.clicked.connect(
-                lambda _c, ch=channel: self._set_channel(ch, "frame"))
-            fbar.addWidget(button)
-
-        self._frame_tool_group = QButtonGroup(self)
-        self._frame_tool_group.setExclusive(True)
-        self._frame_tool_buttons = {}
-        for label, tool in (("Rect", ROITool.RECTANGLE),
-                            ("Poly", ROITool.POLYGON),
-                            ("Circle", ROITool.CIRCLE),
-                            ("Erase", ROITool.ERASE)):
-            button = QPushButton(label)
-            button.setCheckable(True)
-            button.setFixedHeight(30)
-            button.setStyleSheet(_CHOICE_STYLE)
-            self._frame_tool_group.addButton(button)
-            self._frame_tool_buttons[tool] = button
-            button.clicked.connect(
-                lambda _c, t=tool: self._set_tool(t, "frame"))
-            fbar.addWidget(button)
+        channels = (("Include", "include"), ("Exclude", "exclude"))
+        tools = (("Rect", ROITool.RECTANGLE), ("Poly", ROITool.POLYGON),
+                 ("Circle", ROITool.CIRCLE), ("Erase", ROITool.ERASE))
+        self._frame_channel_group, buttons = self._choice_buttons(
+            fbar, channels, lambda channel: self._set_channel(channel, "frame"))
+        self._frame_btn_inc, self._frame_btn_exc = buttons.values()
+        self._frame_tool_group, self._frame_tool_buttons = self._choice_buttons(
+            fbar, tools, lambda tool: self._set_tool(tool, "frame"))
         self._frame_tool_buttons[ROITool.RECTANGLE].setChecked(True)
 
-        fbar.addSpacing(8)
         self._frame_thr_chk = QCheckBox("Threshold override")
         self._frame_thr_chk.toggled.connect(self._on_frame_threshold_toggled)
-        fbar.addWidget(self._frame_thr_chk)
+        actions.addWidget(self._frame_thr_chk)
         self._frame_thr_slider = QSlider(Qt.Orientation.Horizontal)
         self._frame_thr_slider.setRange(0, 100)
         self._frame_thr_slider.setValue(50)
@@ -204,33 +192,33 @@ class DynamicROIPage(QWidget):
         self._frame_thr_slider.setEnabled(False)
         self._frame_thr_slider.valueChanged.connect(
             self._on_frame_threshold_changed)
-        fbar.addWidget(self._frame_thr_slider)
+        actions.addWidget(self._frame_thr_slider)
         self._frame_thr_lbl = QLabel("base")
         self._frame_thr_lbl.setFixedWidth(42)
-        fbar.addWidget(self._frame_thr_lbl)
+        actions.addWidget(self._frame_thr_lbl)
         fbar.addStretch()
         self._copy_prev_btn = QPushButton("Copy prev")
         self._copy_prev_btn.setFixedHeight(30)
         self._copy_prev_btn.clicked.connect(self._copy_previous_override)
-        fbar.addWidget(self._copy_prev_btn)
+        actions.addWidget(self._copy_prev_btn)
         self._set_future_btn = QPushButton("Set → future")
         self._set_future_btn.setFixedHeight(30)
         self._set_future_btn.setToolTip(
             "Apply this frame's override as the default from the next frame\n"
             "onward. Exact-frame edits still take priority.")
         self._set_future_btn.clicked.connect(self._set_current_as_future_default)
-        fbar.addWidget(self._set_future_btn)
+        actions.addWidget(self._set_future_btn)
         self._clear_future_btn = QPushButton("Clear future")
         self._clear_future_btn.setFixedHeight(30)
         self._clear_future_btn.setToolTip(
             "Keep defaults through this frame, then stop inheriting from the\n"
             "next frame onward. Exact-frame edits remain.")
         self._clear_future_btn.clicked.connect(self._clear_future_defaults)
-        fbar.addWidget(self._clear_future_btn)
+        actions.addWidget(self._clear_future_btn)
         self._clear_frame_btn = QPushButton("Clear frame")
         self._clear_frame_btn.setFixedHeight(30)
         self._clear_frame_btn.clicked.connect(self._clear_frame_override)
-        fbar.addWidget(self._clear_frame_btn)
+        actions.addWidget(self._clear_frame_btn)
 
         # Include/exclude overrides are drawn the same way the ROI is, so an
         # accidental region needs the same way back.
@@ -239,7 +227,8 @@ class DynamicROIPage(QWidget):
         self._undo_btn.setEnabled(False)
         self._undo_btn.setToolTip("Undo the last drawn override region  (Ctrl+Z)")
         self._undo_btn.clicked.connect(self._undo)
-        fbar.addWidget(self._undo_btn)
+        actions.addWidget(self._undo_btn)
+        actions.addStretch()
         root.addWidget(frame_bar)
 
         body = QWidget()
@@ -259,8 +248,11 @@ class DynamicROIPage(QWidget):
         self._undo_shortcut.activated.connect(self._undo)
 
         right = QWidget()
+        right.setObjectName("dynamicRoiSidePanel")
         right.setFixedWidth(_PANEL_W)
-        right.setStyleSheet(f"background:{_C_SURFACE}; border-left:1px solid {_C_BORDER};")
+        right.setStyleSheet(
+            f"QWidget#dynamicRoiSidePanel{{background:{_C_SURFACE};"
+            f"border-left:1px solid {_C_BORDER};}}")
         lay = QVBoxLayout(right)
         lay.setContentsMargins(22, 24, 22, 24)
         lay.setSpacing(14)
@@ -369,36 +361,15 @@ class DynamicROIPage(QWidget):
         lay.addWidget(ov_hint)
 
         crow = QHBoxLayout()
-        self._btn_inc = QPushButton("Include")
-        self._btn_exc = QPushButton("Exclude")
-        self._channel_group = QButtonGroup(self)
-        self._channel_group.setExclusive(True)
-        for b, chan in ((self._btn_inc, "include"), (self._btn_exc, "exclude")):
-            b.setCheckable(True)
-            b.setFixedHeight(30)
-            b.setStyleSheet(_CHOICE_STYLE)
-            self._channel_group.addButton(b)
-            b.clicked.connect(lambda _c, ch=chan: self._set_channel(ch, "global"))
-            crow.addWidget(b)
+        self._channel_group, buttons = self._choice_buttons(
+            crow, channels, lambda channel: self._set_channel(channel, "global"))
+        self._btn_inc, self._btn_exc = buttons.values()
         self._btn_inc.setChecked(True)
         lay.addLayout(crow)
 
         trow2 = QHBoxLayout()
-        self._tool_group = QButtonGroup(self)
-        self._tool_group.setExclusive(True)
-        self._tool_buttons = {}
-        for label, tool in (("Rect", ROITool.RECTANGLE),
-                            ("Poly", ROITool.POLYGON),
-                            ("Circle", ROITool.CIRCLE),
-                            ("Erase", ROITool.ERASE)):
-            b = QPushButton(label)
-            b.setCheckable(True)
-            b.setFixedHeight(28)
-            b.setStyleSheet(_CHOICE_STYLE)
-            self._tool_group.addButton(b)
-            self._tool_buttons[tool] = b
-            b.clicked.connect(lambda _c, t=tool: self._set_tool(t, "global"))
-            trow2.addWidget(b)
+        self._tool_group, self._tool_buttons = self._choice_buttons(
+            trow2, tools, lambda tool: self._set_tool(tool, "global"), height=28)
         self._tool_buttons[ROITool.RECTANGLE].setChecked(True)
         lay.addLayout(trow2)
 
@@ -429,9 +400,11 @@ class DynamicROIPage(QWidget):
 
         # Familiar video-player transport along the bottom.
         transport = QWidget()
+        transport.setObjectName("dynamicRoiTransport")
         transport.setFixedHeight(60)
         transport.setStyleSheet(
-            f"background:{_C_SURFACE}; border-top:1px solid {_C_BORDER};")
+            f"QWidget#dynamicRoiTransport{{background:{_C_SURFACE};"
+            f"border-top:1px solid {_C_BORDER};}}")
         transport_lay = QHBoxLayout(transport)
         transport_lay.setContentsMargins(18, 8, 18, 8)
         transport_lay.setSpacing(9)
@@ -453,6 +426,22 @@ class DynamicROIPage(QWidget):
         self._frame_lbl.setStyleSheet(f"color:{_C_TEXT}; font-size:11px;")
         transport_lay.addWidget(self._frame_lbl)
         root.addWidget(transport)
+
+    def _choice_buttons(self, layout, choices, callback, height: int = 30):
+        """Build one exclusive row of ROI channel or drawing-tool buttons."""
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        buttons = {}
+        for label, value in choices:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setFixedHeight(height)
+            button.setStyleSheet(_CHOICE_STYLE)
+            button.clicked.connect(lambda _checked, value=value: callback(value))
+            group.addButton(button)
+            layout.addWidget(button)
+            buttons[value] = button
+        return group, buttons
 
     def _install_shortcuts(self) -> None:
         """Install page-scoped editor shortcuts and expose them in tooltips."""

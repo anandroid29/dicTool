@@ -211,6 +211,7 @@ class ImageCanvas(QWidget):
     shape_drawing_changed = pyqtSignal(bool)
     seed_placed  = pyqtSignal(int, int)
     cursor_moved = pyqtSignal(int, int, float)
+    view_changed = pyqtSignal(float, float, float)
     markers_changed  = pyqtSignal(object)   # list[(x, y)] in image coords
     marker_selected  = pyqtSignal(int)      # index, or -1
     marker_requested = pyqtSignal(float, float)  # raw click, page maps to reference
@@ -294,6 +295,10 @@ class ImageCanvas(QWidget):
         self._zoom: float = 1.0
         self._pan_x: float = 0.0
         self._pan_y: float = 0.0
+        self._linked_view = False
+        self._view_feedback = False
+        self.probe_annotation: Optional[str] = None
+        self.probe_position: Optional[Tuple[int, int]] = None
         self._dragging: bool = False
         self._drag_start: QPoint = QPoint()
 
@@ -554,6 +559,38 @@ class ImageCanvas(QWidget):
 
     def fit_image(self) -> None:
         self._fit_to_window(); self.update()
+        self._publish_view()
+
+    def set_linked_view(self, enabled: bool = True) -> None:
+        self._linked_view = bool(enabled)
+
+    def view_state(self):
+        """Return image-space centre and zoom relative to fitted size."""
+        if self._image_px is None:
+            return (0.5, 0.5, 1.0)
+        width, height = self._image_px.width(), self._image_px.height()
+        center_x = (self.width() / 2 - self._pan_x) / max(self._zoom, 1e-12)
+        center_y = (self.height() / 2 - self._pan_y) / max(self._zoom, 1e-12)
+        fit = min(max(1, self.width()) / max(1, width),
+                  max(1, self.height()) / max(1, height)) * 0.92
+        return (center_x / max(1, width), center_y / max(1, height),
+                self._zoom / max(fit, 1e-12))
+
+    def set_view_state(self, state) -> None:
+        if self._image_px is None:
+            return
+        x, y, relative_zoom = state
+        width, height = self._image_px.width(), self._image_px.height()
+        fit = min(max(1, self.width()) / max(1, width),
+                  max(1, self.height()) / max(1, height)) * 0.92
+        self._zoom = max(0.1, min(fit * float(relative_zoom), 40.0))
+        self._pan_x = self.width() / 2 - float(x) * width * self._zoom
+        self._pan_y = self.height() / 2 - float(y) * height * self._zoom
+        self.update()
+
+    def _publish_view(self) -> None:
+        if self._linked_view and not self._view_feedback:
+            self.view_changed.emit(*self.view_state())
 
     # ─────────────────────────────────────────────────────────────────────
     # Mouse events
@@ -734,7 +771,8 @@ class ImageCanvas(QWidget):
         if self._dragging:
             delta = pos.toPoint() - self._drag_start
             self._pan_x += delta.x(); self._pan_y += delta.y()
-            self._drag_start = pos.toPoint(); self.update(); return
+            self._drag_start = pos.toPoint(); self.update()
+            self._publish_view(); return
 
         if self._poly_edit is not None:
             pe = self._poly_edit
@@ -817,6 +855,7 @@ class ImageCanvas(QWidget):
         self._pan_y = pos.y() + (self._pan_y - pos.y()) * factor
         self._zoom  = max(0.1, min(self._zoom * factor, 40.0))
         self.update()
+        self._publish_view()
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -990,6 +1029,26 @@ class ImageCanvas(QWidget):
                 txt = f"  x={int(x)}  y={int(y)}  I={val:.3f}  zoom={self._zoom:.2f}×{extra}"
                 painter.setPen(QColor("#a2a8ad"))
                 painter.drawText(4, self.height() - 6, txt)
+        if self.probe_annotation:
+            if self.probe_position is not None:
+                px, py = self.probe_position
+                point = QPointF(px + 0.5, py + 0.5) * self._zoom + QPointF(
+                    self._pan_x, self._pan_y)
+                painter.setPen(QPen(QColor(255, 255, 255, 210), 1.0))
+                painter.drawLine(QPointF(point.x() - 7, point.y()),
+                                 QPointF(point.x() + 7, point.y()))
+                painter.drawLine(QPointF(point.x(), point.y() - 7),
+                                 QPointF(point.x(), point.y() + 7))
+            painter.setFont(QFont("Consolas", 9))
+            rect = QRectF(8, self.height() - 31,
+                          max(140, self.width() - 16), 23)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(15, 17, 19, 220))
+            painter.drawRoundedRect(rect, 3, 3)
+            painter.setPen(QColor("#e6e8ea"))
+            painter.drawText(rect.adjusted(7, 0, -4, 0),
+                             Qt.AlignmentFlag.AlignVCenter,
+                             self.probe_annotation)
 
     def _paint_roi_preview(self, painter: QPainter) -> None:
         if self._tool in (ROITool.POLYGON, ROITool.POLYLINE) and self._poly_pts:
@@ -1258,8 +1317,18 @@ class ImageCanvas(QWidget):
         t = QTransform(); t.translate(self._pan_x, self._pan_y); t.scale(self._zoom, self._zoom); return t
 
     def _widget_to_image(self, pos: QPointF) -> Optional[QPointF]:
-        if self._image_arr is None: return None
-        return QPointF((pos.x() - self._pan_x) / self._zoom, (pos.y() - self._pan_y) / self._zoom)
+        if self._image_arr is None:
+            return None
+        x = (pos.x() - self._pan_x) / self._zoom
+        y = (pos.y() - self._pan_y) / self._zoom
+        height, width = self._image_arr.shape[:2]
+        # Letterboxing and panning leave parts of the widget outside the image.
+        # Never publish those coordinates: a consumer indexing a result field
+        # from a Qt signal cannot let IndexError escape, because PyQt terminates
+        # the process on an unhandled exception in a slot.
+        if not (0.0 <= x < width and 0.0 <= y < height):
+            return None
+        return QPointF(x, y)
 
     def _fit_to_window(self) -> None:
         if self._image_px is None: return
@@ -1270,7 +1339,21 @@ class ImageCanvas(QWidget):
         self._pan_y = (wh - ih * self._zoom) / 2.0
 
     def resizeEvent(self, event) -> None:
-        if self._image_px is not None: self._fit_to_window()
+        if self._image_px is not None:
+            if self._linked_view:
+                old = event.oldSize()
+                if old.width() > 0 and old.height() > 0:
+                    width, height = self._image_px.width(), self._image_px.height()
+                    fit_old = min(old.width() / max(1, width),
+                                  old.height() / max(1, height)) * 0.92
+                    state = ((old.width() / 2 - self._pan_x) /
+                             max(self._zoom, 1e-12) / max(1, width),
+                             (old.height() / 2 - self._pan_y) /
+                             max(self._zoom, 1e-12) / max(1, height),
+                             self._zoom / max(fit_old, 1e-12))
+                    self.set_view_state(state)
+            else:
+                self._fit_to_window()
         super().resizeEvent(event)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1307,10 +1390,15 @@ class ImageCanvas(QWidget):
         self.show_marker_heads = bool(visible)
         self.update()
 
-    def add_marker(self, x: float, y: float) -> int:
+    def add_marker(self, x: float, y: float, draw_position=None) -> int:
+        displayed = [self._marker_render_pt(i) for i in range(len(self._markers))]
         self._markers.append(QPointF(float(x), float(y)))
         self._marker_sel = len(self._markers) - 1
-        self._marker_draw_pts = []
+        if draw_position is None:
+            self._marker_draw_pts = []
+        else:
+            dx, dy = draw_position
+            self._marker_draw_pts = displayed + [QPointF(float(dx), float(dy))]
         self.markers_changed.emit(self.markers)
         self.marker_selected.emit(self._marker_sel)
         self.update()

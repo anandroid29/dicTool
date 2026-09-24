@@ -62,7 +62,7 @@ def _cupy_port_reference_icgn(ref: np.ndarray, current: np.ndarray,
                               initial: np.ndarray, max_iter: int,
                               conv_tol: float, corr_cutoff: float,
                               spacing: int):
-    """NumPy/SciPy oracle for the former CuPy single-subset equations."""
+    """NumPy/SciPy oracle for the corrected native single-subset equations."""
     yy, xx = np.mgrid[-radius:radius + 1, -radius:radius + 1]
     inside = xx * xx + yy * yy <= radius * radius
     dx = xx[inside].astype(np.float64)
@@ -90,6 +90,7 @@ def _cupy_port_reference_icgn(ref: np.ndarray, current: np.ndarray,
     raw = np.column_stack((
         grad_x, grad_y, grad_x * dx, grad_x * dy,
         grad_y * dx, grad_y * dy))
+    raw -= raw.mean(axis=0)
     correction = f_norm @ raw
     sd = (raw - np.outer(f_norm, correction)) / sigma_f
     hessian = sd.T @ sd + np.eye(6) * 1e-6
@@ -121,7 +122,7 @@ def _cupy_port_reference_icgn(ref: np.ndarray, current: np.ndarray,
         if not np.isfinite(score):
             break
         dp = hessian_inverse @ (sd.T @ residual)
-        norm = np.linalg.norm(dp)
+        norm = np.sqrt(np.sum(dp[:2] ** 2) + radius**2 * np.sum(dp[2:] ** 2))
         if (not np.isfinite(norm) or np.hypot(dp[0], dp[1]) > 5.0 or
                 np.linalg.norm(dp[2:]) > 8.0):
             break
@@ -132,7 +133,7 @@ def _cupy_port_reference_icgn(ref: np.ndarray, current: np.ndarray,
     score, _ = evaluate(p)
     if score < best_score:
         best_score, best = score, p.copy()
-    limit = max(spacing * 1.5, 10.0)
+    limit = spacing + 1.0
     accepted = (np.isfinite(best_score) and best_score < corr_cutoff and
                 abs(best[0] - start[0]) < limit and
                 abs(best[1] - start[1]) < limit)
@@ -531,10 +532,9 @@ def test_stage_5_recovery_seeds_each_disconnected_failed_component():
             current, seed_idx=seed, seed_guess=(0.0, 0.0), warm_start=False)
         initial_valid = np.logical_and.reduce(
             [np.isfinite(field) for field in initial_fields])
-        # A fresh solve deliberately preserves the former CuPy pipeline's one
-        # global NCC seed; a wavefront cannot cross the gap between components.
-        assert not np.any(initial_valid & roi &
-                          (np.indices(ref.shape)[1] > 80))
+        # Every disconnected material component needs an independent seed.
+        assert np.any(initial_valid & roi &
+                      (np.indices(ref.shape)[1] > 80))
 
         fields = solver.recover_failed(0.0, 0.0)
         valid = np.logical_and.reduce([np.isfinite(field) for field in fields])

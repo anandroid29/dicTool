@@ -160,6 +160,49 @@ OVER_RANGE_RGB  = (255, 0, 255)     # magenta -- above vmax
 UNDER_RANGE_RGB = (0, 255, 255)     # cyan    -- below vmin
 
 
+def sample_colorbar(value: float, vmin: float, vmax: float,
+                    colors: Sequence[tuple[int, int, int]],
+                    mark_out_of_range: bool = False) -> tuple[int, int, int]:
+    """Sample the same piecewise-linear gradient drawn by ResultColorBar."""
+    if mark_out_of_range and value < vmin:
+        return UNDER_RANGE_RGB
+    if mark_out_of_range and value > vmax:
+        return OVER_RANGE_RGB
+    if not colors:
+        return (255, 255, 255)
+    if len(colors) == 1 or vmax <= vmin:
+        return colors[0]
+    position = max(0.0, min(1.0, (value - vmin) / (vmax - vmin))) * (
+        len(colors) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(colors) - 1)
+    fraction = position - lower
+    return tuple(round(a + (b - a) * fraction)
+                 for a, b in zip(colors[lower], colors[upper]))
+
+
+def _resize_field_colors(small, valid, vmin, vmax, cmap_name, size,
+                          mark_out_of_range):
+    """Resize premultiplied colour and coverage without bleeding invalid pixels."""
+    import matplotlib.colors as mc
+
+    norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    cmap = get_cmap(cmap_name, 256)
+    rgba = cmap(norm(np.where(valid, small, vmin)), bytes=True).astype(np.float32)
+    if mark_out_of_range:
+        # Compare the original values before normalisation clips them.
+        rgba[valid & (small > vmax), :3] = OVER_RANGE_RGB
+        rgba[valid & (small < vmin), :3] = UNDER_RANGE_RGB
+
+    coverage = valid.astype(np.float32)
+    premult = cv2.resize(
+        rgba[..., :3] * coverage[..., None], size, interpolation=cv2.INTER_LINEAR)
+    coverage = cv2.resize(coverage, size, interpolation=cv2.INTER_LINEAR)
+    if premult.ndim == 2:
+        premult = premult[..., None]
+    return coverage, premult
+
+
 def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
                   roi_mask: Optional[np.ndarray] = None,
                   spacing: int = 3, alpha: int = 195,
@@ -187,8 +230,6 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
             arr, vmin, vmax, cmap_name, roi_mask=roi_mask,
             spacing=spacing, alpha=alpha,
             mark_out_of_range=mark_out_of_range)
-    import matplotlib.colors as mc
-
     valid = np.isfinite(arr)
     if roi_mask is not None:
         valid &= np.asarray(roi_mask, dtype=bool)
@@ -217,35 +258,9 @@ def field_to_rgba(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str,
     if not small_mask.any():
         return None
 
-    norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
-    cmap_obj = get_cmap(cmap_name, 256)
-
-    safe_small = np.where(small_mask, small, vmin)
-    rgba_small = cmap_obj(norm(safe_small), bytes=True).astype(np.float32)
-
-    if mark_out_of_range:
-        # Compare before normalisation clips, so the test sees the real values.
-        over = small_mask & (small > vmax)
-        under = small_mask & (small < vmin)
-        if over.any():
-            rgba_small[over, :3] = OVER_RANGE_RGB
-        if under.any():
-            rgba_small[under, :3] = UNDER_RANGE_RGB
-
-    # Resize premultiplied colour and coverage separately. Interpolating raw RGB
-    # lets arbitrary colours stored at transparent/invalid pixels bleed into a
-    # specimen edge; premultiplication makes invalid pixels contribute exactly
-    # zero to both display and export.
-    coverage_small = small_mask.astype(np.float32)
-    premult_small = rgba_small[..., :3] * coverage_small[..., None]
-
     th, tw = ymax - ymin + 1, xmax - xmin + 1
-    coverage = cv2.resize(
-        coverage_small, (tw, th), interpolation=cv2.INTER_LINEAR)
-    premult = cv2.resize(
-        premult_small, (tw, th), interpolation=cv2.INTER_LINEAR)
-    if premult.ndim == 2:
-        premult = premult[..., None]
+    coverage, premult = _resize_field_colors(
+        small, small_mask, vmin, vmax, cmap_name, (tw, th), mark_out_of_range)
 
     # Un-premultiply by multiplying with a reciprocal computed once in 2-D,
     # rather than dividing in 3-D under a `where=` mask. A masked ufunc runs a
@@ -275,7 +290,6 @@ def _compact_field_to_rgba(
     """Colour a packed subset field without constructing a dense float image."""
     if not arr.indices.size:
         return None
-    import matplotlib.colors as mc
 
     values = arr.values
     keep = np.isfinite(values)
@@ -299,24 +313,9 @@ def _compact_field_to_rgba(
     small[gy, gx] = values
     small_mask[gy, gx] = True
 
-    norm = mc.Normalize(vmin=vmin, vmax=vmax, clip=True)
-    cmap_obj = get_cmap(cmap_name, 256)
-    rgba_small = cmap_obj(norm(small), bytes=True).astype(np.float32)
-    if mark_out_of_range:
-        over = small_mask & (small > vmax)
-        under = small_mask & (small < vmin)
-        rgba_small[over, :3] = OVER_RANGE_RGB
-        rgba_small[under, :3] = UNDER_RANGE_RGB
-
-    coverage_small = small_mask.astype(np.float32)
-    premult_small = rgba_small[..., :3] * coverage_small[..., None]
     th, tw = ymax - ymin + 1, xmax - xmin + 1
-    coverage = cv2.resize(
-        coverage_small, (tw, th), interpolation=cv2.INTER_LINEAR)
-    premult = cv2.resize(
-        premult_small, (tw, th), interpolation=cv2.INTER_LINEAR)
-    if premult.ndim == 2:
-        premult = premult[..., None]
+    coverage, premult = _resize_field_colors(
+        small, small_mask, vmin, vmax, cmap_name, (tw, th), mark_out_of_range)
     rgb = np.zeros_like(premult, dtype=np.float32)
     np.divide(premult, coverage[..., None], out=rgb,
               where=coverage[..., None] > 1e-6)

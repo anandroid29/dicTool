@@ -79,6 +79,9 @@ QWidget {{
     selection-color: #ffffff;
 }}
 
+/* Text sits on its parent surface, without an opaque tile of its own. */
+QLabel {{ background: transparent; }}
+
 QMainWindow, QDialog {{
     background: {C_BG};
 }}
@@ -245,6 +248,7 @@ QSlider::sub-page:horizontal {{
 
 /* ── Check / Radio ──────────────────────────────────────────────────── */
 QCheckBox {{
+    background: transparent;
     color: {C_TEXT2};
     spacing: 6px;
 }}
@@ -267,6 +271,7 @@ QCheckBox::indicator:disabled {{ border-color: {C_RAISED}; background: {C_BG}; }
    style and rendered as a pale slab against the dark theme. Same geometry as
    the checkbox, round indicator, accent dot when selected. */
 QRadioButton {{
+    background: transparent;
     color: {C_TEXT2};
     spacing: 6px;
     padding: 1px 4px;

@@ -13,6 +13,9 @@ __pycache__/
 *.py[cod]
 /build/
 /output/
+/dic_parameter_sweep/
+/.codex-deps/
+/.sweep-deps/
 sample video_frames
 tmp/
 Lab Data/

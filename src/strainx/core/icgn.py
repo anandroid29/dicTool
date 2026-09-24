@@ -268,9 +268,10 @@ def precompute_subset(
         cols += [0.5 * gx * xx, gx * xy, 0.5 * gx * yy,
                  0.5 * gy * xx, gy * xy, 0.5 * gy * yy]
     SD = np.column_stack(cols)
-    # Mean-correction projection for ZNSSD (Pan et al. 2009):
-    # sd[i,k] = (1/sigma_f) * (SD[i,k] - f_norm[i] * sum_j f_norm[j]*SD[j,k])
-    correction = f_norm @ SD  # shape (6,)
+    # Differentiate both the subset mean and its norm. Omitting SD.mean(0)
+    # gives the wrong Hessian on clipped subsets and illumination gradients.
+    SD -= SD.mean(axis=0)
+    correction = f_norm @ SD
     sd = (SD - np.outer(f_norm, correction)) / sigma_f
     H_mat = sd.T @ sd
 

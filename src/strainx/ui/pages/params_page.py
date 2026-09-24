@@ -5,11 +5,12 @@ from __future__ import annotations
 import importlib.util
 from typing import TYPE_CHECKING
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSpinBox, QDoubleSpinBox,
-    QFrame, QGridLayout, QSizePolicy, QCheckBox, QComboBox, QScrollArea
+    QFrame, QGridLayout, QSizePolicy, QCheckBox, QComboBox, QScrollArea,
+    QStackedWidget,
 )
 
 from strainx.ui.components import FooterButton
@@ -53,10 +54,10 @@ def _section_label(text: str) -> QLabel:
 # Panel and control widths. The label column previously got 140 px against a
 # 340 px fixed panel (292 px usable after margins), which left names like
 # "Correlation cutoff" elided and every spin box pinned at its 80 px minimum.
-_PANEL_W  = 460
+_PANEL_W  = 620
 _LABEL_W  = 145
 _FIELD_W  = 104
-_UNIT_W   = 24
+_UNIT_W   = 50
 
 
 def _param_row(label: str, tooltip: str, widget: QWidget, unit: str = "") -> QHBoxLayout:
@@ -79,6 +80,73 @@ def _param_row(label: str, tooltip: str, widget: QWidget, unit: str = "") -> QHB
     return row
 
 
+class _RangeEditor(QWidget):
+    """Compact inclusive From / To / Step integer-range editor."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, minimum: int, maximum: int,
+                 start: int, stop: int, step: int = 1, parent=None):
+        super().__init__(parent)
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(7)
+        layout.setVerticalSpacing(2)
+        self._spins = []
+        for column, (caption, value) in enumerate(
+                (("FROM", start), ("TO", stop), ("STEP", step))):
+            label = QLabel(caption)
+            label.setStyleSheet(
+                f"color:{_C_TEXT3};font-size:9px;font-weight:700;")
+            layout.addWidget(label, 0, column)
+            spin = QSpinBox()
+            spin.setRange(minimum if column < 2 else 1, maximum)
+            spin.setValue(value)
+            spin.setFixedWidth(84)
+            spin.valueChanged.connect(self._emit_normalized)
+            layout.addWidget(spin, 1, column)
+            self._spins.append(spin)
+
+    def _emit_normalized(self) -> None:
+        start, stop, _step = self.values()
+        if stop < start:
+            sender = self.sender()
+            target = self._spins[0] if sender is self._spins[1] else self._spins[1]
+            target.blockSignals(True)
+            target.setValue(stop if sender is self._spins[1] else start)
+            target.blockSignals(False)
+        self.changed.emit()
+
+    def values(self) -> tuple[int, int, int]:
+        return tuple(spin.value() for spin in self._spins)
+
+    def set_values(self, values: tuple[int, int, int]) -> None:
+        for spin, value in zip(self._spins, values):
+            spin.blockSignals(True)
+            spin.setValue(int(value))
+            spin.blockSignals(False)
+
+    def expanded(self) -> tuple[int, ...]:
+        start, stop, step = self.values()
+        return tuple(range(start, stop + 1, max(1, step)))
+
+
+class _ModeParameterField(QStackedWidget):
+    """Single-value field in normal mode, range field in parametric mode."""
+
+    def __init__(self, single: QWidget, range_editor: _RangeEditor, parent=None):
+        super().__init__(parent)
+        single_host = QWidget()
+        layout = QHBoxLayout(single_host)
+        layout.setContentsMargins(0, 9, 0, 0)
+        layout.addWidget(single)
+        layout.addStretch()
+        self.addWidget(single_host)
+        self.addWidget(range_editor)
+        self.setFixedWidth(270)
+        self.setFixedHeight(50)
+
+
 class ParamsPage(QWidget):
     """Step 4 — set DIC parameters."""
 
@@ -95,8 +163,11 @@ class ParamsPage(QWidget):
 
         # ── Top bar ───────────────────────────────────────────────────
         top = QWidget()
+        top.setObjectName("paramsTopBar")
         top.setFixedHeight(52)
-        top.setStyleSheet(f"background:{_C_SURFACE}; border-bottom:1px solid {_C_BORDER};")
+        top.setStyleSheet(
+            f"QWidget#paramsTopBar{{background:{_C_SURFACE};"
+            f"border-bottom:1px solid {_C_BORDER};}}")
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(20, 0, 20, 0)
 
@@ -126,8 +197,11 @@ class ParamsPage(QWidget):
 
         # Right: parameters panel
         right = QWidget()
+        right.setObjectName("paramsSidePanel")
         right.setMinimumWidth(_PANEL_W - 4)
-        right.setStyleSheet(f"background:{_C_SURFACE}; border-left:1px solid {_C_BORDER};")
+        right.setStyleSheet(
+            f"QWidget#paramsSidePanel {{ background:{_C_SURFACE}; "
+            f"border-left:1px solid {_C_BORDER}; }}")
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(22, 24, 22, 24)
         right_lay.setSpacing(16)
@@ -156,17 +230,25 @@ class ParamsPage(QWidget):
 
         self._sp_radius = spin(5, 200, params.subset_radius, 1)
         self._sp_radius.valueChanged.connect(self._on_param_changed)
+        self._range_radius = _RangeEditor(5, 200, 5, 12, 1)
+        self._range_radius.changed.connect(self._on_param_changed)
+        self._field_radius = _ModeParameterField(
+            self._sp_radius, self._range_radius)
         right_lay.addLayout(_param_row(
             "Subset radius", "Half-size of the correlation window in pixels.\n"
             "Larger = more robust but less spatial resolution.",
-            self._sp_radius, "px"))
+            self._field_radius, "px"))
 
         self._sp_spacing = spin(1, 50, params.subset_spacing, 1)
         self._sp_spacing.valueChanged.connect(self._on_param_changed)
+        self._range_spacing = _RangeEditor(1, 50, 1, 5, 1)
+        self._range_spacing.changed.connect(self._on_param_changed)
+        self._field_spacing = _ModeParameterField(
+            self._sp_spacing, self._range_spacing)
         right_lay.addLayout(_param_row(
             "Grid spacing", "Distance between subset centres.\n"
             "Smaller = denser result grid, longer analysis time.",
-            self._sp_spacing, "px"))
+            self._field_spacing, "px"))
 
         # Dynamic ROI now has its own step, where the threshold and the manual
         # include/exclude regions can be seen against the reference frame. Keep
@@ -200,12 +282,51 @@ class ParamsPage(QWidget):
         # Validation should still follow valid text while it is being typed.
         self._sp_strain.lineEdit().textEdited.connect(
             self._on_strain_text_edited)
+        self._range_strain = _RangeEditor(1, 200, 1, 15, 1)
+        self._range_strain.changed.connect(self._on_param_changed)
+        self._field_strain = _ModeParameterField(
+            self._sp_strain, self._range_strain)
         right_lay.addLayout(_param_row(
-            "Strain window", "Half-width in PIXELS of the neighbourhood used for\n"
+            "Cached strain windows", "A small set of half-widths in PIXELS used for\n"
             "the least-squares plane fit when computing strains.\n"
+            "Effective strain rate and accumulated effective strain are cached\n"
+            "during the sweep so the results viewer never fits them on demand.\n"
             "Must cover at least 3 grid points across, i.e. keep the radius\n"
             "at least equal to the subset spacing, or strains may be empty.",
-            self._sp_strain, "px"))
+            self._field_strain, "px"))
+
+        self._sp_temporal = spin(1, 10000, 1, 1)
+        self._range_temporal = _RangeEditor(1, 10000, 1, 1, 1)
+        self._range_temporal.changed.connect(self._on_param_changed)
+        self._field_temporal = _ModeParameterField(
+            self._sp_temporal, self._range_temporal)
+        temporal_row = _param_row(
+            "Temporal averaging", "Frame intervals in the motion-aware temporal window. "
+            "A span of 1 uses each frame directly.", self._field_temporal,
+            "frames")
+        self._temporal_row_widgets = [
+            temporal_row.itemAt(i).widget()
+            for i in range(temporal_row.count())
+            if temporal_row.itemAt(i).widget() is not None]
+        right_lay.addLayout(temporal_row)
+        self._precompute_temporal = QCheckBox(
+            "Precompute temporal spans during analysis")
+        self._precompute_temporal.setToolTip(
+            "Compute and save every selected temporal span, strain window, "
+            "and frame before opening results. A resumed sweep reuses completed "
+            "correlation and temporal checkpoints.")
+        self._precompute_temporal.toggled.connect(
+            self._on_precompute_temporal_toggled)
+        right_lay.addWidget(self._precompute_temporal)
+        self._disk_lbl = QLabel("Estimated output storage: waiting for image and ROI")
+        self._disk_lbl.setWordWrap(True)
+        self._disk_lbl.setStyleSheet(f"color:{_C_TEXT2}; font-size:10px;")
+        self._disk_lbl.setToolTip(
+            "The range estimates compressed correlation data, strain caches, "
+            "and the temporal HDF5 cache if every requested span/window is "
+            "opened. Temporal results are saved on first access, so actual "
+            "disk use grows as you inspect them.")
+        right_lay.addWidget(self._disk_lbl)
 
         # A strain window too small for the grid spacing silently produced an
         # entirely empty strain field. The solver clamps it, but the clamp was
@@ -353,8 +474,11 @@ class ParamsPage(QWidget):
 
         # ── Footer ────────────────────────────────────────────────────
         footer = QWidget()
+        footer.setObjectName("paramsFooter")
         footer.setFixedHeight(58)
-        footer.setStyleSheet(f"background:{_C_SURFACE}; border-top:1px solid {_C_BORDER};")
+        footer.setStyleSheet(
+            f"QWidget#paramsFooter{{background:{_C_SURFACE};"
+            f"border-top:1px solid {_C_BORDER};}}")
         foot_lay = QHBoxLayout(footer)
         foot_lay.setContentsMargins(20, 0, 20, 0)
         foot_lay.addStretch()
@@ -401,6 +525,18 @@ class ParamsPage(QWidget):
         self._update_order_note()
 
     def on_enter(self) -> None:
+        parametric = getattr(self._wizard, "analysis_mode", None) == "parametric"
+        for field in (self._field_radius, self._field_spacing,
+                      self._field_strain, self._field_temporal):
+            field.setCurrentIndex(1 if parametric else 0)
+        self._field_temporal.setVisible(parametric)
+        self._precompute_temporal.setVisible(parametric)
+        self._precompute_temporal.setChecked(bool(getattr(
+            self._wizard, "parametric_precompute_temporal", False)))
+        for widget in self._temporal_row_widgets:
+            widget.setVisible(parametric)
+        self._run_btn.setText(
+            "▶  Run Parameter Sweep" if parametric else "▶  Run Analysis")
         self._sync_controls_from_model()
         img = self._wizard.analysis.strain_reference_image()
         if img is not None:
@@ -437,6 +573,15 @@ class ParamsPage(QWidget):
         made correctly loaded settings appear not to be cached.
         """
         p = self._wizard.analysis.params
+        ranges = getattr(self._wizard, "parametric_ranges", {})
+        self._range_radius.set_values(tuple(ranges.get(
+            "subset_radius", (5, 12, 1))))
+        self._range_spacing.set_values(tuple(ranges.get(
+            "subset_spacing", (1, 5, 1))))
+        self._range_strain.set_values(tuple(ranges.get(
+            "strain_window", (1, 15, 1))))
+        self._range_temporal.set_values(tuple(ranges.get(
+            "temporal_span", (1, 1, 1))))
         pairs = (
             (self._sp_radius, p.subset_radius),
             (self._sp_spacing, p.subset_spacing),
@@ -469,6 +614,10 @@ class ParamsPage(QWidget):
             self._wizard.use_gpu = self._gpu_chk.isChecked()
         self._update_order_note()
 
+    def _on_precompute_temporal_toggled(self, checked: bool) -> None:
+        self._wizard.parametric_precompute_temporal = bool(checked)
+        self._on_param_changed()
+
     def _on_param_changed(self) -> None:
         p = self._wizard.analysis.params
         old = (p.subset_radius, p.subset_spacing, p.strain_window,
@@ -476,9 +625,25 @@ class ParamsPage(QWidget):
                int(getattr(p, "shape_order", 1)),
                str(getattr(p, "hole_recovery", "neighbour")),
                int(getattr(p, "hole_recovery_passes", 3)))
-        p.subset_radius  = self._sp_radius.value()
-        p.subset_spacing = self._sp_spacing.value()
-        p.strain_window  = self._sp_strain.value()
+        if getattr(self._wizard, "analysis_mode", None) == "parametric":
+            ranges = {
+                "subset_radius": self._range_radius.values(),
+                "subset_spacing": self._range_spacing.values(),
+                "strain_window": self._range_strain.values(),
+                "temporal_span": self._range_temporal.values(),
+            }
+            self._wizard.parametric_ranges = ranges
+            self._precompute_temporal.setEnabled(
+                any(span > 1 for span in self._range_temporal.expanded()))
+            # The first case drives ROI/grid preview; the sweep runner consumes
+            # every inclusive range stored above.
+            p.subset_radius = ranges["subset_radius"][0]
+            p.subset_spacing = ranges["subset_spacing"][0]
+            p.strain_window = ranges["strain_window"][0]
+        else:
+            p.subset_radius  = self._sp_radius.value()
+            p.subset_spacing = self._sp_spacing.value()
+            p.strain_window  = self._sp_strain.value()
         p.max_iter       = self._sp_maxiter.value()
         p.conv_tol       = self._sp_tol.value()
         p.corr_cutoff    = self._sp_cutoff.value()
@@ -515,11 +680,66 @@ class ParamsPage(QWidget):
         if hasattr(self._canvas, "set_subset_radius"):
             self._canvas.set_subset_radius(p.subset_radius)
 
-        # Count estimated subsets
+        # Count estimated subsets / correlations.
         img = self._wizard.analysis.strain_reference_image()
         mask = self._preview_roi_mask
         if img is not None and mask is not None:
             H, W = img.shape
+            if getattr(self._wizard, "analysis_mode", None) == "parametric":
+                radii = self._range_radius.expanded()
+                spacings = self._range_spacing.expanded()
+                windows = self._range_strain.expanded()
+                counts = []
+                for radius in radii:
+                    for spacing in spacings:
+                        ys = np.arange(radius, H - radius, spacing)
+                        xs = np.arange(radius, W - radius, spacing)
+                        counts.append(int(mask[np.ix_(ys, xs)].sum()))
+                correlations = len(radii) * len(spacings)
+                logical = correlations * len(windows)
+                total = sum(counts)
+                self._grid_lbl.setText(
+                    f"{correlations:,} reusable correlations · "
+                    f"{logical * len(self._range_temporal.expanded()):,} logical cases\n"
+                    f"≈ {total:,} subset centres per frame across the sweep · "
+                    f"{len(windows)} strain windows and "
+                    f"{len(self._range_temporal.expanded())} temporal spans")
+                # HDF5 compression varies with image texture. Estimate stored
+                # float/index payload and expose a range rather than a false
+                # byte-exact promise.
+                frame_count = max(1, len(getattr(
+                    self._wizard.analysis, "def_paths", ())))
+                centre_count = max(0, total)
+                strain_outputs = len(windows) * 2
+                raw_bytes = (centre_count * frame_count * 16 +
+                             centre_count * frame_count *
+                             strain_outputs * 4)
+                temporal_spans = tuple(self._range_temporal.expanded())
+                # Temporal outputs are now persisted as compact HDF5 sidecars
+                # on first access. This is the upper estimate if every
+                # requested span/window/frame is eventually opened.
+                temporal_variants = (len(windows) *
+                                     sum(span > 1 for span in temporal_spans))
+                raw_bytes += (centre_count * frame_count *
+                              temporal_variants * 32)
+                low, high = raw_bytes * 0.35, raw_bytes * 0.85
+                def human_size(value):
+                    for unit in ("B", "KB", "MB", "GB", "TB"):
+                        if value < 1024 or unit == "TB":
+                            return f"{value:.1f} {unit}"
+                        value /= 1024
+                self._disk_lbl.setText(
+                    f"Estimated storage: {human_size(low)}–{human_size(high)} "
+                    + ("(includes precomputed temporal cache)"
+                       if self._precompute_temporal.isChecked() else
+                       "(upper range if all temporal results are viewed)"))
+                self._disk_lbl.setToolTip(
+                    "Compressed estimate for correlation data, strain caches, "
+                    "and all requested temporal spans/windows. "
+                    + ("Temporal results will be saved during analysis."
+                       if self._precompute_temporal.isChecked() else
+                       "Temporal results are saved as they are opened."))
+                return
             r, s = p.subset_radius, p.subset_spacing
             ys = np.arange(r, H - r, s)
             xs = np.arange(r, W - r, s)
@@ -529,9 +749,19 @@ class ParamsPage(QWidget):
                 f"≈ {cnt:,} subsets will be analysed\n"
                 f"({W}×{H} image, {s} px spacing)"
             )
+            frame_count = max(1, len(getattr(
+                self._wizard.analysis, "def_paths", ())))
+            # Raw single-analysis fields are stored as compact float32 arrays;
+            # use a conservative 16 bytes per retained subset/frame.
+            estimated = cnt * frame_count * 16
+            self._disk_lbl.setText(
+                f"Estimated output storage: approximately "
+                f"{estimated / (1024 ** 2):.1f} MB before compression")
 
     def _on_strain_text_edited(self, text: str) -> None:
         """Update validation while the operator is still typing."""
+        if getattr(self._wizard, "analysis_mode", None) == "parametric":
+            return
         try:
             value = int(text.strip())
         except ValueError:
@@ -546,6 +776,20 @@ class ParamsPage(QWidget):
 
     def _update_strain_warning(self, window: int | None = None) -> None:
         p = self._wizard.analysis.params
+        if getattr(self._wizard, "analysis_mode", None) == "parametric":
+            windows = self._range_strain.expanded()
+            spacings = self._range_spacing.expanded()
+            clamped = sum(1 for spacing in spacings for value in windows
+                          if value < spacing)
+            if clamped:
+                self._strain_warn.setText(
+                    f"ℹ  {clamped} grid/strain-window pairings request fewer "
+                    "than 3 grid points across. They remain listed separately, "
+                    "but use the grid spacing as their effective fit radius.")
+                self._strain_warn.setVisible(True)
+            else:
+                self._strain_warn.setVisible(False)
+            return
         sw = int(p.strain_window if window is None else window)
         eff = p.effective_strain_window(warn=False, window=sw)
         if eff != sw:
@@ -629,6 +873,19 @@ class ParamsPage(QWidget):
         self._wizard.analysis.params = DICParams()
         self._wizard.analysis.save_settings()
         p = self._wizard.analysis.params
+        if getattr(self._wizard, "analysis_mode", None) == "parametric":
+            self._wizard.parametric_ranges = {
+                "subset_radius": (5, 12, 1),
+                "subset_spacing": (1, 5, 1),
+                "strain_window": (1, 15, 1),
+                "temporal_span": (1, 1, 1),
+            }
+            self._wizard.parametric_precompute_temporal = False
+            self._precompute_temporal.setChecked(False)
+            self._range_radius.set_values((5, 12, 1))
+            self._range_spacing.set_values((1, 5, 1))
+            self._range_strain.set_values((1, 15, 1))
+            self._range_temporal.set_values((1, 1, 1))
 
         # 2. Update all spinboxes silently
         for sb, val in [
@@ -657,13 +914,16 @@ class ParamsPage(QWidget):
 
         self._on_param_changed()  # Update the subset counter and dynamic-ROI summary
 
-        QMessageBox.information(
-            self, "Defaults restored",
-            f"Parameters reset to defaults.\n\n"
-            f"Radius: {p.subset_radius}\n"
-            f"Spacing: {p.subset_spacing}\n"
-            f"Strain Window: {p.strain_window}"
-        )
+        if getattr(self._wizard, "analysis_mode", None) == "parametric":
+            message = ("Parametric ranges restored.\n\n"
+                       "Radius: 5 to 12 px\nGrid spacing: 1 to 5 px\n"
+                       "Cached effective-strain windows: every px from 1 to 15")
+        else:
+            message = (f"Parameters reset to defaults.\n\n"
+                       f"Radius: {p.subset_radius}\n"
+                       f"Spacing: {p.subset_spacing}\n"
+                       f"Strain Window: {p.strain_window}")
+        QMessageBox.information(self, "Defaults restored", message)
 
     def _on_run_clicked(self) -> None:
         """Save the GPU preference to the wizard, then proceed to the analysis screen."""
@@ -696,4 +956,16 @@ class ParamsPage(QWidget):
             return
 
         self._wizard.analysis.save_settings()
+        if getattr(self._wizard, "analysis_mode", None) == "parametric":
+            from pathlib import Path
+            from PyQt6.QtWidgets import QFileDialog
+            previous = getattr(self._wizard, "parametric_output_directory", "")
+            if not previous:
+                previous = str(Path(self._wizard.analysis.ref_path).parent)
+            output = QFileDialog.getExistingDirectory(
+                self, "Select a separate folder for parametric HDF5 results",
+                previous)
+            if not output:
+                return
+            self._wizard.parametric_output_directory = output
         self._wizard.go_analysis()

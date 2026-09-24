@@ -68,8 +68,11 @@ class ROIPage(QWidget):
 
         # ── Top bar ───────────────────────────────────────────────────
         top = QWidget()
+        top.setObjectName("roiTopBar")
         top.setFixedHeight(52)
-        top.setStyleSheet(f"background:{_C_SURFACE}; border-bottom:1px solid {_C_BORDER};")
+        top.setStyleSheet(
+            f"QWidget#roiTopBar{{background:{_C_SURFACE};"
+            f"border-bottom:1px solid {_C_BORDER};}}")
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(20, 0, 20, 0)
         top_lay.setSpacing(16)
@@ -117,8 +120,11 @@ class ROIPage(QWidget):
 
         # Left toolbar
         toolbar = QWidget()
+        toolbar.setObjectName("roiToolbar")
         toolbar.setFixedWidth(64)
-        toolbar.setStyleSheet(f"background:{_C_SURFACE}; border-right:1px solid {_C_BORDER};")
+        toolbar.setStyleSheet(
+            f"QWidget#roiToolbar{{background:{_C_SURFACE};"
+            f"border-right:1px solid {_C_BORDER};}}")
         tb_lay = QVBoxLayout(toolbar)
         tb_lay.setContentsMargins(10, 16, 10, 16)
         tb_lay.setSpacing(8)
@@ -248,8 +254,11 @@ class ROIPage(QWidget):
 
         # ── Footer ────────────────────────────────────────────────────
         footer = QWidget()
+        footer.setObjectName("roiFooter")
         footer.setFixedHeight(58)
-        footer.setStyleSheet(f"background:{_C_SURFACE}; border-top:1px solid {_C_BORDER};")
+        footer.setStyleSheet(
+            f"QWidget#roiFooter{{background:{_C_SURFACE};"
+            f"border-top:1px solid {_C_BORDER};}}")
         foot_lay = QHBoxLayout(footer)
         foot_lay.setContentsMargins(20, 0, 20, 0)
 

@@ -34,6 +34,11 @@ from strainx.core.units import LENGTH_UNIT_ORDER
 from strainx.ui import render
 from strainx.ui.components import ResultColorBar
 from strainx.ui.render import RangeSpec
+from strainx.ui.result_controls import (
+    CMAPS, DEFAULT_CMAP, DEFAULT_COVERAGE_TEXT, FieldFamilySelector,
+    RESULT_FIELDS as FIELDS, RESULT_FIELD_GROUPS as FIELD_GROUPS,
+    field_group as _shared_field_group, field_short as _field_short,
+)
 
 if TYPE_CHECKING:
     from strainx.ui.wizard import Wizard
@@ -58,66 +63,13 @@ _C_WARN = C_WARNING
 
 
 
-FIELDS = {
-    # Displacement is always the current previous-frame -> current-frame
-    # interval. u_inc/v_inc remain file/API aliases but are not duplicated here.
-    "u": ("Instantaneous displacement u", "px"),
-    "v": ("Instantaneous displacement v", "px"),
-    "mag_inc": ("Instantaneous displacement magnitude", "px"),
-
-    # 2. Velocities
-    "Vx": ("Velocity Vx", "px/s"),
-    "Vy": ("Velocity Vy", "px/s"),
-    "Veff": ("Effective Velocity", "px/s"),
-
-    # 3. Strain Rates
-    "Exx_rate": ("Strain Rate  Ėxx", "s⁻¹"),
-    "Exy_rate": ("Tensor Shear Strain Rate  Ėxy", "s⁻¹"),
-    "Eyy_rate": ("Strain Rate  Ėyy", "s⁻¹"),
-    "Eeff_rate": ("Effective Strain Rate", "s⁻¹"),
-
-    # The user-facing strain measure is Green-Lagrange. Legacy infinitesimal
-    # and engineering-shear arrays remain loadable/exportable for old sessions,
-    # but no longer compete with the selected strain convention in the UI.
-    "Exx_gl": ("Accumulated strain Exx", "dimensionless"),
-    "Eyy_gl": ("Accumulated strain Eyy", "dimensionless"),
-    "Exy_gl": ("Accumulated tensor shear strain Exy", "dimensionless"),
-    "Eeff_gl": ("Accumulated equivalent strain magnitude", "dimensionless"),
-}
-
-# Field families, in the order they appear in the category dropdown. Only the
-# members of the selected family get a button in the toolbar.
-FIELD_GROUPS = {
-    "Displacement": ["u", "v", "mag_inc"],
-    "Velocity":     ["Vx", "Vy", "Veff"],
-    "Strain rate":  ["Exx_rate", "Eyy_rate", "Exy_rate", "Eeff_rate"],
-    "Strain":       ["Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl"],
-}
-
 _ACCUMULATED_STRAIN_FIELDS = {
     "Exx_inf", "Eyy_inf", "Exy_inf", "Gxy_inf", "Eeff_inf",
     "Exx_gl", "Eyy_gl", "Exy_gl", "Gxy_gl", "Eeff_gl",
 }
 
-# Short button captions, now that the family is named by the dropdown.
-_FIELD_SHORT = {
-    "u": "u", "v": "v",
-    "u_inc": "du", "v_inc": "dv", "mag_inc": "|d|",
-    "Vx": "Vx", "Vy": "Vy", "Veff": "eff",
-    "Exx_rate": "Ėxx", "Exy_rate": "Ėxy", "Eyy_rate": "Ėyy", "Eeff_rate": "Ėeff",
-    "Exx_gl": "Exx", "Eyy_gl": "Eyy", "Exy_gl": "Exy", "Eeff_gl": "Eeq",
-}
-
-
-def _field_short(key: str) -> str:
-    return _FIELD_SHORT.get(key, key)
-
-
 def _group_of(field: str) -> str:
-    for g, keys in FIELD_GROUPS.items():
-        if field in keys:
-            return g
-    return next(iter(FIELD_GROUPS))
+    return _shared_field_group(field, FIELD_GROUPS)
 
 
 def _interpolate_between_subset_centres(
@@ -146,7 +98,8 @@ def _interpolate_between_subset_centres(
     # A missing value at an actual subset centre is a failed/unsupported
     # measurement, not a gap that interpolation is allowed to conceal.
     if ix0 == ix1 and iy0 == iy1:
-        return None
+        sample = arr[y, x]
+        return float(sample) if np.isfinite(sample) else None
 
     x0, x1 = o + ix0 * s, o + ix1 * s
     y0, y1 = o + iy0 * s, o + iy1 * s
@@ -166,25 +119,6 @@ def _interpolate_between_subset_centres(
                 return None
             value += float(sample) * wx * wy
     return value if np.isfinite(value) else None
-
-
-# FEA-style rainbow ramps first: blue (low) through cyan/green/yellow to red
-# (high) is the contour convention every ANSYS/Abaqus user reads instinctively.
-# turbo is the default rather than jet -- same blue-to-red identity, but without
-# jet's false banding at cyan/yellow, which invents contour edges that are not in
-# the data. jet is kept immediately below for matching legacy figures exactly.
-CMAPS = ["turbo","jet","rainbow","nipy_spectral",
-         "RdBu_r","seismic","bwr","coolwarm",
-         "viridis","inferno","magma","plasma","cividis",
-         "hot","afmhot","gist_heat","copper","gray"]
-
-DEFAULT_CMAP = "turbo"
-
-# Default colour-scale coverage. Not 100%: DIC fields reliably contain a few
-# subsets that converged onto noise, and a raw min/max scale hands the entire
-# colourbar to them. 99% keeps essentially all real signal while ignoring the
-# extreme 0.5% at each tail.
-DEFAULT_COVERAGE_TEXT = "99%"
 
 
 class ExportWorker(QThread):
@@ -321,15 +255,156 @@ class _TrajectoryTask(QRunnable):
             trajectories = self.analysis.get_trajectories_from_seeds(
                 self.seeds, self.endpoint, self.trail)
             draw_points = [
-                (tr["points"][-1]
-                 if tr["lost_at"] is None and tr["points"] else None)
-                for tr in trajectories]
+                self.analysis.marker_positions([seed], self.endpoint)[0]
+                for seed in self.seeds]
             self.signals.done.emit(
                 self.request_id, self.key,
                 (trajectories, draw_points), "")
         except Exception as exc:
             self.signals.done.emit(
                 self.request_id, self.key, None, str(exc))
+
+
+class _MarkerHistorySignals(QObject):
+    done = pyqtSignal(int, object, str)
+
+
+class _MarkerHistoryTask(QRunnable):
+    """Sample only the marker fields requested by the open graph."""
+
+    def __init__(self, analysis, request_id: int, seeds, fields, labels) -> None:
+        super().__init__()
+        self.signals = _MarkerHistorySignals()
+        self.analysis = analysis
+        self.request_id = request_id
+        self.seeds = list(seeds)
+        self.fields = tuple(fields)
+        self.labels = list(labels)
+
+    def run(self) -> None:
+        try:
+            history = self.analysis.marker_timeseries(
+                self.seeds, fields=self.fields, labels=self.labels)
+            self.signals.done.emit(self.request_id, history, "")
+        except Exception as exc:
+            self.signals.done.emit(self.request_id, None, str(exc))
+
+
+class MarkerHistoryDialog(QDialog):
+    """On-demand position and field plots for any chosen trajectory markers."""
+
+    GROUPS = (
+        ("Position", ("x", "y")),
+        ("Velocity", ("Vx", "Vy", "Veff")),
+        ("Strain", ("Exx_gl", "Eyy_gl", "Exy_gl", "Eeff_gl")),
+        ("Strain rate", ("Exx_rate", "Eyy_rate", "Exy_rate", "Eeff_rate")),
+    )
+
+    def __init__(self, analysis, seeds, parent=None) -> None:
+        super().__init__(parent)
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+        from matplotlib.figure import Figure
+
+        self.analysis = analysis
+        self.seeds = list(seeds)
+        self._request_id = 0
+        self._tasks = {}
+        self.setWindowTitle("Streakline time history")
+        self.resize(980, 720)
+        layout = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Graph:"))
+        self.group_combo = QComboBox()
+        for label, fields in self.GROUPS:
+            self.group_combo.addItem(label, fields)
+        controls.addWidget(self.group_combo)
+        controls.addWidget(QLabel("Streaklines:"))
+        self.marker_list = QListWidget()
+        self.marker_list.setFixedHeight(72)
+        for index in range(len(self.seeds)):
+            item = QListWidgetItem(f"M{index + 1}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setForeground(marker_color(index))
+            self.marker_list.addItem(item)
+        controls.addWidget(self.marker_list, 1)
+        self.update_btn = QPushButton("Compute selected")
+        self.update_btn.clicked.connect(self.refresh)
+        controls.addWidget(self.update_btn)
+        layout.addLayout(controls)
+
+        self.figure = Figure(layout="constrained")
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(NavigationToolbar2QT(self.canvas, self))
+        layout.addWidget(self.canvas, 1)
+        self.status = QLabel("Choose any markers and graph type.")
+        layout.addWidget(self.status)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+        QTimer.singleShot(0, self.refresh)
+
+    def refresh(self) -> None:
+        selected = [i for i in range(self.marker_list.count())
+                    if self.marker_list.item(i).checkState() == Qt.CheckState.Checked]
+        if not selected:
+            self.status.setText("Select at least one streakline.")
+            return
+        requested = tuple(self.group_combo.currentData())
+        sample_fields = () if requested == ("x", "y") else requested
+        self._request_id += 1
+        request_id = self._request_id
+        task = _MarkerHistoryTask(
+            self.analysis, request_id, [self.seeds[i] for i in selected],
+            sample_fields, [f"M{i + 1}" for i in selected])
+        task.signals.done.connect(self._history_ready)
+        self._tasks[request_id] = task
+        self.update_btn.setEnabled(False)
+        self.status.setText("Computing selected streaklines…")
+        QThreadPool.globalInstance().start(task)
+
+    @pyqtSlot(int, object, str)
+    def _history_ready(self, request_id: int, history, error: str) -> None:
+        self._tasks.pop(request_id, None)
+        if request_id != self._request_id:
+            return
+        self.update_btn.setEnabled(True)
+        if history is None:
+            self.status.setText(f"Could not compute graph: {error}")
+            return
+        self._draw(history)
+
+    def _draw(self, history) -> None:
+        requested = tuple(self.group_combo.currentData())
+        units = history["units"]
+        self.figure.clear()
+        axes = self.figure.subplots(len(requested), 1, sharex=True, squeeze=False)[:, 0]
+        any_data = False
+        styles = ("-", "--", "-.", ":")
+        for axis, field in zip(axes, requested):
+            unit = history["position_unit"] if field in ("x", "y") else units.get(field, "")
+            for marker_index, marker in enumerate(history["markers"]):
+                values = (marker[field] if field in ("x", "y") else
+                          marker["fields"].get(
+                              field, np.full_like(marker["time"], np.nan)))
+                finite = np.isfinite(values)
+                if finite.any():
+                    color = marker_color(int(marker["label"][1:]) - 1).name()
+                    axis.plot(marker["time"], values, styles[marker_index % len(styles)],
+                              color=color, linewidth=1.5, label=marker["label"])
+                    any_data = True
+            axis.set_ylabel(f"{field}\n[{unit}]" if unit else field)
+            axis.grid(True, alpha=0.25)
+        axes[-1].set_xlabel("Time [s]" if history["time_unit"] == "s" else "Frame")
+        if len(history["markers"]) <= 20:
+            axes[0].legend(loc="best", ncols=min(4, len(history["markers"])))
+        self.canvas.draw_idle()
+        count = len(history["markers"])
+        self.status.setText(
+            f"Computed {count} selected streakline{'s' if count != 1 else ''}."
+            if any_data else "No valid samples exist for this selection yet.")
 
 
 class _TemporalHistorySignals(QObject):
@@ -515,6 +590,9 @@ class ResultsPage(QWidget):
         self._traj_active_request: Optional[int] = None
         self._traj_pending = None
         self._traj_latest_key = None
+        self._marker_start_intervals: list[int] = []
+        self._last_marker_points: list[tuple[float, float]] = []
+        self._marker_plot_dialog = None
         self._play_timer = QTimer(self)
         self._play_timer.setSingleShot(True)
         self._play_timer.setInterval(200)
@@ -559,7 +637,10 @@ class ResultsPage(QWidget):
         # 1500 px, and a fixed-height QHBoxLayout gives no indication that
         # anything is missing.
         top = QWidget()
-        top.setStyleSheet(f"background:{_C_SURFACE}; border-bottom:1px solid {_C_BORDER};")
+        top.setObjectName("resultsTopBar")
+        top.setStyleSheet(
+            f"QWidget#resultsTopBar{{background:{_C_SURFACE};"
+            f"border-bottom:1px solid {_C_BORDER};}}")
         top_outer = QVBoxLayout(top)
         top_outer.setContentsMargins(14, 5, 14, 5)
         top_outer.setSpacing(4)
@@ -586,34 +667,14 @@ class ResultsPage(QWidget):
 
         top_lay.addSpacing(12)
 
-        # Field selector: a category dropdown plus a short row of buttons for
-        # the members of that category. All 13 fields used to sit in this bar as
-        # individual buttons, which together with the marker, trail and colormap
-        # controls left the row overflowing.
-        self._cat_combo = QComboBox()
-        self._cat_combo.addItems(list(FIELD_GROUPS.keys()))
-        self._cat_combo.setFixedWidth(132)
-        self._cat_combo.setToolTip("Which family of results to display.")
-        self._cat_combo.currentTextChanged.connect(self._select_category)
-        top_lay.addWidget(self._cat_combo)
-        top_lay.addSpacing(6)
-
-        self._field_btns: dict[str, QToolButton] = {}
-        for key, (label, _) in FIELDS.items():
-            btn = QToolButton()
-            btn.setText(_field_short(key))
-            btn.setToolTip(label)
-            btn.setCheckable(True)
-            btn.setChecked(key == self._field)
-            btn.clicked.connect(lambda c, k=key: self._select_field(k))
-            top_lay.addWidget(btn)
-            self._field_btns[key] = btn
-
-        self._apply_tab_style()
-        self._cat_combo.blockSignals(True)
-        self._cat_combo.setCurrentText(_group_of(self._field))
-        self._cat_combo.blockSignals(False)
-        self._sync_field_buttons()
+        self._field_selector = FieldFamilySelector(
+            FIELDS, FIELD_GROUPS, self._field)
+        self._field_selector.field_changed.connect(self._select_field)
+        top_lay.addWidget(self._field_selector)
+        # Compatibility aliases keep the page's existing enable/disable logic
+        # small while both result screens share the selector implementation.
+        self._cat_combo = self._field_selector.category_combo
+        self._field_btns = self._field_selector.buttons
 
         # ─── PROMINENT STREAKLINES BLOCK (Just after Eff) ───
         top_lay.addSpacing(12)
@@ -788,8 +849,10 @@ class ResultsPage(QWidget):
         # Right sidebar
         sidebar = QWidget()
         sidebar.setFixedWidth(220)
+        sidebar.setObjectName("resultsSidebar")
         sidebar.setStyleSheet(
-            f"background:{_C_SURFACE}; border-left:1px solid {_C_BORDER};"
+            f"QWidget#resultsSidebar{{background:{_C_SURFACE};"
+            f"border-left:1px solid {_C_BORDER};}}"
         )
         sb_lay = QVBoxLayout(sidebar)
         sb_lay.setContentsMargins(16, 20, 16, 20)
@@ -963,6 +1026,17 @@ class ResultsPage(QWidget):
         self._marker_csv_btn.clicked.connect(self._export_marker_timeseries)
         mp_lay.addWidget(self._marker_csv_btn)
 
+        self._marker_plot_btn = QPushButton("Graph temporal data…")
+        self._marker_plot_btn.setFixedHeight(28)
+        self._marker_plot_btn.setToolTip(
+            "Plot position, velocity, strain or strain rate against time.\n"
+            "Only checked streaklines and the chosen field family are computed.")
+        self._marker_plot_btn.setStyleSheet(
+            f"background:{_C_ACCENT}; color:#ffffff; border:none;"
+            f" border-radius:3px; font-size:10px; font-weight:700;")
+        self._marker_plot_btn.clicked.connect(self._show_marker_history)
+        mp_lay.addWidget(self._marker_plot_btn)
+
         self._marker_panel.setVisible(False)
 
         # ── Smoothed frame-pair sequence ────────────────────────────
@@ -1030,8 +1104,10 @@ class ResultsPage(QWidget):
         # ── Bottom: temporal scrubber ─────────────────────────────────
         bottom = QWidget()
         bottom.setFixedHeight(62)
+        bottom.setObjectName("resultsTransport")
         bottom.setStyleSheet(
-            f"background:{_C_SURFACE}; border-top:1px solid {_C_BORDER};"
+            f"QWidget#resultsTransport{{background:{_C_SURFACE};"
+            f"border-top:1px solid {_C_BORDER};}}"
         )
         bot_lay = QHBoxLayout(bottom)
         bot_lay.setContentsMargins(16, 0, 16, 0)
@@ -1188,22 +1264,44 @@ class ResultsPage(QWidget):
         analysis = self._wizard.analysis
         if not analysis.results:
             return
-        mapped = analysis.reference_from_current(
-            x, y, self._trajectory_source_index(self._frame))
-        if mapped is None:
-            QMessageBox.information(self, "No data",
-                                    "This frame has no valid correlation data.")
-            return
-        (rx, ry), resid = mapped
-        if resid > 25.0:
-            QMessageBox.information(
-                self, "Outside analysed region",
-                "That point is outside the analysed region for this frame.\n"
-                f"Nearest tracked material point is {resid:.0f} px away.")
-            return
-        self._canvas.add_marker(rx, ry)
+        source = self._trajectory_source_index(self._frame)
+        # Reverse mapping is linear in the number of prior intervals. Far into
+        # a long recording, anchor on the clicked frame immediately; this is
+        # both exact on screen and avoids freezing the UI for a historical seed.
+        mapped = (analysis.reference_from_current(
+            x, y, source, exhaustive=False) if source <= 120 else None)
+        if mapped is not None and mapped[1] <= 1.0:
+            (seed_x, seed_y), _residual = mapped
+            start_interval = 0
+        else:
+            # Keep the click exact. This marker begins on the displayed frame
+            # and waits at this spatial point until a later DIC interval can
+            # track it, instead of being rejected because early history is absent.
+            seed_x, seed_y = float(x), float(y)
+            start_interval = source + 1
+        self._marker_start_intervals.append(start_interval)
+        self._canvas.add_marker(seed_x, seed_y, draw_position=(x, y))
 
     def _on_markers_changed(self, pts) -> None:
+        points = [(float(x), float(y)) for x, y in pts]
+        old = self._last_marker_points
+        starts = self._marker_start_intervals
+        if len(points) < len(old):
+            removed = next((i for i, pair in enumerate(zip(old, points))
+                            if pair[0] != pair[1]), len(points))
+            if removed < len(starts):
+                starts.pop(removed)
+        elif len(points) == len(old):
+            # Dragging edits a point in the coordinates currently on screen.
+            # Re-anchor only the changed marker at this displayed frame.
+            start = self._trajectory_source_index(self._frame) + 1
+            for i, (before, after) in enumerate(zip(old, points)):
+                if before != after and i < len(starts):
+                    starts[i] = start
+        while len(starts) < len(points):
+            starts.append(0)
+        del starts[len(points):]
+        self._last_marker_points = points
         n = len(pts)
         self._marker_count_lbl.setText("1 marker" if n == 1 else f"{n} markers")
         self._rebuild_marker_list()
@@ -1235,6 +1333,8 @@ class ResultsPage(QWidget):
         # Results canvas with an empty new model and can native-crash Qt. Reset
         # this page-owned state silently, as on_enter() already does.
         self._canvas.set_markers([])
+        self._marker_start_intervals.clear()
+        self._last_marker_points.clear()
         self._canvas.set_marker_draw_positions([])
         self._canvas.set_streaklines(None)
         self._marker_list.clear()
@@ -1248,7 +1348,11 @@ class ResultsPage(QWidget):
         pts = self._canvas.markers
         trajs = trajs or []
         for i, (x, y) in enumerate(pts):
-            if i < len(trajs) and trajs[i]["lost_at"] is not None:
+            start = self._marker_start_intervals[i] if i < len(
+                self._marker_start_intervals) else 0
+            if i < len(trajs) and trajs[i].get("started_at") is None:
+                status = f"waiting from frame {max(1, start)}"
+            elif i < len(trajs) and trajs[i]["lost_at"] is not None:
                 status = f"lost @ frame {trajs[i]['lost_at']}"
             elif i < len(trajs):
                 npts = len(trajs[i]["points"])
@@ -1264,6 +1368,27 @@ class ResultsPage(QWidget):
         self._marker_list.blockSignals(False)
         self._marker_hint.setVisible(len(pts) == 0)
 
+    def _marker_specs(self):
+        """Canvas points paired with their reference or late-start interval."""
+        pts = [(float(x), float(y)) for x, y in self._canvas.markers]
+        while len(self._marker_start_intervals) < len(pts):
+            self._marker_start_intervals.append(0)
+        del self._marker_start_intervals[len(pts):]
+        self._last_marker_points = pts
+        return [(x, y, self._marker_start_intervals[i])
+                for i, (x, y) in enumerate(pts)]
+
+    def _show_marker_history(self) -> None:
+        specs = self._marker_specs()
+        if not specs:
+            QMessageBox.warning(
+                self, "No streaklines",
+                "Place one or more streakline markers before opening a graph.")
+            return
+        self._marker_plot_dialog = MarkerHistoryDialog(
+            self._wizard.analysis, specs, self)
+        self._marker_plot_dialog.show()
+
     def _render_trajectories(self, idx: int) -> None:
         analysis = self._wizard.analysis
         if not self._streak_chk.isChecked():
@@ -1272,8 +1397,8 @@ class ResultsPage(QWidget):
             self._canvas.set_streaklines(None)
             self._canvas.set_marker_draw_positions([])
             return
-        pts = self._canvas.markers
-        if not pts:
+        specs = self._marker_specs()
+        if not specs:
             self._traj_latest_key = None
             self._traj_pending = None
             self._canvas.set_marker_draw_positions([])
@@ -1281,7 +1406,8 @@ class ResultsPage(QWidget):
             return
         trail = self._trail_combo.currentData() or 0
         source = self._trajectory_source_index(idx)
-        marker_key = tuple((round(x, 3), round(y, 3)) for x, y in pts)
+        marker_key = tuple((round(x, 3), round(y, 3), start)
+                           for x, y, start in specs)
         results = analysis.results
         result_token = (id(analysis), len(results),
                         id(results[0]) if results else 0,
@@ -1295,7 +1421,7 @@ class ResultsPage(QWidget):
             return
 
         self._traj_request_id += 1
-        request = (self._traj_request_id, key, list(pts), source, int(trail))
+        request = (self._traj_request_id, key, specs, source, int(trail))
         if self._traj_active_request is not None:
             # Playback may request many frames faster than one trace completes.
             # Keep only the newest request instead of building a work queue.
@@ -1356,6 +1482,8 @@ class ResultsPage(QWidget):
             self._canvas.clear_result_overlay()
             self._canvas.set_streaklines(None)
             self._canvas.set_markers([])
+            self._marker_start_intervals.clear()
+            self._last_marker_points.clear()
             self._canvas.set_marker_mode(False)
             self._marker_list.clear()
             self._place_btn.setChecked(False)
@@ -1381,6 +1509,8 @@ class ResultsPage(QWidget):
         # That nested QPixmap/render path caused Qt6Core fast-fail exits during
         # the Analysis -> Results transition.
         self._canvas.set_markers([])
+        self._marker_start_intervals.clear()
+        self._last_marker_points.clear()
         self._canvas.set_streaklines(None)
         self._marker_list.clear()
         # Same reasoning for a stored pair sequence: its frame indices and its
@@ -1447,32 +1577,6 @@ class ResultsPage(QWidget):
         while len(self._img_cache) > self._IMG_CACHE_MAX:
             self._img_cache.popitem(last=False)
         return img
-
-    def _cached_trajectories(self, pts, idx: int, trail: int):
-        """Synchronous cache used by exports/tests; interactive drawing is async."""
-        source = self._trajectory_source_index(idx)
-        marker_key = tuple((round(x, 3), round(y, 3)) for x, y in pts)
-        analysis = self._wizard.analysis
-        results = analysis.results
-        result_token = (id(analysis), len(results),
-                        id(results[0]) if results else 0,
-                        id(results[-1]) if results else 0)
-        key = (result_token, source, int(trail), marker_key)
-        hit = self._traj_cache.get(key)
-        if hit is not None:
-            self._traj_cache.move_to_end(key)
-            return hit
-        trajectories = analysis.get_trajectories_from_seeds(
-            pts, source, int(trail))
-        draw_points = [
-            (tr["points"][-1]
-             if tr["lost_at"] is None and tr["points"] else None)
-            for tr in trajectories]
-        value = (trajectories, draw_points)
-        self._traj_cache[key] = value
-        while len(self._traj_cache) > self._TRAJ_CACHE_MAX:
-            self._traj_cache.popitem(last=False)
-        return value
 
     def _trajectory_source_index(self, idx: int) -> int:
         """Underlying single-frame endpoint represented by this timeline item."""
@@ -1906,29 +2010,14 @@ class ResultsPage(QWidget):
             self._show_frame(self._frame)
 
     def _sync_field_buttons(self) -> None:
-        """Show only the buttons belonging to the selected category."""
-        visible = set(FIELD_GROUPS.get(self._cat_combo.currentText(), []))
-        for k, btn in self._field_btns.items():
-            btn.setVisible(k in visible)
-            btn.setChecked(k == self._field)
+        self._field_selector.set_field(self._field, emit=False)
 
     def _select_category(self, name: str) -> None:
-        keys = FIELD_GROUPS.get(name, [])
-        if keys and self._field not in keys:
-            self._field = keys[0]
-        self._sync_field_buttons()
-        self._apply_tab_style()
-        self._refresh_overlay()
+        self._field_selector.select_category(name)
 
     def _select_field(self, key: str) -> None:
         self._field = key
-        grp = _group_of(key)
-        if self._cat_combo.currentText() != grp:
-            self._cat_combo.blockSignals(True)
-            self._cat_combo.setCurrentText(grp)
-            self._cat_combo.blockSignals(False)
         self._sync_field_buttons()
-        self._apply_tab_style()
         self._refresh_overlay()
 
     def _refresh_overlay(self, *_) -> None:
@@ -2536,8 +2625,8 @@ class ResultsPage(QWidget):
     def _export_marker_timeseries(self) -> None:
         """Write the per-frame history of every marker to one spreadsheet."""
         analysis = self._wizard.analysis
-        pts = self._canvas.markers
-        if not pts:
+        specs = self._marker_specs()
+        if not specs:
             QMessageBox.warning(
                 self, "No markers",
                 "Enable Place markers, then click the point you want to follow.")
@@ -2553,11 +2642,11 @@ class ResultsPage(QWidget):
         if not path.lower().endswith(".csv"):
             path += ".csv"
         try:
-            labels = [f"M{i + 1}" for i in range(len(pts))]
-            rows = analysis.export_marker_timeseries(pts, path, labels=labels)
+            labels = [f"M{i + 1}" for i in range(len(specs))]
+            rows = analysis.export_marker_timeseries(specs, path, labels=labels)
             QMessageBox.information(
                 self, "Exported",
-                f"{rows} rows for {len(pts)} marker(s) written to:\n{path}\n\n"
+                f"{rows} rows for {len(specs)} marker(s) written to:\n{path}\n\n"
                 "One row per frame per marker. Filter on the marker column, "
                 "then plot any field against time_s.")
         except Exception as e:
@@ -2639,7 +2728,7 @@ class ResultsPage(QWidget):
         self._export_progress.show()
         self._export_progress.setValue(0)
         self._export_progress.setFormat("Rendering… %p%")
-        markers = self._canvas.markers
+        markers = self._marker_specs()
         trail = self._trail_combo.currentData() or 0
         spec.trail = trail
 
@@ -2756,18 +2845,7 @@ class ResultsPage(QWidget):
     # ------------------------------------------------------------------
 
     def _apply_tab_style(self) -> None:
-        active = (
-            f"QToolButton {{ background:{_C_ACCENT}; color:#fff; border:none; "
-            f"border-radius:3px; font-size:10px; font-weight:700; padding:3px 8px; }}"
-        )
-        inactive = (
-            f"QToolButton {{ background:{_C_RAISED}; color:{_C_TEXT2}; "
-            f"border:1px solid {_C_BORDER}; border-radius:3px; "
-            f"font-size:10px; padding:3px 8px; }} "
-            f"QToolButton:hover {{ background:{_C_BORDER}; color:{_C_TEXT}; }}"
-        )
-        for k, btn in self._field_btns.items():
-            btn.setStyleSheet(active if btn.isChecked() else inactive)
+        self._sync_field_buttons()
 
     def _sep(self) -> QFrame:
         f = QFrame()

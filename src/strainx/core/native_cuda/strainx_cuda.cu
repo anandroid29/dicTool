@@ -310,6 +310,7 @@ struct BlockWorkspace {
     double start[6];
     double best[6];
     double correction[6];
+    double raw_mean[6];
     double hessian[36];
     double inverse[36];
     double b[6];
@@ -440,7 +441,7 @@ __device__ void evaluate_parameters_block(
             double raw[6];
             raw_jacobian(grad_x[ref_idx], grad_y[ref_idx], dx, dy, raw);
             for (int k = 0; k < 6; ++k) {
-                const double sd = (raw[k] - f_norm * workspace->correction[k]) /
+                const double sd = (raw[k] - workspace->raw_mean[k] - f_norm * workspace->correction[k]) /
                                   workspace->ref_sigma;
                 totals[k + 1] += sd * residual;
             }
@@ -503,6 +504,61 @@ __device__ double evaluate_translation_bilinear(
     return score;
 }
 
+__device__ void refine_subset(
+    const double* reference, const double* current_coeff,
+    const double* grad_x, const double* grad_y, const uint8_t* roi_mask,
+    double intensity_scale, int height, int width, int cx, int cy,
+    const int2* offsets, int n_pixels, int max_iter, double conv_tol,
+    BlockWorkspace& workspace) {
+    for (int iteration = 0; iteration < max_iter; ++iteration) {
+        evaluate_parameters_block(reference, current_coeff, grad_x, grad_y,
+                                  roi_mask, intensity_scale,
+                                  height, width, cx, cy, offsets, n_pixels,
+                                  &workspace, true);
+        if (threadIdx.x == 0) {
+            if (workspace.score < workspace.best_score) {
+                workspace.best_score = workspace.score;
+                for (int k = 0; k < 6; ++k) workspace.best[k] = workspace.p[k];
+            }
+            if (!isfinite(workspace.score)) {
+                workspace.stop = 1;
+            } else {
+                double dp[6] = {0, 0, 0, 0, 0, 0};
+                for (int a = 0; a < 6; ++a)
+                    for (int k = 0; k < 6; ++k)
+                        dp[a] += workspace.inverse[a * 6 + k] * workspace.b[k];
+                double norm2 = dp[0] * dp[0] + dp[1] * dp[1];
+                for (int k = 2; k < 6; ++k)
+                    norm2 += workspace.r_eff * workspace.r_eff * dp[k] * dp[k];
+                const double disp = hypot(dp[0], dp[1]);
+                const double grad = sqrt(dp[2] * dp[2] + dp[3] * dp[3] +
+                                         dp[4] * dp[4] + dp[5] * dp[5]);
+                double next[6];
+                if (!isfinite(norm2) || disp > 5.0 || grad > 8.0 ||
+                    !compose_inverse_affine(workspace.p, dp, next)) {
+                    workspace.stop = 1;
+                } else {
+                    for (int k = 0; k < 6; ++k) workspace.p[k] = next[k];
+                    workspace.stop = sqrt(norm2) < conv_tol;
+                }
+            }
+        }
+        __syncthreads();
+        if (workspace.stop) break;
+    }
+    evaluate_parameters_block(reference, current_coeff, grad_x, grad_y,
+                              roi_mask, intensity_scale,
+                              height, width, cx, cy, offsets, n_pixels,
+                              &workspace, false);
+    if (threadIdx.x == 0) {
+        if (workspace.score < workspace.best_score) {
+            workspace.best_score = workspace.score;
+            for (int k = 0; k < 6; ++k) workspace.best[k] = workspace.p[k];
+        }
+    }
+    __syncthreads();
+}
+
 __global__ void solve_subsets_block_kernel(
     const double* reference, const double* current_raw,
     const double* current_coeff,
@@ -512,7 +568,7 @@ __global__ void solve_subsets_block_kernel(
     const int2* offsets, int n_pixels,
     const int* active_indices, const double* initial_parameters, int n_active,
     int max_iter, double conv_tol, double corr_cutoff, int rescue_radius,
-    int spacing, int subset_radius, int warm_start,
+    int spacing, int warm_start,
     double* result_parameters, double* result_correlation,
     uint8_t* result_accepted) {
     const int row = blockIdx.x;
@@ -522,6 +578,7 @@ __global__ void solve_subsets_block_kernel(
     const int cx = grid_x[grid_idx], cy = grid_y[grid_idx];
     if (threadIdx.x < 6) {
         workspace.p[threadIdx.x] = initial_parameters[row * 6 + threadIdx.x];
+        result_parameters[row * 6 + threadIdx.x] = workspace.p[threadIdx.x];
     }
     if (threadIdx.x == 0) {
         workspace.invalid = 0; workspace.stop = 0;
@@ -595,17 +652,23 @@ __global__ void solve_subsets_block_kernel(
         return;
     }
 
-    double correction_local[6] = {0, 0, 0, 0, 0, 0};
+    double correction_local[12] = {};
     for (int i = threadIdx.x; i < n_pixels; i += blockDim.x) {
         const int dx = offsets[i].x, dy = offsets[i].y;
         const int idx = (cy + dy) * width + cx + dx;
         if (roi_mask && !roi_mask[idx]) continue;
         const double fn = (reference[idx] - workspace.ref_mean) / workspace.ref_sigma;
         double raw[6]; raw_jacobian(grad_x[idx], grad_y[idx], dx, dy, raw);
-        for (int k = 0; k < 6; ++k) correction_local[k] += fn * raw[k];
+        for (int k = 0; k < 6; ++k) {
+            correction_local[k] += fn * raw[k];
+            correction_local[k + 6] += raw[k];
+        }
     }
-    block_accumulate(correction_local, 6, &workspace);
-    if (threadIdx.x < 6) workspace.correction[threadIdx.x] = workspace.sums[threadIdx.x];
+    block_accumulate(correction_local, 12, &workspace);
+    if (threadIdx.x < 6) {
+        workspace.correction[threadIdx.x] = workspace.sums[threadIdx.x];
+        workspace.raw_mean[threadIdx.x] = workspace.sums[threadIdx.x + 6] / workspace.support;
+    }
     __syncthreads();
 
     double hessian_local[36];
@@ -617,7 +680,7 @@ __global__ void solve_subsets_block_kernel(
         const double fn = (reference[idx] - workspace.ref_mean) / workspace.ref_sigma;
         double raw[6], sd[6]; raw_jacobian(grad_x[idx], grad_y[idx], dx, dy, raw);
         for (int k = 0; k < 6; ++k)
-            sd[k] = (raw[k] - fn * workspace.correction[k]) / workspace.ref_sigma;
+            sd[k] = (raw[k] - workspace.raw_mean[k] - fn * workspace.correction[k]) / workspace.ref_sigma;
         for (int a = 0; a < 6; ++a)
             for (int b = 0; b < 6; ++b)
                 hessian_local[a * 6 + b] += sd[a] * sd[b];
@@ -645,115 +708,84 @@ __global__ void solve_subsets_block_kernel(
         workspace.start[threadIdx.x] = workspace.p[threadIdx.x];
     __syncthreads();
 
-    // Keep the former CuPy rescue scoring semantics: score only the
-    // translational part of the propagated guess with bilinear interpolation
-    // on the raw current image. Search only poor guesses, and reject
-    // off-frame search candidates (the trigger score itself remains mirrored).
-    if (threadIdx.x == 0) {
-        workspace.score = evaluate_translation_bilinear(
-            reference, current_raw, roi_mask, workspace.support,
-            height, width, cx, cy, offsets, n_pixels,
-            workspace.p[0], workspace.p[1], workspace.ref_mean,
-            workspace.ref_sigma, false);
-    }
-    __syncthreads();
-    if (workspace.score > 0.25 && rescue_radius > 0) {
-        const int side = 2 * rescue_radius + 1;
-        const int candidates = side * side;
-        double local_best = CUDART_INF;
-        int local_candidate = candidates;
-        for (int candidate = threadIdx.x; candidate < candidates;
-             candidate += blockDim.x) {
-            const int du = candidate % side - rescue_radius;
-            const int dv = candidate / side - rescue_radius;
-            const double score = evaluate_translation_bilinear(
-                reference, current_raw, roi_mask, workspace.support,
-                height, width, cx, cy, offsets, n_pixels,
-                workspace.p[0] + du, workspace.p[1] + dv,
-                workspace.ref_mean, workspace.ref_sigma, true);
-            if (score < local_best ||
-                (score == local_best && candidate < local_candidate)) {
-                local_best = score;
-                local_candidate = candidate;
-            }
-        }
-        workspace.rescue_scores[threadIdx.x] = local_best;
-        workspace.rescue_candidates[threadIdx.x] = local_candidate;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            double best_score = workspace.score;
-            int best_candidate = candidates;
-            for (int lane = 0; lane < blockDim.x; ++lane) {
-                const double score = workspace.rescue_scores[lane];
-                const int candidate = workspace.rescue_candidates[lane];
-                if (score < best_score ||
-                    (score == best_score && best_candidate < candidates &&
-                     candidate < best_candidate)) {
-                    best_score = score;
-                    best_candidate = candidate;
-                }
-            }
-            if (best_candidate < candidates) {
-                const int du = best_candidate % side - rescue_radius;
-                const int dv = best_candidate / side - rescue_radius;
-                workspace.p[0] += du;
-                workspace.p[1] += dv;
-                if (!warm_start && hypot(static_cast<double>(du),
-                                         static_cast<double>(dv)) > 4.0)
-                    for (int k = 2; k < 6; ++k) workspace.p[k] = 0.0;
-            }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x < 6)
-        workspace.best[threadIdx.x] = workspace.p[threadIdx.x];
+    if (threadIdx.x < 6) workspace.best[threadIdx.x] = workspace.p[threadIdx.x];
     if (threadIdx.x == 0) workspace.best_score = CUDART_INF;
     __syncthreads();
-
-    for (int iteration = 0; iteration < max_iter; ++iteration) {
-        evaluate_parameters_block(reference, current_coeff, grad_x, grad_y,
-                                  roi_mask, intensity_scale,
-                                  height, width, cx, cy, offsets, n_pixels,
-                                  &workspace, true);
+    refine_subset(reference, current_coeff, grad_x, grad_y, roi_mask,
+                  intensity_scale, height, width, cx, cy, offsets, n_pixels,
+                  max_iter, conv_tol, workspace);
+    const double limit = spacing + 1.0;
+    const bool direct_accepted = workspace.best_score < corr_cutoff &&
+        fabs(workspace.best[0] - workspace.start[0]) < limit &&
+        fabs(workspace.best[1] - workspace.start[1]) < limit;
+    if (!direct_accepted && rescue_radius > 0) {
+        if (threadIdx.x < 6) workspace.p[threadIdx.x] = workspace.start[threadIdx.x];
+        __syncthreads();
+        // Keep the former CuPy rescue scoring semantics: score only the
+        // translational part of the propagated guess with bilinear interpolation
+        // on the raw current image. Search only poor guesses, and reject
+        // off-frame search candidates (the trigger score itself remains mirrored).
         if (threadIdx.x == 0) {
-            if (workspace.score < workspace.best_score) {
-                workspace.best_score = workspace.score;
-                for (int k = 0; k < 6; ++k) workspace.best[k] = workspace.p[k];
-            }
-            if (!isfinite(workspace.score)) {
-                workspace.stop = 1;
-            } else {
-                double dp[6] = {0, 0, 0, 0, 0, 0};
-                for (int a = 0; a < 6; ++a)
-                    for (int k = 0; k < 6; ++k)
-                        dp[a] += workspace.inverse[a * 6 + k] * workspace.b[k];
-                double norm2 = 0.0;
-                for (int k = 0; k < 6; ++k) norm2 += dp[k] * dp[k];
-                const double disp = hypot(dp[0], dp[1]);
-                const double grad = sqrt(dp[2] * dp[2] + dp[3] * dp[3] +
-                                         dp[4] * dp[4] + dp[5] * dp[5]);
-                double next[6];
-                if (!isfinite(norm2) || disp > 5.0 || grad > 8.0 ||
-                    !compose_inverse_affine(workspace.p, dp, next)) {
-                    workspace.stop = 1;
-                } else {
-                    for (int k = 0; k < 6; ++k) workspace.p[k] = next[k];
-                    workspace.stop = sqrt(norm2) < conv_tol;
-                }
-            }
+            workspace.score = evaluate_translation_bilinear(
+                reference, current_raw, roi_mask, workspace.support,
+                height, width, cx, cy, offsets, n_pixels,
+                workspace.p[0], workspace.p[1], workspace.ref_mean,
+                workspace.ref_sigma, false);
         }
         __syncthreads();
-        if (workspace.stop) break;
-    }
-    evaluate_parameters_block(reference, current_coeff, grad_x, grad_y,
-                              roi_mask, intensity_scale,
-                              height, width, cx, cy, offsets, n_pixels,
-                              &workspace, false);
-    if (threadIdx.x == 0) {
-        if (workspace.score < workspace.best_score) {
-            workspace.best_score = workspace.score;
-            for (int k = 0; k < 6; ++k) workspace.best[k] = workspace.p[k];
+        if (workspace.score > 0.25) {
+            const int side = 2 * rescue_radius + 1;
+            const int candidates = side * side;
+            double local_best = CUDART_INF;
+            int local_candidate = candidates;
+            for (int candidate = threadIdx.x; candidate < candidates;
+                 candidate += blockDim.x) {
+                const int du = candidate % side - rescue_radius;
+                const int dv = candidate / side - rescue_radius;
+                const double score = evaluate_translation_bilinear(
+                    reference, current_raw, roi_mask, workspace.support,
+                    height, width, cx, cy, offsets, n_pixels,
+                    workspace.p[0] + du, workspace.p[1] + dv,
+                    workspace.ref_mean, workspace.ref_sigma, true);
+                if (score < local_best ||
+                    (score == local_best && candidate < local_candidate)) {
+                    local_best = score;
+                    local_candidate = candidate;
+                }
+            }
+            workspace.rescue_scores[threadIdx.x] = local_best;
+            workspace.rescue_candidates[threadIdx.x] = local_candidate;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                double best_score = workspace.score;
+                int best_candidate = candidates;
+                for (int lane = 0; lane < blockDim.x; ++lane) {
+                    const double score = workspace.rescue_scores[lane];
+                    const int candidate = workspace.rescue_candidates[lane];
+                    if (score < best_score ||
+                        (score == best_score && best_candidate < candidates &&
+                         candidate < best_candidate)) {
+                        best_score = score;
+                        best_candidate = candidate;
+                    }
+                }
+                if (best_candidate < candidates) {
+                    const int du = best_candidate % side - rescue_radius;
+                    const int dv = best_candidate / side - rescue_radius;
+                    workspace.p[0] += du;
+                    workspace.p[1] += dv;
+                    if (!warm_start && hypot(static_cast<double>(du),
+                                             static_cast<double>(dv)) > 4.0)
+                        for (int k = 2; k < 6; ++k) workspace.p[k] = 0.0;
+                }
+            }
+            __syncthreads();
         }
+        refine_subset(reference, current_coeff, grad_x, grad_y, roi_mask,
+                      intensity_scale, height, width, cx, cy, offsets, n_pixels,
+                      max_iter, conv_tol, workspace);
+    }
+    if (threadIdx.x == 0) {
         const double displacement_limit = spacing + 1.0;
         const bool accepted = isfinite(workspace.best_score) &&
             workspace.best_score < corr_cutoff &&
@@ -842,7 +874,11 @@ bool ncc_guess(Solver* solver, int grid_index, double guess_u, double guess_v,
                  "reading native NCC scores")) return false;
     const auto best = std::min_element(scores.begin(), scores.end());
     if (best == scores.end() || !std::isfinite(*best)) {
-        set_error("Native NCC found no in-frame candidate."); return false;
+        // A flat/out-of-frame template is a failed guess, not a CUDA error.
+        // Let IC-GN reject it normally so other seeds and recovery can run.
+        output_u = guess_u; output_v = guess_v;
+        if (output_zncc) *output_zncc = 0.0;
+        return true;
     }
     const int index = static_cast<int>(best - scores.begin());
     output_u = base_u + index % side - radius;
@@ -921,167 +957,87 @@ void initialize_warm_start(Solver* solver) {
     }
 }
 
-void squared_distance_transform_1d(const std::vector<double>& input,
-                                   std::vector<double>& output) {
-    const int length = static_cast<int>(input.size());
-    std::vector<int> sites(length);
-    std::vector<double> boundaries(length + 1);
-    int envelope = 0;
-    sites[0] = 0;
-    boundaries[0] = -std::numeric_limits<double>::infinity();
-    boundaries[1] = std::numeric_limits<double>::infinity();
-    for (int q = 1; q < length; ++q) {
-        double crossing = 0.0;
-        while (true) {
-            const int site = sites[envelope];
-            crossing = ((input[q] + static_cast<double>(q) * q) -
-                        (input[site] + static_cast<double>(site) * site)) /
-                       (2.0 * (q - site));
-            if (crossing > boundaries[envelope] || envelope == 0) break;
-            --envelope;
-        }
-        ++envelope;
-        sites[envelope] = q;
-        boundaries[envelope] = crossing;
-        boundaries[envelope + 1] = std::numeric_limits<double>::infinity();
+int best_accepted_neighbour(const Solver* solver, int index) {
+    const int y = index / solver->grid_w, x = index % solver->grid_w;
+    const int neighbours[4] = {index - solver->grid_w, index + solver->grid_w,
+                               index - 1, index + 1};
+    const bool allowed[4] = {y > 0, y + 1 < solver->grid_h,
+                             x > 0, x + 1 < solver->grid_w};
+    int best = -1;
+    for (int k = 0; k < 4; ++k) {
+        const int next = neighbours[k];
+        if (allowed[k] && solver->state[next] == 2 &&
+            (best < 0 || solver->correlation[next] < solver->correlation[best]))
+            best = next;
     }
-    output.resize(length);
-    envelope = 0;
-    for (int q = 0; q < length; ++q) {
-        while (boundaries[envelope + 1] < q) ++envelope;
-        const double delta = q - sites[envelope];
-        output[q] = delta * delta + input[sites[envelope]];
-    }
+    return best;
 }
 
-int deepest_component_seed(const std::vector<int>& component,
-                           int grid_h, int grid_w) {
-    // Pad with a zero-valued border so components touching the grid edge still
-    // have a well-defined interior distance. For ordinary failed components
-    // this is the same Euclidean EDT argmax used by the former Python path.
-    const int padded_h = grid_h + 2;
-    const int padded_w = grid_w + 2;
-    std::vector<uint8_t> inside(
-        static_cast<size_t>(padded_h) * padded_w, 0);
-    for (int index : component) {
-        const int y = index / grid_w, x = index % grid_w;
-        inside[(y + 1) * padded_w + x + 1] = 1;
-    }
-    constexpr double far = 1e20;
-    std::vector<double> column_pass(
-        static_cast<size_t>(padded_h) * padded_w, 0.0);
-    std::vector<double> input, output;
-    input.resize(padded_h);
-    for (int x = 0; x < padded_w; ++x) {
-        for (int y = 0; y < padded_h; ++y)
-            input[y] = inside[y * padded_w + x] ? far : 0.0;
-        squared_distance_transform_1d(input, output);
-        for (int y = 0; y < padded_h; ++y)
-            column_pass[y * padded_w + x] = output[y];
-    }
-    std::vector<double> distance2(
-        static_cast<size_t>(padded_h) * padded_w, 0.0);
-    input.resize(padded_w);
-    for (int y = 0; y < padded_h; ++y) {
-        for (int x = 0; x < padded_w; ++x)
-            input[x] = column_pass[y * padded_w + x];
-        squared_distance_transform_1d(input, output);
-        for (int x = 0; x < padded_w; ++x)
-            distance2[y * padded_w + x] = output[x];
-    }
-    int seed = component.front();
-    double best = -1.0;
-    // Row-major scan reproduces np.argmax's tie break.
-    for (int y = 0; y < grid_h; ++y)
-        for (int x = 0; x < grid_w; ++x) {
-            const int index = y * grid_w + x;
-            if (!inside[(y + 1) * padded_w + x + 1]) continue;
-            const double candidate = distance2[(y + 1) * padded_w + x + 1];
-            if (candidate > best) { best = candidate; seed = index; }
-        }
-    return seed;
-}
-
-void initialize_recovery(Solver* solver, double guess_u, double guess_v) {
+bool initialize_recovery(Solver* solver, double guess_u, double guess_v,
+                         bool unseeded_only = false) {
     if (!solver->has_state) throw std::runtime_error("Recovery requested before a solve.");
-    const int n = solver->total;
-    std::vector<uint8_t> failed(n, 0), seen(n, 0);
-    for (int i = 0; i < n; ++i) {
-        failed[i] = solver->valid[i] && solver->state[i] != 2;
-        if (failed[i]) { solver->state[i] = 0; solver->retry[i] = 0; }
-    }
-    std::vector<std::vector<int>> components;
-    const int di[4] = {-1, 1, 0, 0};
-    const int dj[4] = {0, 0, -1, 1};
-    for (int start = 0; start < n; ++start) {
-        if (!failed[start] || seen[start]) continue;
-        components.emplace_back();
-        std::queue<int> queue;
-        queue.push(start); seen[start] = 1;
-        while (!queue.empty()) {
-            const int item = queue.front(); queue.pop();
-            components.back().push_back(item);
-            const int y = item / solver->grid_w, x = item % solver->grid_w;
-            for (int k = 0; k < 4; ++k) {
-                const int yy = y + dj[k], xx = x + di[k];
-                if (yy < 0 || yy >= solver->grid_h || xx < 0 || xx >= solver->grid_w) continue;
-                const int next = yy * solver->grid_w + xx;
-                if (failed[next] && !seen[next]) { seen[next] = 1; queue.push(next); }
+    std::vector<uint8_t> eligible = solver->valid;
+    if (unseeded_only) {
+        // Initial seeding is needed in every disconnected ROI component, even
+        // with hole recovery off. Also restart components after total dropout.
+        std::vector<uint8_t> seen(solver->total, 0);
+        for (int start = 0; start < solver->total; ++start) {
+            if (!eligible[start] || seen[start]) continue;
+            std::vector<int> component{start};
+            seen[start] = 1;
+            bool has_solution = false;
+            for (size_t pos = 0; pos < component.size(); ++pos) {
+                const int i = component[pos];
+                has_solution |= solver->state[i] == 2;
+                const int y = i / solver->grid_w, x = i % solver->grid_w;
+                const int next[4] = {i - solver->grid_w, i + solver->grid_w, i - 1, i + 1};
+                const bool inside[4] = {y > 0, y + 1 < solver->grid_h, x > 0, x + 1 < solver->grid_w};
+                for (int k = 0; k < 4; ++k)
+                    if (inside[k] && eligible[next[k]] && !seen[next[k]]) {
+                        seen[next[k]] = 1;
+                        component.push_back(next[k]);
+                    }
             }
+            if (has_solution)
+                for (int i : component) eligible[i] = 0;
         }
     }
-    struct RankedComponent {
-        std::vector<int> indices;
-        int seed;
-    };
-    std::vector<RankedComponent> ranked;
-    ranked.reserve(components.size());
-    for (auto& component : components) {
-        const int seed = deepest_component_seed(
-            component, solver->grid_h, solver->grid_w);
-        ranked.push_back({std::move(component), seed});
-    }
-    std::sort(ranked.begin(), ranked.end(), [solver](const auto& a, const auto& b) {
-        if (a.indices.size() != b.indices.size())
-            return a.indices.size() > b.indices.size();
-        const int ay = a.seed / solver->grid_w, ax = a.seed % solver->grid_w;
-        const int by = b.seed / solver->grid_w, bx = b.seed % solver->grid_w;
-        return ay != by ? ay > by : ax > bx;
-    });
-    if (ranked.size() > 32) ranked.resize(32);
-    for (const auto& component : ranked) {
-        const int seed = component.seed;
+    bool scheduled = false;
+    // Search every failed subset. A geometric component centre may itself be
+    // unmeasurable, and a fixed component cap starves smaller valid islands.
+    // Accepted neighbours provide the local motion/affine guess, as on CPU.
+    for (int index = 0; index < solver->total; ++index) {
+        if (!eligible[index] || solver->state[index] == 2) continue;
+        const int parent = best_accepted_neighbour(solver, index);
+        double* p = &solver->parameters[index * 6];
+        std::fill_n(p, 6, 0.0);
         double u = guess_u, v = guess_v;
-        if (!ncc_guess(solver, seed, guess_u, guess_v, u, v)) continue;
-        solver->state[seed] = 1;
-        for (int k = 0; k < 6; ++k) solver->parameters[seed * 6 + k] = 0.0;
-        solver->parameters[seed * 6] = u;
-        solver->parameters[seed * 6 + 1] = v;
+        if (parent >= 0) {
+            const double* source = &solver->parameters[parent * 6];
+            const double dx = solver->gx[index] - solver->gx[parent];
+            const double dy = solver->gy[index] - solver->gy[parent];
+            u = source[0] + source[2] * dx + source[3] * dy;
+            v = source[1] + source[4] * dx + source[5] * dy;
+            std::copy_n(source + 2, 4, p + 2);
+        }
+        if (!ncc_guess(solver, index, u, v, p[0], p[1]))
+            throw std::runtime_error(g_last_error);
+        solver->state[index] = 1;
+        solver->retry[index] = 0;
+        scheduled = true;
     }
+    return scheduled;
 }
 
 void initialize_neighbour_recovery(Solver* solver) {
     if (!solver->has_state)
         throw std::runtime_error("Recovery requested before a solve.");
-    const int di[4] = {-1, 1, 0, 0};
-    const int dj[4] = {0, 0, -1, 1};
     std::vector<int> parents(solver->total, -1);
-    // Select parents before changing any state, so this is a genuine second
-    // pass seeded only from correlations accepted by the preceding solve.
     for (int index = 0; index < solver->total; ++index) {
         if (!solver->valid[index] || solver->state[index] == 2) continue;
-        const int y = index / solver->grid_w, x = index % solver->grid_w;
-        double best = std::numeric_limits<double>::infinity();
-        for (int k = 0; k < 4; ++k) {
-            const int yy = y + dj[k], xx = x + di[k];
-            if (yy < 0 || yy >= solver->grid_h ||
-                xx < 0 || xx >= solver->grid_w) continue;
-            const int next = yy * solver->grid_w + xx;
-            if (solver->state[next] == 2 && solver->correlation[next] < best) {
-                best = solver->correlation[next];
-                parents[index] = next;
-            }
-        }
+        solver->state[index] = 0;
+        solver->retry[index] = 0;
+        parents[index] = best_accepted_neighbour(solver, index);
     }
     for (int index = 0; index < solver->total; ++index) {
         const int parent = parents[index];
@@ -1136,7 +1092,7 @@ bool run_wavefront(Solver* solver, bool warm_start) {
             solver->d_offsets, solver->n_pixels, solver->d_active_indices,
             solver->d_active_parameters, count, solver->max_iter, solver->conv_tol,
             solver->corr_cutoff, solver->rescue_radius, solver->spacing,
-            solver->radius, warm_start ? 1 : 0,
+            warm_start ? 1 : 0,
             solver->d_result_parameters,
             solver->d_result_correlation, solver->d_result_accepted);
         if (!cuda_ok(cudaGetLastError(), "launching native IC-GN")) return false;
@@ -1245,7 +1201,7 @@ __global__ void plane_fit_kernel(
 
 extern "C" {
 
-const char* strainx_cuda_version(void) { return "2.1.0-native"; }
+const char* strainx_cuda_version(void) { return "2.2.0-native"; }
 uint32_t strainx_cuda_abi_version(void) { return 2; }
 const char* strainx_cuda_last_error(void) { return g_last_error.c_str(); }
 
@@ -1391,7 +1347,6 @@ int strainx_cuda_solver_ncc(
         grid_index >= solver->total || !solver->valid[grid_index]) {
         set_error("Invalid native CUDA NCC arguments."); return -1;
     }
-    const size_t count = static_cast<size_t>(solver->height) * solver->width;
     if (!upload_current_with_coefficients(
             solver, current_image, "uploading NCC current image")) return -1;
     solver->has_current = true;
@@ -1429,7 +1384,7 @@ int strainx_cuda_solver_icgn(
         solver->height, solver->width, solver->d_grid_x, solver->d_grid_y,
         solver->d_offsets, solver->n_pixels, solver->d_active_indices,
         solver->d_active_parameters, 1, solver->max_iter, solver->conv_tol,
-        solver->corr_cutoff, 0, solver->spacing, solver->radius, 0,
+        solver->corr_cutoff, 0, solver->spacing, 0,
         solver->d_result_parameters, solver->d_result_correlation,
         solver->d_result_accepted);
     if (!cuda_ok(cudaGetLastError(), "launching isolated native IC-GN") ||
@@ -1479,6 +1434,9 @@ int strainx_cuda_solver_solve(
             throw std::runtime_error("Unknown native CUDA solve mode.");
         }
         if (!run_wavefront(solver, mode == STRAINX_CUDA_WARM_START)) return -1;
+        if ((mode == STRAINX_CUDA_FRESH || mode == STRAINX_CUDA_WARM_START) &&
+            initialize_recovery(solver, guess_u, guess_v, true) &&
+            !run_wavefront(solver, false)) return -1;
         const double nan = std::numeric_limits<double>::quiet_NaN();
         std::fill_n(out_u, count, nan); std::fill_n(out_v, count, nan);
         std::fill_n(out_du_dx, count, nan); std::fill_n(out_du_dy, count, nan);

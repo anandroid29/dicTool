@@ -50,6 +50,162 @@ def connected_support_labels(valid: np.ndarray, grid_spacing: int = 1):
             support, structure=np.ones((3, 3), dtype=bool), iterations=grow)
     return label(support, structure=np.ones((3, 3), dtype=np.uint8))
 
+
+def iter_velocity_strains_multi_window(
+    Vx: np.ndarray,
+    Vy: np.ndarray,
+    valid_mask: np.ndarray,
+    strain_windows,
+    grid_spacing: int = 1,
+    use_gpu: bool = False,
+):
+    """Yield exact plane-fit gradients for many windows from shared integrals.
+
+    The single-window implementation performs twelve separable image scans for
+    every radius. A parameter sweep needs the same sufficient statistics at up
+    to fifteen radii, so integral images reduce each additional radius to box
+    lookups while preserving the normal-equation fit exactly.
+    """
+    Vx, Vy = np.asarray(Vx), np.asarray(Vy)
+    valid = (np.asarray(valid_mask, dtype=bool) &
+             np.isfinite(Vx) & np.isfinite(Vy))
+    windows = tuple(sorted({max(0, int(value)) for value in strain_windows}))
+    if not windows:
+        return
+    if use_gpu:
+        for radius in windows:
+            yield radius, compute_velocity_strains(
+                Vx, Vy, valid, radius, grid_spacing, use_gpu=True)
+        return
+    shape = Vx.shape
+
+    # Correlation values occupy one regular subset lattice inside a full-image
+    # array.  Regressing on that lattice is mathematically identical because we
+    # retain physical pixel coordinates, and avoids scanning the invalid pixels
+    # between subset centres (25x fewer cells for grid spacing 5).
+    spacing = max(1, int(grid_spacing))
+    rows, columns = np.nonzero(valid)
+    if rows.size:
+        row_offset = int(rows[0] % spacing)
+        column_offset = int(columns[0] % spacing)
+        aligned = (np.all(rows % spacing == row_offset)
+                   and np.all(columns % spacing == column_offset))
+    else:
+        row_offset = column_offset = 0
+        aligned = True
+    if not aligned:
+        spacing = 1
+        row_offset = column_offset = 0
+
+    row_slice = slice(row_offset, None, spacing)
+    column_slice = slice(column_offset, None, spacing)
+    lattice_slice = (row_slice, column_slice)
+    Vx_lattice = Vx[lattice_slice]
+    Vy_lattice = Vy[lattice_slice]
+    valid_lattice = valid[lattice_slice]
+    lattice_shape = valid_lattice.shape
+    labels, count = connected_support_labels(valid_lattice, 1)
+    yy = (row_offset + np.arange(lattice_shape[0], dtype=np.float64)
+          * spacing)[:, None]
+    xx = (column_offset + np.arange(lattice_shape[1], dtype=np.float64)
+          * spacing)[None, :]
+    lattice_radii = {window: window // spacing for window in windows}
+    pad = max(lattice_radii.values())
+
+    def integral(values: np.ndarray) -> np.ndarray:
+        padded = np.pad(values, pad, mode="constant")
+        summed = padded.cumsum(axis=0, dtype=np.float64).cumsum(
+            axis=1, dtype=np.float64)
+        return np.pad(summed, ((1, 0), (1, 0)), mode="constant")
+
+    def box(summed: np.ndarray, radius: int) -> np.ndarray:
+        top, bottom = pad - radius, pad + radius + 1
+        left, right = top, bottom
+        h, w = lattice_shape
+        return (summed[bottom:bottom + h, right:right + w]
+                - summed[top:top + h, right:right + w]
+                - summed[bottom:bottom + h, left:left + w]
+                + summed[top:top + h, left:left + w])
+
+    components = []
+    for component_id in range(1, count + 1):
+        component = valid_lattice & (labels == component_id)
+        if np.count_nonzero(component) < 6:
+            continue
+        mask = component.astype(np.float64)
+        u = np.where(component, Vx_lattice, 0.0).astype(
+            np.float64, copy=False)
+        v = np.where(component, Vy_lattice, 0.0).astype(
+            np.float64, copy=False)
+        bases = (
+            mask, mask * xx, mask * yy, mask * xx * xx,
+            mask * yy * yy, mask * xx * yy,
+            u, v, u * xx, u * yy, v * xx, v * yy,
+        )
+        components.append((component, tuple(integral(values)
+                                             for values in bases)))
+
+    cached = {}
+    for radius in windows:
+        lattice_radius = lattice_radii[radius]
+        if lattice_radius in cached:
+            yield radius, cached[lattice_radius]
+            continue
+        gradients = [np.full(lattice_shape, np.nan, dtype=np.float64)
+                     for _ in range(4)]
+        for component, summed in components:
+            (N, abs_x, abs_y, abs_x2, abs_y2, abs_xy,
+             sum_u, sum_v, abs_ux, abs_uy, abs_vx, abs_vy) = (
+                box(values, lattice_radius) for values in summed)
+            sum_x = abs_x - xx * N
+            sum_y = abs_y - yy * N
+            sum_x2 = abs_x2 - 2.0 * xx * abs_x + xx * xx * N
+            sum_y2 = abs_y2 - 2.0 * yy * abs_y + yy * yy * N
+            sum_xy = (abs_xy - xx * abs_y - yy * abs_x
+                      + xx * yy * N)
+            sum_ux = abs_ux - xx * sum_u
+            sum_uy = abs_uy - yy * sum_u
+            sum_vx = abs_vx - xx * sum_v
+            sum_vy = abs_vy - yy * sum_v
+            safe_n = np.maximum(N, 1.0)
+            Sxx = sum_x2 - sum_x ** 2 / safe_n
+            Syy = sum_y2 - sum_y ** 2 / safe_n
+            Sxy = sum_xy - sum_x * sum_y / safe_n
+            Sux = sum_ux - sum_u * sum_x / safe_n
+            Suy = sum_uy - sum_u * sum_y / safe_n
+            Svx = sum_vx - sum_v * sum_x / safe_n
+            Svy = sum_vy - sum_v * sum_y / safe_n
+            with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+                det = Sxx * Syy - Sxy ** 2
+                enough = (component & (N >= 6) & np.isfinite(det)
+                          & (det > 1e-12))
+                safe_det = np.where(enough, det, 1.0)
+                fitted = (
+                    (Sux * Syy - Suy * Sxy) / safe_det,
+                    (Suy * Sxx - Sux * Sxy) / safe_det,
+                    (Svx * Syy - Svy * Sxy) / safe_det,
+                    (Svy * Sxx - Svx * Sxy) / safe_det,
+                )
+            for output, values in zip(gradients, fitted):
+                keep = enough & np.isfinite(values)
+                output[keep] = values[keep]
+        expanded = []
+        for values in gradients:
+            full = np.full(shape, np.nan, dtype=np.float64)
+            full[lattice_slice] = values
+            expanded.append(full)
+        dVx_dx, dVx_dy, dVy_dx, dVy_dy = expanded
+        Exx_rate, Eyy_rate = dVx_dx, dVy_dy
+        Exy_rate = 0.5 * (dVx_dy + dVy_dx)
+        result = {
+            "dVx_dx": dVx_dx, "dVx_dy": dVx_dy,
+            "dVy_dx": dVy_dx, "dVy_dy": dVy_dy,
+            "Eeff_rate": von_mises_equivalent(
+                Exx_rate, Eyy_rate, Exy_rate),
+        }
+        cached[lattice_radius] = result
+        yield radius, result
+
 def compute_velocity_strains(
     Vx: np.ndarray,
     Vy: np.ndarray,
